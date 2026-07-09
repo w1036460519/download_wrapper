@@ -1,0 +1,9 @@
+{
+  "name": "download-wrapper",
+  "version": "1.0.0",
+  "description": "统一多协议下载封装库依赖声明（HTTP + BitTorrent）",
+  "dependencies": [
+    "curl",
+    "libtorrent-rasterbar"
+  ]
+}
