@@ -1,9 +1,11 @@
 name: Build download_wrapper
 
-# 触发条件：改动源码、依赖声明或本工作流时构建；也支持手动触发
+# 触发条件：改动源码/依赖/本工作流时构建；推送 v* 标签时构建并发布 Release；也支持手动触发
 on:
   push:
     branches: [main]
+    tags:
+      - 'v*'
     paths:
       - 'src/**'
       - 'include/**'
@@ -47,6 +49,17 @@ jobs:
             os: windows-2022
             triplet: x64-windows-static-md
             output: download_wrapper.dll
+          # iOS：真机 arm64 静态库（.a）。iOS 不允许加载未签名独立动态库，
+          # 故编静态库并合并依赖为自包含胖库，随 Runner 链接
+          - name: ios-arm64
+            os: macos-14
+            triplet: arm64-ios
+            output: libdownload_wrapper.a
+          # Android：仅 arm64-v8a（NDK 交叉编译，.so 依赖静态链入自包含）
+          - name: android-arm64-v8a
+            os: ubuntu-24.04
+            triplet: arm64-android
+            output: libdownload_wrapper.so
 
     runs-on: ${{ matrix.os }}
 
@@ -119,7 +132,7 @@ jobs:
 
       # ---------- Linux / Windows：单架构 ----------
       - name: Build (${{ matrix.name }})
-        if: matrix.name != 'macos-universal'
+        if: matrix.name == 'linux-x64' || matrix.name == 'windows-x64'
         shell: bash
         run: |
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
@@ -134,9 +147,94 @@ jobs:
           find build -name "${{ matrix.output }}" -exec cp {} dist/ \;
           ls -l dist
 
+      # ---------- iOS：真机 arm64 静态库，合并依赖为自包含胖静态库 ----------
+      - name: Build (iOS arm64 static)
+        if: matrix.name == 'ios-arm64'
+        shell: bash
+        run: |
+          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DDW_BUILD_SHARED=OFF \
+            -DVCPKG_TARGET_TRIPLET=arm64-ios \
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+          cmake --build build --config Release
+
+          mkdir -p dist
+          # STATIC 库只含 download_wrapper 自身符号；需将 vcpkg 依赖（curl/libtorrent/boost/openssl）
+          # 一并合并为自包含胖静态库，供 Runner 直接链接。
+          SELF_LIB=$(find build -name "libdownload_wrapper.a" | head -1)
+          DEP_LIB_DIR=$(find . -type d -path "*vcpkg_installed/arm64-ios/lib" | head -1)
+          echo "self=$SELF_LIB deps=$DEP_LIB_DIR"
+          libtool -static -o dist/libdownload_wrapper.a "$SELF_LIB" "$DEP_LIB_DIR"/*.a
+          echo "== 静态库架构验证 =="
+          lipo -info dist/libdownload_wrapper.a
+
+      # ---------- Android：arm64-v8a 动态库（.so，依赖静态链入自包含）----------
+      - name: Build (Android arm64-v8a)
+        if: matrix.name == 'android-arm64-v8a'
+        shell: bash
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK=$ANDROID_NDK_HOME"
+          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          # vcpkg 的 arm64-android triplet 会自动 chainload NDK 工具链（依赖 ANDROID_NDK_HOME）
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVCPKG_TARGET_TRIPLET=arm64-android \
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+          cmake --build build --config Release
+
+          mkdir -p dist
+          find build -name "libdownload_wrapper.so" -exec cp {} dist/ \;
+          ls -l dist
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: download_wrapper-${{ matrix.name }}
           path: dist/${{ matrix.output }}
           if-no-files-found: error
+
+  # ========== 发布：推送 v* 标签时，汇总全平台产物并创建 GitHub Release ==========
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    # 仅当推送 v* 标签时发布；日常 main push / PR 不触发
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # 使用内置 GITHUB_TOKEN 创建 Release，无需额外 token
+    steps:
+      # 下载所有平台的构建产物（每个 job 一个 artifact）
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # 展平目录并重命名：避免不同平台同名 .so 相互覆盖（linux 与 android 均为 libdownload_wrapper.so）
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            plat=$(basename "$dir")            # 形如 download_wrapper-linux-x64
+            for f in "$dir"*; do
+              base=$(basename "$f")
+              ext="${base##*.}"
+              name="${base%.*}"
+              # 以平台名作后缀区分，保证 Release 资产名唯一
+              cp "$f" "release/${name}-${plat#download_wrapper-}.${ext}"
+            done
+          done
+          echo "== 待发布资产 =="
+          ls -l release
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

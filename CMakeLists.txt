@@ -22,10 +22,14 @@ find_package(LibtorrentRasterbar CONFIG REQUIRED)
 
 if(APPLE)
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-        set(CMAKE_OSX_DEPLOYMENT_TARGET "12" CACHE STRING "Minimum macOS version")
+        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+            set(CMAKE_OSX_DEPLOYMENT_TARGET "13" CACHE STRING "最低 iOS 版本")
+        else()
+            set(CMAKE_OSX_DEPLOYMENT_TARGET "12" CACHE STRING "最低 macOS 版本")
+        endif()
     endif()
-    # 目标架构由外部传入（CI 分架构编译后用 lipo 合并为 universal binary）；
-    # 本地不指定时默认构建当前主机架构。
+    # 目标架构由外部传入：macOS CI 分架构编译后用 lipo 合并为 universal binary；
+    # iOS 传入 arm64。本地不指定时默认构建当前主机架构。
 endif()
 
 # 源文件
@@ -36,7 +40,14 @@ set(DW_SOURCES
     src/torrent/torrent_engine.cpp
 )
 
-add_library(download_wrapper SHARED ${DW_SOURCES})
+# 库类型开关：桌面端 / Android 构建动态库（.dylib/.so/.dll）；
+# iOS 不允许加载未签名独立动态库，改构建静态库（.a）随 Runner 链接。
+option(DW_BUILD_SHARED "构建为动态库（OFF 时构建静态库，供 iOS 链接）" ON)
+if(DW_BUILD_SHARED)
+    add_library(download_wrapper SHARED ${DW_SOURCES})
+else()
+    add_library(download_wrapper STATIC ${DW_SOURCES})
+endif()
 
 target_include_directories(download_wrapper
     PUBLIC
