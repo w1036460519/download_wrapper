@@ -23,7 +23,9 @@ on:
 
 env:
   # 固定 vcpkg 版本（发布 tag，可复现）；升级依赖时改这里即可
-  VCPKG_REF: '2024.08.23'
+  # 注意：msys2 上游镜像会定期清理旧包，过老的 tag 会导致 pkgconfig 等 msys 依赖下载失败，
+  # 需保持相对较新的 release tag
+  VCPKG_REF: '2026.06.24'
   # 启用 GitHub Actions Cache 作为 vcpkg binary cache 后端
   VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
 
