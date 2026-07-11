@@ -4,6 +4,16 @@
   "description": "统一多协议下载封装库依赖声明（HTTP + BitTorrent）",
   "dependencies": [
     "curl",
-    "libtorrent"
+    {
+      "name": "libtorrent",
+      "default-features": false
+    },
+    {
+      "name": "libtorrent",
+      "features": [
+        "iconv"
+      ],
+      "platform": "!ios & !android"
+    }
   ]
 }
