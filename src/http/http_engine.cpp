@@ -203,7 +203,7 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
         if (params->filename && params->filename[0]) {
             full_path = (std::filesystem::path(params->save_path) / params->filename).string();
         }
-        const int fd = ::open(full_path.c_str(), O_CREAT | O_WRONLY, 0644);
+        const int fd = dw_file_open_write(full_path.c_str());
         if (fd < 0) {
             set_result(out_result, url, trace_id, DW_REASON_INTERNAL, nullptr,
                        "open failed: path=%s errno=%d (%s)", full_path.c_str(), errno, std::strerror(errno));
@@ -320,7 +320,7 @@ int32_t HttpEngine::delete_task(const char *         id,
             url_str = hit->url;
             output_path = hit->full_file_path;
             if (hit->task_thread.joinable()) hit->task_thread.join();
-            if (!output_path.empty() && ::unlink(output_path.c_str()) != 0 && errno != ENOENT)
+            if (!output_path.empty() && dw_file_unlink(output_path.c_str()) != 0 && errno != ENOENT)
                 HTTP_LOG(DW_LOG_ERROR, trace_id.c_str(),
                 "delete_task: unlink failed url=%s path=%s errno=%d", url_str.c_str(), output_path.c_str(), errno);
             HTTP_LOG(DW_LOG_INFO, trace_id.c_str(), "delete_task ok: url=%s", url_str.c_str());

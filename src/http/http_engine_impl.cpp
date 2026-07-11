@@ -400,11 +400,24 @@ namespace internal {
         }
 
         auto &part = tCtx->parts[pCtx->index];
-        const auto off = static_cast<off_t>(part.start + part.done);
-        const ssize_t w = pwrite(tCtx->fd, ptr, len, off);
+        // multiple-handle：每个分片首次写入时打开自己的 fd，各自持有独立文件偏移，
+        // 定点写退化为 seek+write，跨平台统一且无需共享 fd 的原子写
+        if (pCtx->fd < 0) {
+            pCtx->fd = dw_file_open_write(tCtx->full_file_path.c_str());
+            if (pCtx->fd < 0) {
+                HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] open failed: path=%s errno=%d",
+                    pCtx->index, tCtx->full_file_path.c_str(), errno);
+                std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
+                part.status = DW_TASK_STATUS_ERROR;
+                part.reason = DW_REASON_INTERNAL;
+                return 0;
+            }
+        }
+        const long long off = static_cast<long long>(part.start + part.done);
+        const dw_ssize_t w = dw_file_pwrite(pCtx->fd, ptr, len, off);
         if (w < 0 || static_cast<size_t>(w) != len) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] pwrite failed: wanted=%zu got=%zd errno=%d",
-                pCtx->index, len, w, errno);
+            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] pwrite failed: wanted=%zu got=%lld errno=%d",
+                pCtx->index, len, static_cast<long long>(w), errno);
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             part.status = DW_TASK_STATUS_ERROR;
             part.reason = DW_REASON_INTERNAL;
@@ -605,7 +618,7 @@ namespace internal {
             tCtx->full_file_path = resolve_unique_path(tCtx->output_path, tCtx->filename);
 
         if (tCtx->fd >= 0) {
-            ::close(tCtx->fd);
+            dw_file_close(tCtx->fd);
             tCtx->fd = -1;
         }
 
@@ -618,7 +631,7 @@ namespace internal {
                 tCtx->message = "目录创建失败";
                 return;
             }
-            tCtx->fd = ::open(tCtx->full_file_path.c_str(), O_CREAT | O_WRONLY, 0644);
+            tCtx->fd = dw_file_open_write(tCtx->full_file_path.c_str());
             if (tCtx->fd < 0) {
                 HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "open failed: %s errno=%d",
                     tCtx->full_file_path.c_str(), errno);
@@ -630,7 +643,7 @@ namespace internal {
         }
 
         if (tCtx->total_size > 0 && tCtx->fd >= 0 &&
-            ftruncate(tCtx->fd, static_cast<off_t>(tCtx->total_size)) != 0) {
+            dw_file_truncate(tCtx->fd, tCtx->total_size) != 0) {
             HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "ftruncate failed: size=%lld errno=%d",
                 (long long)tCtx->total_size, errno);
             tCtx->status = DW_TASK_STATUS_ERROR;
@@ -701,109 +714,183 @@ namespace internal {
      *          Part 5: 分片线程 + 任务线程 + monitor 线程
      * ===================================================================== */
 
-    void part_thread_func(dl_task_ctx *tCtx, dl_part_ctx *pCtx) {
-        try {
-        while (!tCtx->cancel_req.load() && !tCtx->pause_req.load()) {
-            if (tCtx->status == DW_TASK_STATUS_ERROR &&
-                tCtx->reason == DW_REASON_INVALID_INPUT)
-                break;
-
-            CURL *curl = build_easy_for_part(tCtx, pCtx);
-            if (!curl) {
-                HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] build_easy_for_part failed", pCtx->index);
-                std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
-                tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
-                tCtx->parts[pCtx->index].reason = DW_REASON_INTERNAL;
-                tCtx->parts[pCtx->index].download_rate = 0.0;
-                break;
-            }
-            CurlEasyGuard easy_guard(curl);
-            pCtx->easy = curl;
-
-            const CURLcode rc = curl_easy_perform(curl);
-            long http_code = 0;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-            easy_guard.reset();
-            pCtx->easy = nullptr;
-            if (pCtx->easy_hdrs) {
-                curl_slist_free_all(pCtx->easy_hdrs);
-                pCtx->easy_hdrs = nullptr;
-            }
-
-            if (tCtx->cancel_req.load() || tCtx->pause_req.load()) break;
-
-            if (rc == CURLE_OK && http_code >= 200 && http_code < 300) {
-                std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
-                auto &part = tCtx->parts[pCtx->index];
-                if (part.done >= part.size && part.size > 0) {
-                    part.status = DW_TASK_STATUS_COMPLETED;
-                    part.reason = DW_REASON_NONE;
-                    part.download_rate = 0.0;
-                } else {
-                    HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
-                        "incomplete: part=%d done=%lld/%lld",
-                        pCtx->index, static_cast<long long>(part.done), static_cast<long long>(part.size));
-                    if (pCtx->retry_count >= g_cfg.max_retries) {
-                        part.status = DW_TASK_STATUS_ERROR;
-                        part.reason = DW_REASON_NETWORK;
-                        part.download_rate = 0.0;
-                    } else {
-                        pCtx->retry_count++;
-                        HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
-                            "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
-                        continue;
-                    }
-                }
-                break;
-            }
-
-            int retryable = 0;
-            const dw_reason_t reason = classify_failure(rc, http_code, &retryable);
-            HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
-                "failed: part=%d rc=%d http=%ld reason=%d retryable=%d",
-                pCtx->index, static_cast<int>(rc), http_code, static_cast<int>(reason), retryable);
-
-            if (retryable && pCtx->retry_count < g_cfg.max_retries) {
-                pCtx->retry_count++;
-                HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
-                    "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
-                continue;
-            }
-
-            {
-                std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
-                auto &part = tCtx->parts[pCtx->index];
-                part.status = DW_TASK_STATUS_ERROR;
-                part.reason = reason;
+    // 处理单个分片一次请求完成后的结果判定（复用原多线程模型的判定逻辑）。
+    // 返回 true 表示需要重试（调用方应重新构建 easy 并重新入队），
+    // 返回 false 表示该分片已进入终态（完成或错误）。
+    bool handle_part_result(dl_task_ctx *tCtx, dl_part_ctx *pCtx, CURLcode rc, long http_code) {
+        if (rc == CURLE_OK && http_code >= 200 && http_code < 300) {
+            std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
+            auto &part = tCtx->parts[pCtx->index];
+            if (part.done >= part.size && part.size > 0) {
+                part.status = DW_TASK_STATUS_COMPLETED;
+                part.reason = DW_REASON_NONE;
                 part.download_rate = 0.0;
-                if (tCtx->message.empty()) {
-                    switch (reason) {
-                        case DW_REASON_AUTH: tCtx->message = "认证失败"; break;
-                        case DW_REASON_INVALID_INPUT: tCtx->message = "资源不存在或已失效"; break;
-                        case DW_REASON_NETWORK: tCtx->message = "网络连接异常"; break;
-                        default: tCtx->message = "下载过程中出现异常"; break;
+                return false;
+            }
+            HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+                "incomplete: part=%d done=%lld/%lld",
+                pCtx->index, static_cast<long long>(part.done), static_cast<long long>(part.size));
+            if (pCtx->retry_count >= g_cfg.max_retries) {
+                part.status = DW_TASK_STATUS_ERROR;
+                part.reason = DW_REASON_NETWORK;
+                part.download_rate = 0.0;
+                return false;
+            }
+            pCtx->retry_count++;
+            HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+                "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
+            return true;
+        }
+
+        int retryable = 0;
+        const dw_reason_t reason = classify_failure(rc, http_code, &retryable);
+        HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+            "failed: part=%d rc=%d http=%ld reason=%d retryable=%d",
+            pCtx->index, static_cast<int>(rc), http_code, static_cast<int>(reason), retryable);
+
+        if (retryable && pCtx->retry_count < g_cfg.max_retries) {
+            pCtx->retry_count++;
+            HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+                "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
+        auto &part = tCtx->parts[pCtx->index];
+        part.status = DW_TASK_STATUS_ERROR;
+        part.reason = reason;
+        part.download_rate = 0.0;
+        if (tCtx->message.empty()) {
+            switch (reason) {
+                case DW_REASON_AUTH: tCtx->message = "认证失败"; break;
+                case DW_REASON_INVALID_INPUT: tCtx->message = "资源不存在或已失效"; break;
+                case DW_REASON_NETWORK: tCtx->message = "网络连接异常"; break;
+                default: tCtx->message = "下载过程中出现异常"; break;
+            }
+        }
+        return false;
+    }
+
+    // 每任务一个 curl_multi：单线程事件循环驱动本任务所有分片。
+    // 各分片持有独立 easy handle 与独立 fd，回调在本线程串行执行；
+    // 与其他任务的 multi 互不影响，磁盘写阻塞仅局限于当前任务内部。
+    void run_parts_multi(dl_task_ctx *tCtx) {
+        CURLM *multi = curl_multi_init();
+        if (!multi) {
+            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "curl_multi_init failed");
+            std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
+            tCtx->status = DW_TASK_STATUS_ERROR;
+            tCtx->reason = DW_REASON_INTERNAL;
+            if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
+            return;
+        }
+
+        // 退出/异常时统一回收所有仍在的 easy：先从 multi 移除再释放。
+        auto cleanup_all = [&]() {
+            for (auto &pc: tCtx->part_ctx) {
+                if (pc.easy) {
+                    curl_multi_remove_handle(multi, pc.easy);
+                    curl_easy_cleanup(pc.easy);
+                    pc.easy = nullptr;
+                }
+                if (pc.easy_hdrs) {
+                    curl_slist_free_all(pc.easy_hdrs);
+                    pc.easy_hdrs = nullptr;
+                }
+            }
+            curl_multi_cleanup(multi);
+        };
+
+        try {
+            // 为分片构建 easy 并加入 multi；失败则直接标记该分片错误。
+            auto add_part = [&](dl_part_ctx *pCtx) -> bool {
+                CURL *curl = build_easy_for_part(tCtx, pCtx);
+                if (!curl) {
+                    HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] build_easy_for_part failed", pCtx->index);
+                    std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
+                    tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
+                    tCtx->parts[pCtx->index].reason = DW_REASON_INTERNAL;
+                    tCtx->parts[pCtx->index].download_rate = 0.0;
+                    return false;
+                }
+                pCtx->easy = curl;
+                curl_multi_add_handle(multi, curl);
+                return true;
+            };
+
+            // 单个分片本轮结束后回收其 easy（drop 前 pCtx->easy 应等于完成的 handle）。
+            auto drop_easy = [&](dl_part_ctx *pCtx) {
+                if (pCtx->easy) {
+                    curl_multi_remove_handle(multi, pCtx->easy);
+                    curl_easy_cleanup(pCtx->easy);
+                    pCtx->easy = nullptr;
+                }
+                if (pCtx->easy_hdrs) {
+                    curl_slist_free_all(pCtx->easy_hdrs);
+                    pCtx->easy_hdrs = nullptr;
+                }
+            };
+
+            int active = 0;
+            for (auto &pc: tCtx->part_ctx) {
+                if (add_part(&pc)) ++active;
+            }
+
+            while (active > 0) {
+                if (tCtx->cancel_req.load() || tCtx->pause_req.load()) break;
+                if (tCtx->status == DW_TASK_STATUS_ERROR && tCtx->reason == DW_REASON_INVALID_INPUT) break;
+
+                int still_running = 0;
+                CURLMcode mc = curl_multi_perform(multi, &still_running);
+                if (mc == CURLM_OK)
+                    mc = curl_multi_poll(multi, nullptr, 0, 200, nullptr);
+                if (mc != CURLM_OK) {
+                    HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "curl_multi error: %d", static_cast<int>(mc));
+                    break;
+                }
+
+                int msgs_left = 0;
+                CURLMsg *msg;
+                while ((msg = curl_multi_info_read(multi, &msgs_left)) != nullptr) {
+                    if (msg->msg != CURLMSG_DONE) continue;
+                    CURL *e = msg->easy_handle;
+                    const CURLcode rc = msg->data.result;
+
+                    dl_part_ctx *pCtx = nullptr;
+                    curl_easy_getinfo(e, CURLINFO_PRIVATE, &pCtx);
+                    long http_code = 0;
+                    curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &http_code);
+                    if (!pCtx) { curl_multi_remove_handle(multi, e); curl_easy_cleanup(e); continue; }
+
+                    drop_easy(pCtx);
+
+                    if (tCtx->cancel_req.load() || tCtx->pause_req.load()) { --active; continue; }
+
+                    if (handle_part_result(tCtx, pCtx, rc, http_code)) {
+                        // 需要重试：重新构建并入队；构建失败则计为终态
+                        if (!add_part(pCtx)) --active;
+                    } else {
+                        --active;
                     }
                 }
             }
-            break;
-        }
         } catch (const std::exception &e) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(),
-                "[part %d] part_thread_func exception: %s", pCtx->index, e.what());
+            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "run_parts_multi exception: %s", e.what());
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
-            tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
-            tCtx->parts[pCtx->index].reason = DW_REASON_INTERNAL;
-            tCtx->parts[pCtx->index].download_rate = 0.0;
+            tCtx->status = DW_TASK_STATUS_ERROR;
+            tCtx->reason = DW_REASON_INTERNAL;
+            if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
         } catch (...) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(),
-                "[part %d] part_thread_func unknown exception", pCtx->index);
+            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "run_parts_multi unknown exception");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
-            tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
-            tCtx->parts[pCtx->index].reason = DW_REASON_INTERNAL;
-            tCtx->parts[pCtx->index].download_rate = 0.0;
+            tCtx->status = DW_TASK_STATUS_ERROR;
+            tCtx->reason = DW_REASON_INTERNAL;
+            if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
         }
+
+        cleanup_all();
     }
+
 
     void task_thread_func(dl_task_ctx *tCtx) {
         try {
@@ -845,14 +932,7 @@ namespace internal {
 
         if (tCtx->cancel_req.load() || tCtx->pause_req.load()) return;
 
-        {
-            std::vector<std::thread> part_threads;
-            part_threads.reserve(tCtx->part_ctx.size());
-            for (size_t i = 0; i < tCtx->part_ctx.size(); ++i) {
-                part_threads.emplace_back(part_thread_func, tCtx, &tCtx->part_ctx[i]);
-            }
-            for (auto &t: part_threads) t.join();
-        }
+        run_parts_multi(tCtx);
 
         {
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);

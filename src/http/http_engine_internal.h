@@ -24,7 +24,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <fcntl.h>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -32,11 +31,73 @@
 #include <ranges>
 #include <string>
 #include <string_view>
-#include <sys/time.h>
 #include <thread>
-#include <unistd.h>
 #include <unordered_map>
 #include <vector>
+
+/* ===================== 跨平台文件 I/O 兼容层 ===================== */
+// POSIX 提供 open/close/pwrite/ftruncate/unlink；MSVC 无这些接口，改用 io.h 系列等价物。
+#if defined(_WIN32)
+    #include <fcntl.h>
+    #include <io.h>
+    #include <share.h>
+    #include <sys/stat.h>
+using dw_ssize_t = long long;
+#else
+    #include <fcntl.h>
+    #include <unistd.h>
+using dw_ssize_t = ssize_t;
+#endif
+
+/// 以写入方式打开文件（不存在则创建）。返回文件描述符，失败返回 -1。
+/// Windows 强制二进制模式，避免 CRLF 文本转换损坏下载数据；允许多句柄共享打开。
+inline int dw_file_open_write(const char *path) {
+#if defined(_WIN32)
+    int fd = -1;
+    _sopen_s(&fd, path, _O_CREAT | _O_WRONLY | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    return fd;
+#else
+    return ::open(path, O_CREAT | O_WRONLY, 0644);
+#endif
+}
+
+/// 关闭文件描述符。成功返回 0。
+inline int dw_file_close(int fd) {
+#if defined(_WIN32)
+    return ::_close(fd);
+#else
+    return ::close(fd);
+#endif
+}
+
+/// 将文件截断/预分配到指定大小。成功返回 0。
+inline int dw_file_truncate(int fd, long long size) {
+#if defined(_WIN32)
+    return ::_chsize_s(fd, size);
+#else
+    return ::ftruncate(fd, static_cast<off_t>(size));
+#endif
+}
+
+/// 定点写入：向 fd 的 off 偏移写 len 字节，返回实际写入字节数，失败返回 -1。
+/// 调用方须保证同一 fd 不被多线程并发共享（本项目每个分片持有独立 fd）。
+inline dw_ssize_t dw_file_pwrite(int fd, const void *buf, size_t len, long long off) {
+#if defined(_WIN32)
+    if (::_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return ::_write(fd, buf, static_cast<unsigned int>(len));
+#else
+    return ::pwrite(fd, buf, len, static_cast<off_t>(off));
+#endif
+}
+
+/// 删除文件。成功返回 0。
+inline int dw_file_unlink(const char *path) {
+#if defined(_WIN32)
+    return ::_unlink(path);
+#else
+    return ::unlink(path);
+#endif
+}
 
 /* ===================== RAII 辅助封装 ===================== */
 
@@ -116,7 +177,10 @@ struct dl_part_ctx {
     std::string seen_last_modified;
     long seen_http_code = 0;
 
+    int fd = -1;   // 本分片独立文件句柄（multiple-handle：各分片自持偏移，规避跨线程共享）
+
     ~dl_part_ctx() {
+        if (fd >= 0) { dw_file_close(fd); fd = -1; }
         if (easy_hdrs) { curl_slist_free_all(easy_hdrs); easy_hdrs = nullptr; }
         if (easy) { curl_easy_cleanup(easy); easy = nullptr; }
     }
@@ -154,7 +218,7 @@ struct dl_task_ctx {
     std::thread task_thread;
 
     ~dl_task_ctx() {
-        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (fd >= 0) { dw_file_close(fd); fd = -1; }
     }
 };
 
@@ -236,8 +300,11 @@ std::string parse_content_disposition_filename(std::string_view value);
 /** 探测完成后冻结元数据字段 */
 void finalize_probing(dl_task_ctx *tCtx, const dl_part_ctx *pCtx);
 
-/** 分片工作线程 */
-void part_thread_func(dl_task_ctx *tCtx, dl_part_ctx *pCtx);
+/** 单个分片一次请求完成后的结果判定，返回 true 表示需重试 */
+bool handle_part_result(dl_task_ctx *tCtx, dl_part_ctx *pCtx, CURLcode rc, long http_code);
+
+/** 每任务一个 curl_multi 事件循环，驱动本任务所有分片下载 */
+void run_parts_multi(dl_task_ctx *tCtx);
 
 /** 任务工作线程 */
 void task_thread_func(dl_task_ctx *tCtx);
