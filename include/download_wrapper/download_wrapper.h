@@ -124,6 +124,19 @@ typedef void (*dw_log_cb)(dw_log_level_t  level,
                           int32_t         line,
                           int64_t         timestamp_unix_ms);
 
+/**
+ * 断点续传数据回调。
+ *
+ * 当引擎生成 / 更新任务的断点续传数据时触发（如暂停、周期保存等时机）。
+ * data 指向 resume_data 字节缓冲、size 为长度，二者仅在本次回调周期内有效，
+ * 调用方如需持久化必须立即深拷贝。
+ * 目前仅 BT（libtorrent）任务会触发；HTTP 任务不产生 resume_data。
+ */
+typedef void (*dw_resume_data_cb)(const char*    task_id,
+                                  dw_protocol_t  protocol,
+                                  const uint8_t* data,
+                                  size_t         size);
+
 /* ================================================================== */
 /*                          结构体定义                                */
 /* ================================================================== */
@@ -376,6 +389,14 @@ DW_API void dw_set_progress_callback(dw_progress_cb cb);
  * cb 为 NULL 时日志输出到 stderr。
  */
 DW_API void dw_set_log_callback(dw_log_cb cb);
+
+/**
+ * 设置断点续传数据回调。
+ *
+ * 引擎生成 resume_data 时通过此回调输出，供上层持久化。
+ * cb 为 NULL 表示清除回调。
+ */
+DW_API void dw_set_resume_data_callback(dw_resume_data_cb cb);
 
 /* ================================================================== */
 /*                            任务接口                                */

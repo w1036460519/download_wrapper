@@ -32,6 +32,7 @@ struct dw_downloader {
 
     dw_progress_cb progress_cb = nullptr;
     dw_log_cb      log_cb      = nullptr;
+    dw_resume_data_cb resume_data_cb = nullptr;
 
     dw_config_t    config{};
 };
@@ -56,6 +57,16 @@ void log_message(dw_log_level_t level,
  * 内部进度推送，调用 progress_cb（若已注册）。
  */
 void post_progress(const dw_progress_t* progress);
+
+/**
+ * 内部断点续传数据推送，调用 resume_data_cb（若已注册）。
+ *
+ * data / size 仅在调用期间有效，回调内如需持有须深拷贝。
+ */
+void post_resume_data(const char*    task_id,
+                      dw_protocol_t  protocol,
+                      const uint8_t* data,
+                      size_t         size);
 
 } // namespace dw
 

@@ -77,6 +77,16 @@ void post_progress(const dw_progress_t* progress) {
     g_downloader->progress_cb(progress);
 }
 
+void post_resume_data(const char*    task_id,
+                      dw_protocol_t  protocol,
+                      const uint8_t* data,
+                      size_t         size) {
+    if (!g_downloader || !g_downloader->resume_data_cb || !task_id) {
+        return;
+    }
+    g_downloader->resume_data_cb(task_id, protocol, data, size);
+}
+
 } // namespace dw
 
 /// 格式化日志宏：自动捕获调用方函数名与行号。
@@ -187,6 +197,15 @@ DW_API void dw_set_log_callback(dw_log_cb cb) {
     }
     std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
     dw::g_downloader->log_cb = cb;
+}
+
+DW_API void dw_set_resume_data_callback(dw_resume_data_cb cb) {
+    if (!dw::g_downloader) {
+        DW_LOG(DW_LOG_DEBUG, "跳过: 全局单例不存在", "");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
+    dw::g_downloader->resume_data_cb = cb;
 }
 
 /* ------------------------------------------------------------------ */
