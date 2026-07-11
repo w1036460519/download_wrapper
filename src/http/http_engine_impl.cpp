@@ -60,7 +60,12 @@ namespace internal {
             {
                 const auto secs = static_cast<time_t>(ts / 1000);
                 struct tm tm_buf{};
+                // localtime_r 为 POSIX 专有；MSVC 用参数顺序一致的 localtime_s
+#ifdef _WIN32
+                localtime_s(&tm_buf, &secs);
+#else
                 localtime_r(&secs, &tm_buf);
+#endif
                 std::strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
             }
             const std::string base_name = file ? std::filesystem::path(file).filename().string() : std::string{};
