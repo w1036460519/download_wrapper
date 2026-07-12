@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # 自动跟进 GitHub Actions 官方/第三方 action 的版本更新
+  # Dependabot 会在检测到新版本时自动提 PR bump 版本号，review 合并即可
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # 允许大版本升级（如 Node 运行时切换导致的 v4 -> v5/v6）
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+    labels:
+      - "dependencies"
+      - "github-actions"
