@@ -140,6 +140,14 @@ jobs:
             build-x64/libdownload_wrapper.dylib \
             -output dist/libdownload_wrapper.dylib
 
+          # strip 符号：Release 无调试信息但仍保留静态链入依赖的符号表。
+          # -x 只去除本地符号，保留动态库加载必需的导出符号，最稳妥。
+          echo "== strip 前 =="
+          ls -l dist
+          strip -x dist/libdownload_wrapper.dylib
+          echo "== strip 后 =="
+          ls -l dist
+
           echo "== universal binary 架构验证 =="
           lipo -info dist/libdownload_wrapper.dylib
           file dist/libdownload_wrapper.dylib
@@ -159,6 +167,15 @@ jobs:
           mkdir -p dist
           # 兼容不同平台产物目录（多配置生成器会输出到 Release/ 子目录）
           find build -name "${{ matrix.output }}" -exec cp {} dist/ \;
+
+          # strip 符号：仅 Linux 的 .so 需手动裁剪（仍带静态链入依赖的符号表）；
+          # Windows 符号已分离到 .pdb，.dll 本身无需 strip。
+          if [ "${{ matrix.name }}" = "linux-x64" ]; then
+            echo "== strip 前 =="
+            ls -l dist
+            strip --strip-unneeded dist/libdownload_wrapper.so
+            echo "== strip 后 =="
+          fi
           ls -l dist
 
       # ---------- iOS：真机 arm64 静态库，合并依赖为自包含胖静态库 ----------
