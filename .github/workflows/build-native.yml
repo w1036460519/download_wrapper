@@ -215,6 +215,17 @@ jobs:
 
           mkdir -p dist
           find build -name "libdownload_wrapper.so" -exec cp {} dist/ \;
+
+          # strip 符号：NDK 直接输出的 .so 保留了完整符号表与 C++ 异常展开信息，
+          # 加上静态链入的 libtorrent/boost/openssl/curl，未裁剪时体积可达数十 MB。
+          # 正常 Gradle/AGP 打包 APK 时会自动 strip，此处取裸产物需手动裁剪，
+          # 与其他平台产物体积对齐。
+          STRIP=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -name 'llvm-strip' | head -1)
+          echo "strip=$STRIP"
+          echo "== strip 前 =="
+          ls -l dist
+          "$STRIP" --strip-unneeded dist/libdownload_wrapper.so
+          echo "== strip 后 =="
           ls -l dist
 
       - name: Upload artifact
