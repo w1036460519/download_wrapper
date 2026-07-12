@@ -11,6 +11,7 @@ on:
       - 'include/**'
       - 'CMakeLists.txt'
       - 'vcpkg.json'
+      - 'vcpkg-triplets/**'
       - '.github/workflows/build-native.yml'
   pull_request:
     paths:
@@ -18,6 +19,7 @@ on:
       - 'include/**'
       - 'CMakeLists.txt'
       - 'vcpkg.json'
+      - 'vcpkg-triplets/**'
       - '.github/workflows/build-native.yml'
   workflow_dispatch:
 
@@ -116,11 +118,15 @@ jobs:
         shell: bash
         run: |
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          # 覆盖 triplet：将 vcpkg 依赖的 macOS 部署目标锁定到 12.0，
+          # 与主库、App 一致，避免最终 dylib 的 minos 被抬到构建机 SDK 版本。
+          export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
 
           # arm64
           cmake -B build-arm64 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
             -DVCPKG_TARGET_TRIPLET=arm64-osx \
             -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
           cmake --build build-arm64 --config Release
@@ -129,6 +135,7 @@ jobs:
           cmake -B build-x64 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
             -DVCPKG_TARGET_TRIPLET=x64-osx \
             -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
           cmake --build build-x64 --config Release
@@ -151,6 +158,9 @@ jobs:
           echo "== universal binary 架构验证 =="
           lipo -info dist/libdownload_wrapper.dylib
           file dist/libdownload_wrapper.dylib
+
+          echo "== 部署目标验证（各架构 minos 应为 12.0）=="
+          otool -l dist/libdownload_wrapper.dylib | grep -A3 LC_BUILD_VERSION || true
 
       # ---------- Linux / Windows：单架构 ----------
       - name: Build (${{ matrix.name }})
