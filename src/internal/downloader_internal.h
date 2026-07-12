@@ -17,6 +17,7 @@ namespace dw {
 // 前向声明各协议引擎
 class HttpEngine;
 class TorrentEngine;
+class TaskManager;
 
 /**
  * 下载器全局单例内部实现。
@@ -29,6 +30,7 @@ struct dw_downloader {
 
     std::unique_ptr<HttpEngine>     http_engine;
     std::unique_ptr<TorrentEngine>  torrent_engine;
+    std::unique_ptr<TaskManager>    task_manager;
 
     dw_progress_cb progress_cb = nullptr;
     dw_log_cb      log_cb      = nullptr;
@@ -68,10 +70,23 @@ void post_resume_data(const char*    task_id,
                       const uint8_t* data,
                       size_t         size);
 
+/**
+ * 格式化日志输出（内部）。
+ *
+ * func / line 由 DW_LOGF 宏自动捕获；fmt 后接可变参。
+ */
+void emit_logf(dw_log_level_t level, const char* trace_id,
+               const char* func, int32_t line,
+               const char* fmt, ...);
+
 } // namespace dw
 
 /// 日志宏：自动捕获调用方函数名与行号。
 #define DW_LOG(level, message, trace_id) \
     dw::log_message((level), (message), (trace_id), __FUNCTION__, __LINE__)
+
+/// 格式化日志宏：自动捕获调用方函数名与行号。
+#define DW_LOGF(level, trace_id, fmt, ...) \
+    dw::emit_logf((level), (trace_id), __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__)
 
 #endif /* DOWNLOADER_INTERNAL_H */

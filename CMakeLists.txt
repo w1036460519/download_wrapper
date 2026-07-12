@@ -16,6 +16,7 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 # 查找依赖
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 # libtorrent 提供 CMake config 包，优先使用 find_package
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
@@ -35,6 +36,7 @@ endif()
 # 源文件
 set(DW_SOURCES
     src/download_wrapper.cpp
+    src/core/task_manager.cpp
     src/http/http_engine.cpp
     src/http/http_engine_impl.cpp
     src/torrent/torrent_engine.cpp
@@ -62,6 +64,7 @@ target_link_libraries(download_wrapper
         CURL::libcurl
         Threads::Threads
         LibtorrentRasterbar::torrent-rasterbar
+        unofficial::sqlite3::sqlite3
 )
 
 target_compile_definitions(download_wrapper PRIVATE DOWNLOAD_WRAPPER_BUILD)

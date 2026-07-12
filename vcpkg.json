@@ -4,6 +4,7 @@
   "description": "统一多协议下载封装库依赖声明（HTTP + BitTorrent）",
   "dependencies": [
     "curl",
+    "sqlite3",
     {
       "name": "libtorrent",
       "default-features": false

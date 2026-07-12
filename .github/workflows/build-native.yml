@@ -74,14 +74,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 缓存 vcpkg 的二进制归档目录（files provider 默认写入该目录）；
       # 命中后 libtorrent/boost/openssl/curl 等重依赖无需重复编译。
       # key 绑定平台 + vcpkg 版本 + vcpkg.json 哈希，依赖或版本变动时自动失效，
       # restore-keys 提供退化匹配，保证部分依赖仍可复用。
       - name: Cache vcpkg binary archives
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ matrix.bincache }}
           key: vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-${{ hashFiles('vcpkg.json') }}
@@ -246,7 +246,7 @@ jobs:
           ls -l dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: download_wrapper-${{ matrix.name }}
           path: dist/${{ matrix.output }}
@@ -264,7 +264,7 @@ jobs:
     steps:
       # 下载所有平台的构建产物（每个 job 一个 artifact）
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: artifacts
 

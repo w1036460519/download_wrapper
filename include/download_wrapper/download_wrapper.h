@@ -270,6 +270,10 @@ typedef struct dw_task_params {
     int32_t        file_index_size;  /**< file_indexes 数组长度。 */
     const char**   url_seeds;        /**< Web Seed URL 数组（BEP 19）。 */
     int32_t        url_seed_count;   /**< url_seeds 数组长度。 */
+
+    /* ===== 队列（通用，追加保持 ABI 兼容） ===== */
+
+    int32_t        priority;         /**< 队列优先级：越大越优先，默认 0；同级按提交顺序 FIFO。 */
 } dw_task_params_t;
 
 /* ------------------------------------------------------------------ */
@@ -325,7 +329,7 @@ typedef struct dw_config {
     /* ===== BT 配置（libtorrent） ===== */
 
     int32_t     listen_port;                 /**< BT 监听端口；0=随机。 */
-    int32_t     max_concurrent_downloads;    /**< 最大并发下载数（队列限流）。 */
+    int32_t     max_concurrent_downloads;    /**< 全局最大并发下载数（队列限流，HTTP+BT 共用）；<=0 时库内取默认值 3。 */
     int32_t     download_rate_limit;         /**< 下载限速（B/s）；0=不限。 */
     int32_t     upload_rate_limit;           /**< 上传限速（B/s）；0=不限。 */
     const char* session_state_path;          /**< session 状态保存目录。 */
@@ -337,6 +341,31 @@ typedef struct dw_config {
     dw_log_level_t log_level;                   /**< 日志级别。 */
     const char*    work_dir;                    /**< 工作目录（临时文件等）。 */
 } dw_config_t;
+
+/* ------------------------------------------------------------------ */
+/*  dw_task_snapshot_t — 任务列表快照（启动恢复用）                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 单个任务的持久化快照。
+ *
+ * 由 dw_list_tasks 返回，用于 App 启动时一次性还原任务列表；
+ * 之后的实时变更仍通过 dw_progress_cb 增量推送。
+ * 所有字符串由库分配，整个数组通过 dw_task_list_free 统一释放。
+ */
+typedef struct dw_task_snapshot {
+    char*            task_id;      /**< 任务标识：HTTP=URL，BT=info_hash。 */
+    dw_protocol_t    protocol;     /**< 协议类型。 */
+    char*            name;         /**< 任务显示名称。 */
+    char*            save_path;    /**< 保存目录。 */
+    char*            filename;     /**< 目标文件名（可能为空串）。 */
+    dw_task_status_t status;       /**< 持久化的任务状态。 */
+    double           progress;     /**< 进度 0.0-1.0；-1=未知。 */
+    int64_t          total_size;   /**< 总大小（字节）；-1=未知。 */
+    int64_t          total_done;   /**< 已完成字节；-1=未知。 */
+    int32_t          priority;     /**< 队列优先级。 */
+    int64_t          created_at;   /**< 创建时间（Unix 毫秒）。 */
+} dw_task_snapshot_t;
 
 /* ================================================================== */
 /*                            生命周期                                */
@@ -529,6 +558,34 @@ DW_API int32_t dw_get_file_list(const char*      task_id,
                                 int32_t*         out_count);
 
 /* ================================================================== */
+/*                        任务快照与队列                              */
+/* ================================================================== */
+
+/**
+ * 获取全部任务的持久化快照。
+ *
+ * 用于 App 启动时一次性还原任务列表（含已完成 / 暂停 / 排队 / 下载中）。
+ * 数据来自库内 SQLite，无需引擎运行即可返回。
+ *
+ * @param out_tasks  输出：堆分配的快照数组（调用者 dw_task_list_free 释放）。
+ * @param out_count  输出：任务数量。
+ * @return           0=成功，-1=失败。
+ */
+DW_API int32_t dw_list_tasks(dw_task_snapshot_t** out_tasks,
+                             int32_t*             out_count);
+
+/**
+ * 设置任务队列优先级（越大越优先）。
+ *
+ * 立即持久化并触发一次队列调度；对下载中任务仅更新优先级、不中断。
+ *
+ * @param task_id   任务标识，不可为 NULL。
+ * @param priority  新优先级值。
+ * @return          0=成功，-1=失败（任务不存在）。
+ */
+DW_API int32_t dw_set_task_priority(const char* task_id, int32_t priority);
+
+/* ================================================================== */
 /*                          资源释放                                  */
 /* ================================================================== */
 
@@ -546,6 +603,14 @@ DW_API void dw_submit_result_release(dw_submit_result_t* result);
  * @param count  数组长度。
  */
 DW_API void dw_file_list_free(dw_file_info_t* files, int32_t count);
+
+/**
+ * 释放任务快照数组（含各字段字符串）。
+ *
+ * @param tasks  dw_list_tasks 返回的数组。
+ * @param count  数组长度。
+ */
+DW_API void dw_task_list_free(dw_task_snapshot_t* tasks, int32_t count);
 
 /**
  * 通用内存释放。

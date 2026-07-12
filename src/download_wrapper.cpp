@@ -6,6 +6,7 @@
 #include "download_wrapper/download_wrapper.h"
 
 #include "internal/downloader_internal.h"
+#include "core/task_manager.h"
 #include "http/http_engine.h"
 #include "torrent/torrent_engine.h"
 
@@ -71,27 +72,34 @@ void log_message(dw_log_level_t level,
 }
 
 void post_progress(const dw_progress_t* progress) {
-    if (!g_downloader || !g_downloader->progress_cb || !progress) {
+    if (!g_downloader || !progress) {
         return;
     }
-    g_downloader->progress_cb(progress);
+    // 优先经 TaskManager 拦截（更新快照 / 持久化 / 触发调度），内部再转发上层。
+    if (g_downloader->task_manager) {
+        g_downloader->task_manager->on_progress(progress);
+    } else if (g_downloader->progress_cb) {
+        g_downloader->progress_cb(progress);
+    }
 }
 
 void post_resume_data(const char*    task_id,
                       dw_protocol_t  protocol,
                       const uint8_t* data,
                       size_t         size) {
-    if (!g_downloader || !g_downloader->resume_data_cb || !task_id) {
+    if (!g_downloader || !task_id) {
         return;
     }
-    g_downloader->resume_data_cb(task_id, protocol, data, size);
+    // resume_data 由库内 SQLite 持久化；同时保留对外回调以兼容已注册的调用方。
+    if (g_downloader->task_manager) {
+        g_downloader->task_manager->on_resume_data(task_id, protocol, data, size);
+    }
+    if (g_downloader->resume_data_cb) {
+        g_downloader->resume_data_cb(task_id, protocol, data, size);
+    }
 }
 
 } // namespace dw
-
-/// 格式化日志宏：自动捕获调用方函数名与行号。
-#define DW_LOGF(level, trace_id, fmt, ...) \
-    dw::emit_logf((level), (trace_id), __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__)
 
 /* ================================================================== */
 /*                          C ABI 接口实现                            */
@@ -135,6 +143,19 @@ DW_API int32_t dw_init(const dw_config_t* cfg) {
     }
 
     dw::g_downloader->initialized.store(true);
+
+    // 启动任务中枢：打开 SQLite、加载注册表、启动事件驱动调度线程。
+    dw::g_downloader->task_manager = std::make_unique<dw::TaskManager>();
+    dw::g_downloader->task_manager->set_engines(
+        dw::g_downloader->http_engine.get(),
+        dw::g_downloader->torrent_engine.get());
+    dw::g_downloader->task_manager->set_progress_cb(dw::g_downloader->progress_cb);
+    if (dw::g_downloader->task_manager->start(dw::g_downloader->config) != 0) {
+        DW_LOG(DW_LOG_ERROR, "失败: TaskManager 启动失败", "");
+        dw::g_downloader->task_manager.reset();
+        return -1;
+    }
+
     DW_LOG(DW_LOG_INFO, "初始化完成", "");
     return 0;
 }
@@ -149,6 +170,12 @@ DW_API void dw_destroy(void) {
     if (!dw::g_downloader->initialized.load()) {
         DW_LOG(DW_LOG_DEBUG, "跳过: 尚未初始化", "");
         return;
+    }
+
+    // 先停止调度线程并最终刷库，再销毁引擎。
+    if (dw::g_downloader->task_manager) {
+        dw::g_downloader->task_manager->stop();
+        dw::g_downloader->task_manager.reset();
     }
 
     if (dw::g_downloader->http_engine) {
@@ -188,6 +215,9 @@ DW_API void dw_set_progress_callback(dw_progress_cb cb) {
     }
     std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
     dw::g_downloader->progress_cb = cb;
+    if (dw::g_downloader->task_manager) {
+        dw::g_downloader->task_manager->set_progress_cb(cb);
+    }
 }
 
 DW_API void dw_set_log_callback(dw_log_cb cb) {
@@ -229,19 +259,15 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
         return -1;
     }
 
-    switch (protocol) {
-        case DW_PROTOCOL_HTTP:
-            return d->http_engine->add_task(params, out_result);
-        case DW_PROTOCOL_TORRENT:
-            return d->torrent_engine->add_task(params, out_result);
-        default:
-            out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
-            out_result->message = nullptr;
-            DW_LOGF(DW_LOG_ERROR, trace_id,
-                "失败: 未知协议 protocol=%d", protocol);
-            return -1;
+    if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
+        out_result->task_id = nullptr;
+        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->message = nullptr;
+        DW_LOGF(DW_LOG_ERROR, trace_id, "失败: 未知协议 protocol=%d", protocol);
+        return -1;
     }
+    // 入队 + 调度由 TaskManager 统一接管，引擎启动由调度线程按并发额度触发。
+    return d->task_manager->add(protocol, params, out_result);
 }
 
 DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
@@ -260,19 +286,14 @@ DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
         return -1;
     }
 
-    switch (protocol) {
-        case DW_PROTOCOL_HTTP:
-            return d->http_engine->pause_task(id, out_result);
-        case DW_PROTOCOL_TORRENT:
-            return d->torrent_engine->pause_task(id, out_result);
-        default:
-            out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
-            out_result->message = nullptr;
-            DW_LOGF(DW_LOG_ERROR, "",
-                "失败: 未知协议 protocol=%d", protocol);
-            return -1;
+    if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
+        out_result->task_id = nullptr;
+        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->message = nullptr;
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
+        return -1;
     }
+    return d->task_manager->pause(protocol, id, out_result);
 }
 
 DW_API int32_t dw_resume_task(dw_protocol_t           protocol,
@@ -292,19 +313,14 @@ DW_API int32_t dw_resume_task(dw_protocol_t           protocol,
         return -1;
     }
 
-    switch (protocol) {
-        case DW_PROTOCOL_HTTP:
-            return d->http_engine->resume_task(params, out_result);
-        case DW_PROTOCOL_TORRENT:
-            return d->torrent_engine->resume_task(params, out_result);
-        default:
-            out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
-            out_result->message = nullptr;
-            DW_LOGF(DW_LOG_ERROR, trace_id,
-                "失败: 未知协议 protocol=%d", protocol);
-            return -1;
+    if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
+        out_result->task_id = nullptr;
+        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->message = nullptr;
+        DW_LOGF(DW_LOG_ERROR, trace_id, "失败: 未知协议 protocol=%d", protocol);
+        return -1;
     }
+    return d->task_manager->resume(protocol, params, out_result);
 }
 
 DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
@@ -323,19 +339,14 @@ DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
         return -1;
     }
 
-    switch (protocol) {
-        case DW_PROTOCOL_HTTP:
-            return d->http_engine->delete_task(id, out_result);
-        case DW_PROTOCOL_TORRENT:
-            return d->torrent_engine->delete_task(id, out_result);
-        default:
-            out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
-            out_result->message = nullptr;
-            DW_LOGF(DW_LOG_ERROR, "",
-                "失败: 未知协议 protocol=%d", protocol);
-            return -1;
+    if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
+        out_result->task_id = nullptr;
+        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->message = nullptr;
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
+        return -1;
     }
+    return d->task_manager->remove(protocol, id, out_result);
 }
 
 /* ------------------------------------------------------------------ */
@@ -421,6 +432,36 @@ DW_API int32_t dw_get_file_list(const char*      task_id,
 }
 
 /* ------------------------------------------------------------------ */
+/*  任务快照与队列                                              */
+/* ------------------------------------------------------------------ */
+
+DW_API int32_t dw_list_tasks(dw_task_snapshot_t** out_tasks,
+                             int32_t*             out_count) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager ||
+        !out_tasks || !out_count) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d out_tasks=%p out_count=%p",
+            d, d ? d->initialized.load() : 0, out_tasks, out_count);
+        if (out_tasks) *out_tasks = nullptr;
+        if (out_count) *out_count = 0;
+        return -1;
+    }
+    return d->task_manager->list(out_tasks, out_count);
+}
+
+DW_API int32_t dw_set_task_priority(const char* task_id, int32_t priority) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager || !task_id) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d task_id=%p",
+            d, d ? d->initialized.load() : 0, task_id);
+        return -1;
+    }
+    return d->task_manager->set_priority(task_id, priority);
+}
+
+/* ------------------------------------------------------------------ */
 /*  资源释放                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -445,6 +486,19 @@ DW_API void dw_file_list_free(dw_file_info_t* files, int32_t count) {
         }
     }
     std::free(files);
+}
+
+DW_API void dw_task_list_free(dw_task_snapshot_t* tasks, int32_t count) {
+    if (!tasks || count <= 0) {
+        return;
+    }
+    for (int32_t i = 0; i < count; ++i) {
+        std::free(tasks[i].task_id);
+        std::free(tasks[i].name);
+        std::free(tasks[i].save_path);
+        std::free(tasks[i].filename);
+    }
+    std::free(tasks);
 }
 
 DW_API void dw_free(void* ptr) {
