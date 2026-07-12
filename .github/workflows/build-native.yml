@@ -26,8 +26,9 @@ env:
   # 注意：msys2 上游镜像会定期清理旧包，过老的 tag 会导致 pkgconfig 等 msys 依赖下载失败，
   # 需保持相对较新的 release tag
   VCPKG_REF: '2026.06.24'
-  # 启用 GitHub Actions Cache 作为 vcpkg binary cache 后端
-  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+  # 说明：vcpkg 的 x-gha 后端已于 2025 年 4 月随 GitHub Actions Cache API 变更被移除，
+  # 故不再配置 VCPKG_BINARY_SOURCES。vcpkg 默认启用 files provider，将二进制归档写入
+  # 各平台默认缓存目录，该目录由下方 actions/cache 步骤跨次构建持久化。
 
 jobs:
   build:
@@ -37,31 +38,37 @@ jobs:
       matrix:
         include:
           # macOS：编译 arm64 + x86_64 后用 lipo 合并为单个 universal .dylib
+          # bincache 为 vcpkg 默认二进制缓存目录，供 actions/cache 持久化
           - name: macos-universal
             os: macos-14
             triplet: ''            # 见下方 macOS 专用步骤，单独处理双 triplet
             output: libdownload_wrapper.dylib
+            bincache: ~/.cache/vcpkg/archives
           # Linux 仅 x86_64
           - name: linux-x64
             os: ubuntu-24.04
             triplet: x64-linux
             output: libdownload_wrapper.so
+            bincache: ~/.cache/vcpkg/archives
           # Windows 仅 x64（static-md：依赖静态链入 DLL，CRT 用系统动态运行时，产物自包含）
           - name: windows-x64
             os: windows-2022
             triplet: x64-windows-static-md
             output: download_wrapper.dll
+            bincache: ~\AppData\Local\vcpkg\archives
           # iOS：真机 arm64 静态库（.a）。iOS 不允许加载未签名独立动态库，
           # 故编静态库并合并依赖为自包含胖库，随 Runner 链接
           - name: ios-arm64
             os: macos-14
             triplet: arm64-ios
             output: libdownload_wrapper.a
+            bincache: ~/.cache/vcpkg/archives
           # Android：仅 arm64-v8a（NDK 交叉编译，.so 依赖静态链入自包含）
           - name: android-arm64-v8a
             os: ubuntu-24.04
             triplet: arm64-android
             output: libdownload_wrapper.so
+            bincache: ~/.cache/vcpkg/archives
 
     runs-on: ${{ matrix.os }}
 
@@ -69,13 +76,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 导出 x-gha 后端所需的运行时变量（否则 binary cache 无法读写）
-      - name: Export GitHub Actions cache env
-        uses: actions/github-script@v7
+      # 缓存 vcpkg 的二进制归档目录（files provider 默认写入该目录）；
+      # 命中后 libtorrent/boost/openssl/curl 等重依赖无需重复编译。
+      # key 绑定平台 + vcpkg 版本 + vcpkg.json 哈希，依赖或版本变动时自动失效，
+      # restore-keys 提供退化匹配，保证部分依赖仍可复用。
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ${{ matrix.bincache }}
+          key: vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-
+            vcpkg-${{ matrix.name }}-
 
       # 手动 clone 并 bootstrap vcpkg，固定到 VCPKG_REF 发布 tag
       - name: Setup vcpkg
