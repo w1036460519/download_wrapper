@@ -9,8 +9,8 @@
 #include "core/task_manager.h"
 #include "http/http_engine.h"
 #include "torrent/torrent_engine.h"
+#include "utils/time_util.h"
 
-#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -53,8 +53,7 @@ void log_message(dw_log_level_t level,
                  const char*    func,
                  int32_t        line) {
     const char* tid = (trace_id && trace_id[0]) ? trace_id : "";
-    const int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t ts = utils::now_unix_ms();
     if (g_downloader && g_downloader->log_cb) {
         g_downloader->log_cb(level, message, tid, func ? func : "", line, ts);
     } else {
@@ -65,8 +64,9 @@ void log_message(dw_log_level_t level,
             case DW_LOG_ERROR: lvl_str = "ERROR"; break;
             default: break;
         }
-        std::fprintf(stderr, "[download_wrapper][%s][%lld] %s:%d %s: %s\n",
-                     lvl_str, static_cast<long long>(ts),
+        const std::string time_str = utils::format_unix_ms(ts);
+        std::fprintf(stderr, "[download_wrapper][%s][%s] %s:%d %s: %s\n",
+                     lvl_str, time_str.c_str(),
                      func ? func : "?", line, tid, message);
     }
 }
@@ -199,8 +199,17 @@ DW_API int32_t dw_set_config(const dw_config_t* cfg) {
         return -1;
     }
 
-    std::lock_guard<std::mutex> lock(d->mutex);
-    d->config = *cfg;
+    dw::TaskManager* tm = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(d->mutex);
+        d->config = *cfg;
+        tm = d->task_manager.get();
+    }
+    // 流量闸门：wifi_only 且当前非 WiFi 时关闭。锁外下发，避免持 d->mutex 时触发合成回调重入。
+    if (tm) {
+        const bool allowed = !(cfg->wifi_only != 0 && cfg->is_wifi == 0);
+        tm->set_network_allowed(allowed);
+    }
     return 0;
 }
 

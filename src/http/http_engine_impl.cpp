@@ -12,6 +12,7 @@
 #include "http/http_engine_internal.h"
 
 #include "internal/downloader_internal.h"
+#include "utils/time_util.h"
 
 #include <filesystem>
 
@@ -29,12 +30,10 @@ dw_log_cb g_log_cb = nullptr;
 
 namespace internal {
 
-    static constexpr int64_t DEFAULT_PART_SIZE = 1 * 1024 * 1024; /* 1 MiB */
+    using dw::utils::format_unix_ms;
+    using dw::utils::now_unix_ms;
 
-    int64_t now_unix_ms() {
-        using namespace std::chrono;
-        return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    }
+    static constexpr int64_t DEFAULT_PART_SIZE = 1 * 1024 * 1024; /* 1 MiB */
 
     static constexpr const char *log_level_name(int lvl) {
         switch (lvl) {
@@ -56,22 +55,11 @@ namespace internal {
                func ? func : "", line, ts);
         } else {
             /* 回调未就绪，fallback 到 stderr：格式化全部信息 */
-            char ts_buf[32];
-            {
-                const auto secs = static_cast<time_t>(ts / 1000);
-                struct tm tm_buf{};
-                // localtime_r 为 POSIX 专有；MSVC 用参数顺序一致的 localtime_s
-#ifdef _WIN32
-                localtime_s(&tm_buf, &secs);
-#else
-                localtime_r(&secs, &tm_buf);
-#endif
-                std::strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
-            }
+            const std::string ts_buf = format_unix_ms(ts);
             const std::string base_name = file ? std::filesystem::path(file).filename().string() : std::string{};
             const char *base = base_name.empty() ? "?" : base_name.c_str();
             std::fprintf(stderr, "[%s] [%s] %s:%d (%s): %s\n",
-                         ts_buf, log_level_name(lvl),
+                         ts_buf.c_str(), log_level_name(lvl),
                          base, line, func ? func : "?", msg);
         }
     }
@@ -898,6 +886,8 @@ namespace internal {
 
 
     void task_thread_func(dl_task_ctx *tCtx) {
+        // 线程退出即置位（在所有终态推送之后），确保 sweep 只在推送完成后回收上下文，规避 use-after-free
+        struct DoneGuard { dl_task_ctx *t; ~DoneGuard() { t->thread_done.store(1); } } done_guard{tCtx};
         try {
         {
             dl_part_ctx probe_ctx{};

@@ -13,29 +13,32 @@
 #include "internal/downloader_internal.h"
 #include "http/http_engine.h"
 #include "torrent/torrent_engine.h"
+#include "utils/string_util.h"
+#include "utils/time_util.h"
 
 #include <sqlite3.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <sstream>
 
 namespace dw {
 
+using utils::now_unix_ms;
+using utils::join_lines;
+using utils::split_lines;
+using utils::join_ints;
+using utils::split_ints;
+
 namespace {
 
-/// 当前 Unix 毫秒时间戳。
-int64_t now_unix_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-/// 占用下载额度的状态集合：非 {QUEUED, PAUSED, COMPLETED, ERROR} 即占额度。
+/// 占用下载额度的状态集合：明确列举活跃态 {DOWNLOADING, PARSING, PARSED}。
+/// 其余状态（QUEUED / PAUSED / COMPLETED / ERROR）均不占额度。
 bool status_occupies_slot(dw_task_status_t s) {
-    return s != DW_TASK_STATUS_QUEUED && s != DW_TASK_STATUS_PAUSED &&
-           s != DW_TASK_STATUS_COMPLETED && s != DW_TASK_STATUS_ERROR;
+    return s == DW_TASK_STATUS_DOWNLOADING ||
+           s == DW_TASK_STATUS_PARSING ||
+           s == DW_TASK_STATUS_PARSED;
 }
 
 /// std::string 拷贝为堆分配 C 字符串（供快照数组使用，调用方 free）。
@@ -45,52 +48,69 @@ char* dup_cstr(const std::string& s) {
     return p;
 }
 
-/// 以 '\n' 连接字符串数组（trackers 序列化）。
-std::string join_lines(const std::vector<std::string>& v) {
-    std::string out;
-    for (size_t i = 0; i < v.size(); ++i) {
-        if (i) out.push_back('\n');
-        out += v[i];
-    }
-    return out;
-}
-
-/// 按 '\n' 拆分（trackers 反序列化），忽略空行。
-std::vector<std::string> split_lines(const std::string& s) {
-    std::vector<std::string> out;
-    std::string line;
-    std::istringstream iss(s);
-    while (std::getline(iss, line)) {
-        if (!line.empty()) out.push_back(line);
-    }
-    return out;
-}
-
-/// 以 ',' 连接整型数组（file_indexes 序列化）。
-std::string join_ints(const std::vector<int32_t>& v) {
-    std::string out;
-    for (size_t i = 0; i < v.size(); ++i) {
-        if (i) out.push_back(',');
-        out += std::to_string(v[i]);
-    }
-    return out;
-}
-
-/// 按 ',' 拆分整型数组（file_indexes 反序列化）。
-std::vector<int32_t> split_ints(const std::string& s) {
-    std::vector<int32_t> out;
-    std::string tok;
-    std::istringstream iss(s);
-    while (std::getline(iss, tok, ',')) {
-        if (!tok.empty()) out.push_back(std::atoi(tok.c_str()));
-    }
-    return out;
-}
-
 /// SQLite text 列安全读取（NULL 返回空串）。
 std::string col_text(sqlite3_stmt* st, int idx) {
     const unsigned char* t = sqlite3_column_text(st, idx);
     return t ? reinterpret_cast<const char*>(t) : std::string();
+}
+
+/// HTTP 分片续传态序列化：每行 "index,start,end,done"，仅存续传必需字段。
+std::string serialize_parts(const std::vector<dw_part_state_t>& parts) {
+    std::string out;
+    for (const auto& p : parts) {
+        if (!out.empty()) out.push_back('\n');
+        out += std::to_string(p.index); out.push_back(',');
+        out += std::to_string(p.start); out.push_back(',');
+        out += std::to_string(p.end);   out.push_back(',');
+        out += std::to_string(p.done);
+    }
+    return out;
+}
+
+/// 反序列化 HTTP 分片续传态；坏行跳过。size/status 等运行态由引擎续传时重算。
+std::vector<dw_part_state_t> deserialize_parts(const std::string& s) {
+    std::vector<dw_part_state_t> parts;
+    for (const auto& line : split_lines(s)) {
+        long long idx = 0, st = 0, en = 0, dn = 0;
+        if (std::sscanf(line.c_str(), "%lld,%lld,%lld,%lld", &idx, &st, &en, &dn) != 4)
+            continue;
+        dw_part_state_t p{};
+        p.index  = static_cast<int32_t>(idx);
+        p.start  = static_cast<int64_t>(st);
+        p.end    = static_cast<int64_t>(en);
+        p.done   = static_cast<int64_t>(dn);
+        p.size   = (p.end >= p.start) ? (p.end - p.start + 1) : 0;
+        p.status = DW_TASK_STATUS_DOWNLOADING;
+        p.reason = DW_REASON_NONE;
+        parts.push_back(p);
+    }
+    return parts;
+}
+
+/// 从查询行填充 TaskRecord（db_load_all 与 db_load_by_id 共用，列序须与 SELECT 一致）。
+void fill_record(sqlite3_stmt* st, TaskRecord& r) {
+    r.task_id       = col_text(st, 0);
+    r.protocol      = static_cast<dw_protocol_t>(sqlite3_column_int(st, 1));
+    r.name          = col_text(st, 2);
+    r.save_path     = col_text(st, 3);
+    r.filename      = col_text(st, 4);
+    r.url           = col_text(st, 5);
+    r.magnet_link   = col_text(st, 6);
+    r.torrent_file  = col_text(st, 7);
+    r.trackers      = split_lines(col_text(st, 8));
+    r.file_indexes  = split_ints(col_text(st, 9));
+    r.auto_start    = sqlite3_column_int(st, 10);
+    r.priority      = sqlite3_column_int(st, 11);
+    r.status        = static_cast<dw_task_status_t>(sqlite3_column_int(st, 12));
+    r.progress      = sqlite3_column_double(st, 13);
+    r.total_size    = sqlite3_column_int64(st, 14);
+    r.total_done    = sqlite3_column_int64(st, 15);
+    r.support_range = sqlite3_column_int(st, 16);
+    r.etag          = col_text(st, 17);
+    r.last_modified = col_text(st, 18);
+    r.created_at    = sqlite3_column_int64(st, 19);
+    r.submit_seq    = sqlite3_column_int64(st, 20);
+    r.parts         = deserialize_parts(col_text(st, 21));
 }
 
 } // namespace
@@ -129,7 +149,9 @@ int32_t TaskManager::start(const dw_config_t& cfg) {
         return -1;
     }
     db_init_schema();
-    db_load_all();
+    db_load_active();
+    // submit_seq 单调性需覆盖全量（含未载入的暂停/完成/错误任务），避免新任务序号冲突。
+    seq_counter_ = db_max_submit_seq();
 
     // 重启归一化：既有 downloading/parsing/parsed 状态无引擎支撑，退回 QUEUED 重新准入。
     for (auto& kv : tasks_) {
@@ -139,10 +161,12 @@ int32_t TaskManager::start(const dw_config_t& cfg) {
             r.queued_notified = false;
             db_upsert(r);
         }
-        if (r.submit_seq > seq_counter_) seq_counter_ = r.submit_seq;
     }
 
     running_.store(true);
+    // 初始流量闸门：wifi_only 且非 WiFi 时关闭（挂起 torrent session、不准入新任务）。
+    net_allowed_ = !(cfg.wifi_only != 0 && cfg.is_wifi == 0);
+    if (!net_allowed_ && torrent_) torrent_->set_network_paused(true);
     schedule_needed_ = true; // 唤醒后立即准入恢复的排队任务
     worker_ = std::thread(&TaskManager::scheduler_loop, this);
 
@@ -203,6 +227,15 @@ int32_t TaskManager::add(dw_protocol_t proto, const dw_task_params_t* params,
                 db_upsert(r);
             }
             schedule_needed_ = true;
+        } else if (TaskRecord existing; db_load_by_id(id, existing)) {
+            // 已落库任务（暂停/错误）重新入队；已完成任务保持不变（幂等 no-op）。
+            if (existing.status != DW_TASK_STATUS_COMPLETED) {
+                existing.status          = DW_TASK_STATUS_QUEUED;
+                existing.queued_notified = false;
+                tasks_[id] = std::move(existing);
+                db_upsert(tasks_[id]);
+                schedule_needed_ = true;
+            }
         } else {
             TaskRecord r;
             r.task_id     = id;
@@ -265,6 +298,8 @@ int32_t TaskManager::pause(dw_protocol_t proto, const char* id,
         it->second.queued_notified = false;
         db_upsert(it->second);
         copy = it->second;
+        // 暂停任务落库后从内存移除，仅保留活跃/排队任务常驻。
+        tasks_.erase(it);
     }
 
     // 仅对引擎持有的活跃任务下发暂停；排队 / 终态任务无需通知引擎。
@@ -298,15 +333,24 @@ int32_t TaskManager::resume(dw_protocol_t /*proto*/, const dw_task_params_t* par
     {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = tasks_.find(params->task_id);
-        if (it == tasks_.end()) {
-            out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
-            out->message = nullptr;
-            return -1;
+        if (it != tasks_.end()) {
+            // 恢复即重新入队，实际引擎启动交由调度线程按并发额度准入。
+            it->second.status          = DW_TASK_STATUS_QUEUED;
+            it->second.queued_notified = false;
+            db_upsert(it->second);
+        } else {
+            // 已落库的暂停/错误任务：回读全字段后重新入队。
+            TaskRecord r;
+            if (!db_load_by_id(params->task_id, r)) {
+                out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+                out->message = nullptr;
+                return -1;
+            }
+            r.status          = DW_TASK_STATUS_QUEUED;
+            r.queued_notified = false;
+            tasks_[params->task_id] = std::move(r);
+            db_upsert(tasks_[params->task_id]);
         }
-        // 恢复即重新入队，实际引擎启动交由调度线程按并发额度准入。
-        it->second.status          = DW_TASK_STATUS_QUEUED;
-        it->second.queued_notified = false;
-        db_upsert(it->second);
         schedule_needed_ = true;
     }
     cv_.notify_one();
@@ -327,12 +371,18 @@ int32_t TaskManager::remove(dw_protocol_t proto, const char* id,
     {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = tasks_.find(id);
-        if (it == tasks_.end()) {
-            out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
-            out->message = nullptr;
-            return -1;
+        const bool present = (it != tasks_.end());
+        // 内存未命中时查库确认存在性，避免误删不存在任务仍返回成功。
+        if (!present) {
+            TaskRecord probe;
+            if (!db_load_by_id(id, probe)) {
+                out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+                out->message = nullptr;
+                return -1;
+            }
+        } else {
+            tasks_.erase(it);
         }
-        tasks_.erase(it);
         db_delete(id);
     }
 
@@ -358,9 +408,16 @@ int32_t TaskManager::set_priority(const char* id, int32_t priority) {
     {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = tasks_.find(id);
-        if (it == tasks_.end()) return -1;
-        it->second.priority = priority;
-        db_upsert(it->second);
+        if (it != tasks_.end()) {
+            it->second.priority = priority;
+            db_upsert(it->second);
+        } else {
+            // 已落库的暂停/错误任务：回读后仅更新优先级并写回。
+            TaskRecord r;
+            if (!db_load_by_id(id, r)) return -1;
+            r.priority = priority;
+            db_upsert(r);
+        }
         schedule_needed_ = true; // 仅影响排队顺序，不打断下载中的任务
     }
     cv_.notify_one();
@@ -393,11 +450,22 @@ void TaskManager::on_progress(const dw_progress_t* p) {
             r.support_range = p->support_range;
             if (p->etag && p->etag[0])          r.etag          = p->etag;
             if (p->last_modified && p->last_modified[0]) r.last_modified = p->last_modified;
+            // HTTP 分片续传态随进度落库（BT 无分片，part_count=0）。
+            if (r.protocol == DW_PROTOCOL_HTTP && p->part_count > 0 && p->part_states) {
+                r.parts.assign(p->part_states, p->part_states + p->part_count);
+            }
             r.dirty = true;
 
             // 任务由占额度状态跌落为释放额度状态时，唤醒调度补位。
             if (status_occupies_slot(before) && !status_occupies_slot(r.status)) {
                 need_schedule = true;
+            }
+
+            // 终态（完成/错误）落库后即从内存移除，仅保留活跃/排队任务常驻。
+            if (r.status == DW_TASK_STATUS_COMPLETED ||
+                r.status == DW_TASK_STATUS_ERROR) {
+                db_upsert(r);        // erase 前落最终快照（r 引用此后失效）
+                tasks_.erase(it);
             }
         }
     }
@@ -429,29 +497,59 @@ int32_t TaskManager::list(dw_task_snapshot_t** out_tasks, int32_t* out_count) {
     if (!out_tasks || !out_count) return -1;
 
     std::lock_guard<std::mutex> lock(mtx_);
-    const int32_t n = static_cast<int32_t>(tasks_.size());
+
+    // 先刷写活跃任务脏进度，使快照反映最新内存态（暂停/完成/错误已在状态迁移时落库）。
+    for (auto& kv : tasks_) {
+        if (kv.second.dirty) {
+            db_upsert(kv.second);
+            kv.second.dirty = false;
+        }
+    }
+
+    // 全量任务来自库（含未常驻内存的暂停/完成/错误任务）。
+    const char* sql =
+        "SELECT task_id, protocol, name, save_path, filename, status,"
+        "       progress, total_size, total_done, priority, created_at"
+        " FROM tasks;";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+        *out_tasks = nullptr; *out_count = 0; return -1;
+    }
+
+    std::vector<dw_task_snapshot_t> rows;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        dw_task_snapshot_t s{};
+        s.task_id    = dup_cstr(col_text(st, 0));
+        s.protocol   = static_cast<dw_protocol_t>(sqlite3_column_int(st, 1));
+        s.name       = dup_cstr(col_text(st, 2));
+        s.save_path  = dup_cstr(col_text(st, 3));
+        s.filename   = dup_cstr(col_text(st, 4));
+        s.status     = static_cast<dw_task_status_t>(sqlite3_column_int(st, 5));
+        s.progress   = sqlite3_column_double(st, 6);
+        s.total_size = sqlite3_column_int64(st, 7);
+        s.total_done = sqlite3_column_int64(st, 8);
+        s.priority   = sqlite3_column_int(st, 9);
+        s.created_at = sqlite3_column_int64(st, 10);
+        rows.push_back(s);
+    }
+    sqlite3_finalize(st);
+
+    const int32_t n = static_cast<int32_t>(rows.size());
     if (n == 0) { *out_tasks = nullptr; *out_count = 0; return 0; }
 
     auto* arr = static_cast<dw_task_snapshot_t*>(
         std::calloc(n, sizeof(dw_task_snapshot_t)));
-    if (!arr) { *out_tasks = nullptr; *out_count = 0; return -1; }
-
-    int32_t i = 0;
-    for (auto& kv : tasks_) {
-        const TaskRecord& r = kv.second;
-        arr[i].task_id    = dup_cstr(r.task_id);
-        arr[i].protocol   = r.protocol;
-        arr[i].name       = dup_cstr(r.name);
-        arr[i].save_path  = dup_cstr(r.save_path);
-        arr[i].filename   = dup_cstr(r.filename);
-        arr[i].status     = r.status;
-        arr[i].progress   = r.progress;
-        arr[i].total_size = r.total_size;
-        arr[i].total_done = r.total_done;
-        arr[i].priority   = r.priority;
-        arr[i].created_at = r.created_at;
-        ++i;
+    if (!arr) {
+        // 分配失败：释放已 dup 的字符串，避免泄漏。
+        for (auto& s : rows) {
+            std::free(const_cast<char*>(s.task_id));
+            std::free(const_cast<char*>(s.name));
+            std::free(const_cast<char*>(s.save_path));
+            std::free(const_cast<char*>(s.filename));
+        }
+        *out_tasks = nullptr; *out_count = 0; return -1;
     }
+    for (int32_t i = 0; i < n; ++i) arr[i] = rows[i];
     *out_tasks = arr;
     *out_count = n;
     return 0;
@@ -480,12 +578,20 @@ void TaskManager::scheduler_loop() {
             schedule_needed_ = false;
             run_schedule(lock);
         }
+
+        // 引擎周期性维护策略：HTTP 回收终态任务上下文、Torrent 释放已达分享率的做种任务。
+        // 锁外调用，避免与引擎内部锁交叉等待。
+        lock.unlock();
+        if (http_)    http_->sweep();
+        if (torrent_) torrent_->sweep();
+        lock.lock();
     }
 }
 
 void TaskManager::run_schedule(std::unique_lock<std::mutex>& lock) {
     // 准入循环：额度未满且存在排队任务时，按 (priority, submit_seq) 取最优准入。
-    while (running_.load()) {
+    // 流量闸门关闭时不准入任何新任务，仅保留下方的 QUEUED 合成通知。
+    while (running_.load() && net_allowed_) {
         int32_t active = active_count_locked();
         if (active >= max_concurrent_) break;
 
@@ -539,6 +645,54 @@ void TaskManager::run_schedule(std::unique_lock<std::mutex>& lock) {
         for (auto& r : to_notify) emit_synthetic(r);
         lock.lock();
     }
+}
+
+void TaskManager::set_network_allowed(bool allowed) {
+    std::vector<std::string> http_to_pause;   // 需停传输的活跃 HTTP 任务
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (net_allowed_ == allowed) return;   // 状态未变，幂等跳过
+        net_allowed_ = allowed;
+        if (!allowed) {
+            // 闸门关闭：torrent 整体挂起（含做种流量），收集活跃 HTTP 任务待锁外停线程。
+            if (torrent_) torrent_->set_network_paused(true);
+            for (auto& kv : tasks_) {
+                TaskRecord& r = kv.second;
+                if (r.protocol == DW_PROTOCOL_HTTP && status_occupies_slot(r.status)) {
+                    http_to_pause.push_back(r.task_id);
+                }
+            }
+        } else {
+            // 闸门开启：恢复 session，唤醒调度自动重启排队任务（HTTP 走既有 QUEUED→准入路径）。
+            if (torrent_) torrent_->set_network_paused(false);
+            schedule_needed_ = true;
+        }
+    }
+    if (allowed) { cv_.notify_one(); return; }
+
+    // 锁外停止 HTTP 传输线程（pause_task 内部 join，不可持 mtx_ 调用以规避死锁）。
+    for (const auto& id : http_to_pause) {
+        dw_submit_result_t res{};
+        http_->pause_task(id.c_str(), &res);
+        dw_submit_result_release(&res);
+    }
+
+    // 线程已停，回落 QUEUED 待闸门开启后重启；收集 QUEUED 合成通知。
+    std::vector<TaskRecord> to_notify;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (const auto& id : http_to_pause) {
+            auto it = tasks_.find(id);
+            if (it == tasks_.end()) continue;
+            TaskRecord& r = it->second;
+            if (r.protocol != DW_PROTOCOL_HTTP) continue;
+            r.status          = DW_TASK_STATUS_QUEUED;
+            r.queued_notified = true;   // 已在此处合成，避免调度重复通知
+            db_upsert(r);
+            to_notify.push_back(r);
+        }
+    }
+    for (auto& r : to_notify) emit_synthetic(r);
 }
 
 bool TaskManager::start_engine_task(const TaskRecord& r,
@@ -671,7 +825,8 @@ void TaskManager::db_init_schema() {
         "  etag TEXT,"
         "  last_modified TEXT,"
         "  created_at INTEGER,"
-        "  submit_seq INTEGER"
+        "  submit_seq INTEGER,"
+        "  http_parts TEXT"
         ");"
         "CREATE TABLE IF NOT EXISTS resume_data ("
         "  task_id TEXT PRIMARY KEY,"
@@ -679,43 +834,60 @@ void TaskManager::db_init_schema() {
         "  saved_at INTEGER"
         ");";
     sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
+    // 兼容旧库：为既有 tasks 表补 http_parts 列（新库 CREATE 已含，重复 ADD 报错忽略）。
+    sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN http_parts TEXT;",
+                 nullptr, nullptr, nullptr);
 }
 
-void TaskManager::db_load_all() {
+void TaskManager::db_load_active() {
+    // 仅载入排队 / 活跃任务（DOWNLOADING=0, QUEUED=4, PARSING=5, PARSED=6）；
+    // 暂停(1)/完成(2)/错误(3) 留库，按需经 add/resume/list 回读，减小常驻内存。
     const char* sql =
         "SELECT task_id, protocol, name, save_path, filename, url, magnet_link,"
         "       torrent_file, trackers, file_indexes, auto_start, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
-        "       last_modified, created_at, submit_seq FROM tasks;";
+        "       last_modified, created_at, submit_seq, http_parts FROM tasks"
+        "  WHERE status IN (0,4,5,6);";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         TaskRecord r;
-        r.task_id       = col_text(st, 0);
-        r.protocol      = static_cast<dw_protocol_t>(sqlite3_column_int(st, 1));
-        r.name          = col_text(st, 2);
-        r.save_path     = col_text(st, 3);
-        r.filename      = col_text(st, 4);
-        r.url           = col_text(st, 5);
-        r.magnet_link   = col_text(st, 6);
-        r.torrent_file  = col_text(st, 7);
-        r.trackers      = split_lines(col_text(st, 8));
-        r.file_indexes  = split_ints(col_text(st, 9));
-        r.auto_start    = sqlite3_column_int(st, 10);
-        r.priority      = sqlite3_column_int(st, 11);
-        r.status        = static_cast<dw_task_status_t>(sqlite3_column_int(st, 12));
-        r.progress      = sqlite3_column_double(st, 13);
-        r.total_size    = sqlite3_column_int64(st, 14);
-        r.total_done    = sqlite3_column_int64(st, 15);
-        r.support_range = sqlite3_column_int(st, 16);
-        r.etag          = col_text(st, 17);
-        r.last_modified = col_text(st, 18);
-        r.created_at    = sqlite3_column_int64(st, 19);
-        r.submit_seq    = sqlite3_column_int64(st, 20);
+        fill_record(st, r);
         tasks_[r.task_id] = std::move(r);
     }
     sqlite3_finalize(st);
+}
+
+int64_t TaskManager::db_max_submit_seq() {
+    int64_t maxv = 0;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT IFNULL(MAX(submit_seq),0) FROM tasks;",
+                           -1, &st, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) maxv = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return maxv;
+}
+
+bool TaskManager::db_load_by_id(const std::string& task_id, TaskRecord& out) {
+    const char* sql =
+        "SELECT task_id, protocol, name, save_path, filename, url, magnet_link,"
+        "       torrent_file, trackers, file_indexes, auto_start, priority,"
+        "       status, progress, total_size, total_done, support_range, etag,"
+        "       last_modified, created_at, submit_seq, http_parts"
+        " FROM tasks WHERE task_id=?;";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+    bool found = false;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        fill_record(st, out);
+        found = true;
+    }
+    sqlite3_finalize(st);
+    return found;
 }
 
 void TaskManager::db_upsert(const TaskRecord& r) {
@@ -723,13 +895,15 @@ void TaskManager::db_upsert(const TaskRecord& r) {
         "INSERT OR REPLACE INTO tasks (task_id, protocol, name, save_path,"
         " filename, url, magnet_link, torrent_file, trackers, file_indexes,"
         " auto_start, priority, status, progress, total_size, total_done,"
-        " support_range, etag, last_modified, created_at, submit_seq)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+        " support_range, etag, last_modified, created_at, submit_seq,"
+        " http_parts)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
 
     const std::string trackers = join_lines(r.trackers);
     const std::string indexes  = join_ints(r.file_indexes);
+    const std::string parts    = serialize_parts(r.parts);
 
     sqlite3_bind_text(st, 1, r.task_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, r.protocol);
@@ -752,6 +926,7 @@ void TaskManager::db_upsert(const TaskRecord& r) {
     sqlite3_bind_text(st, 19, r.last_modified.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 20, r.created_at);
     sqlite3_bind_int64(st, 21, r.submit_seq);
+    sqlite3_bind_text(st, 22, parts.c_str(), -1, SQLITE_TRANSIENT);
 
     sqlite3_step(st);
     sqlite3_finalize(st);

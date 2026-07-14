@@ -3,7 +3,9 @@
  * @brief 库内任务中枢：SQLite 持久化 + 内存注册表 + 优先级就绪队列 + 事件驱动调度。
  *
  * 设计要点：
- *   - 注册表持有全部任务（含暂停/完成/排队），引擎仅持有当前活跃任务；
+ *   - 注册表仅常驻排队 / 活跃任务（DOWNLOADING/QUEUED/PARSING/PARSED），
+ *     暂停 / 完成 / 错误任务落库后从内存移除，按需经 add/resume/list 回读；
+ *     引擎仅持有当前活跃任务的运行时句柄；
  *   - 所有状态经 dw::post_progress 汇入 on_progress，断点续传经 on_resume_data 汇入，
  *     是持久化的天然拦截点，引擎内部零改动；
  *   - 并发准入：活跃任务数 < max_concurrent_downloads 才准入下载，其余置 QUEUED；
@@ -49,6 +51,7 @@ struct TaskRecord {
     std::string              torrent_file;  // BT
     std::vector<std::string> trackers;
     std::vector<int32_t>     file_indexes;
+    std::vector<dw_part_state_t> parts;      // HTTP 分片续传态（仅 index/start/end/done 持久化）
     int32_t                  auto_start = 1;
 
     // 队列元数据
@@ -106,6 +109,10 @@ public:
     // ---- 快照查询 ----
     int32_t list(dw_task_snapshot_t** out_tasks, int32_t* out_count);
 
+    /// 设置流量闸门：allowed=false 时挂起 torrent session 并将活跃 HTTP 任务回落 QUEUED，
+    /// 调度线程不再准入新任务；true 时恢复 session 并唤醒调度自动重启排队任务。
+    void set_network_allowed(bool allowed);
+
 private:
     // 调度线程主循环
     void scheduler_loop();
@@ -120,7 +127,9 @@ private:
     bool db_open(const std::string& path);
     void db_close();
     void db_init_schema();
-    void db_load_all();                       // 载入注册表
+    void db_load_active();                    // 仅载入排队/活跃任务（暂停/完成/错误留库）
+    int64_t db_max_submit_seq();              // 全量最大 submit_seq（恢复 seq_counter_ 单调性）
+    bool db_load_by_id(const std::string& task_id, TaskRecord& out); // 按 id 载入全字段（含分片）
     void db_upsert(const TaskRecord& r);      // 全量 upsert
     void db_update_progress(const TaskRecord& r); // 仅进度/状态快照
     void db_delete(const std::string& task_id);
@@ -138,6 +147,7 @@ private:
     std::thread      worker_;
     std::atomic<bool> running_{false};
     bool             schedule_needed_ = false;
+    bool             net_allowed_     = true;  // 流量闸门：false=关闭（不准入新任务）；默认开启，不持久化，由调用方重启后重新下发
     int64_t          seq_counter_     = 0;
     int32_t          max_concurrent_  = 3;
     int32_t          flush_interval_ms_ = 1000;

@@ -14,7 +14,6 @@
 namespace dw {
 
 namespace he = http_engine;
-using he::internal::now_unix_ms;
 using he::internal::task_create_new;
 using he::internal::validate_add_input;
 using he::internal::set_result;
@@ -333,6 +332,38 @@ int32_t HttpEngine::delete_task(const char *         id,
     } catch (...) {
         HTTP_LOG(DW_LOG_ERROR, "", "delete_task unknown exception");
         return -1;
+    }
+}
+
+void HttpEngine::sweep() {
+    if (!initialized_ || !he::g_running.load()) return;
+    // HTTP 仅在下载中需要持有线程/curl handle；终态任务线程结束后回收上下文。
+    // 暂停态由 pause_task 即时回收，下载中任务保留，故此处只处理 COMPLETED/ERROR。
+    std::vector<std::string> to_reclaim;
+    {
+        std::lock_guard<std::mutex> lk(he::g_map_mtx);
+        for (auto &[url, tCtx]: he::g_tasks) {
+            if (!tCtx) continue;
+            const dw_task_status_t st = tCtx->status;
+            const bool terminal = (st == DW_TASK_STATUS_COMPLETED || st == DW_TASK_STATUS_ERROR);
+            if (terminal && tCtx->thread_done.load() == 1) {
+                to_reclaim.push_back(url);
+            }
+        }
+    }
+    for (const auto &url: to_reclaim) {
+        std::unique_ptr<dl_task_ctx> owned;
+        {
+            std::lock_guard<std::mutex> lk(he::g_map_mtx);
+            const auto it = he::g_tasks.find(url);
+            if (it == he::g_tasks.end()) continue;
+            owned = std::move(it->second); // 移出 map，脱离全局可见
+            he::g_tasks.erase(it);
+        }
+        // 锁外 join 已结束的线程并析构 ctx（触发 curl/文件句柄释放）
+        if (owned->task_thread.joinable()) owned->task_thread.join();
+        HTTP_LOG(DW_LOG_INFO, owned->trace_id.c_str(),
+                 "[CLEANUP] 终态回收 HTTP 上下文 url=%s", owned->url.c_str());
     }
 }
 

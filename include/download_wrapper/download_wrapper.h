@@ -340,6 +340,14 @@ typedef struct dw_config {
     int32_t        status_callback_interval_ms; /**< 进度回调间隔（ms）。 */
     dw_log_level_t log_level;                   /**< 日志级别。 */
     const char*    work_dir;                    /**< 工作目录（临时文件等）。 */
+
+    /* ===== 追加字段（置于末尾以保持既有字段偏移的 ABI 兼容） ===== */
+
+    double seed_ratio_limit;   /**< BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文；0=库内默认 3.0（即下载:上传=1:3），<0=永久做种。 */
+
+    int32_t wifi_only;         /**< 仅 WiFi 下载开关：0=不限网络（默认），1=仅在 WiFi 下下载。 */
+    int32_t is_wifi;           /**< 当前网络是否为 WiFi（由调用方实时上报）：0=否，1=是；仅当 wifi_only=1 时参与流量闸门判定。
+                                    闸门关闭条件：wifi_only!=0 && is_wifi==0，此时暂停所有下载与做种流量。 */
 } dw_config_t;
 
 /* ------------------------------------------------------------------ */

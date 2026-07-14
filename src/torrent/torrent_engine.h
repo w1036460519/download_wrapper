@@ -101,6 +101,19 @@ public:
                           dw_file_info_t** out_files,
                           int32_t*         out_count);
 
+    /**
+     * 周期性维护策略：回收已达做种分享率阈值的任务（remove_torrent 释放上下文）。
+     * 由上层调度循环定时调用；无匹配任务时为空操作。
+     */
+    void sweep();
+
+    /**
+     * 流量闸门：整体挂起 / 恢复 session。
+     * paused=true 时 session.pause()，停止所有 torrent 的下载、做种、peer 流量（含已完成仍在做种的任务）；
+     * paused=false 时 session.resume() 恢复。由上层流量闸门驱动，不改变单个任务状态。
+     */
+    void set_network_paused(bool paused);
+
 private:
     bool initialized_ = false;
 };

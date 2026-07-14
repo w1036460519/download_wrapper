@@ -62,6 +62,12 @@ public:
     int32_t delete_task(const char*         id,
                         dw_submit_result_t* out_result);
 
+    /**
+     * 周期性维护策略：回收已达终态（COMPLETED/ERROR）任务的上下文（join 线程 + 释放 curl/文件句柄）。
+     * 由上层调度循环定时调用；下载中任务保留，暂停态由 pause_task 即时回收。
+     */
+    void sweep();
+
 private:
     bool initialized_ = false;
 };

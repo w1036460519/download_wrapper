@@ -40,6 +40,8 @@ set(DW_SOURCES
     src/http/http_engine.cpp
     src/http/http_engine_impl.cpp
     src/torrent/torrent_engine.cpp
+    src/utils/string_util.cpp
+    src/utils/time_util.cpp
 )
 
 # 库类型开关：桌面端 / Android 构建动态库（.dylib/.so/.dll）；

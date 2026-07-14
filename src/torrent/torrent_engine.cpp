@@ -13,6 +13,7 @@
 #include "torrent/torrent_engine.h"
 
 #include "internal/downloader_internal.h"
+#include "utils/time_util.h"
 
 #include <libtorrent/session.hpp>
 #include <libtorrent/settings_pack.hpp>
@@ -44,6 +45,8 @@ namespace lt = libtorrent;
 
 namespace dw {
 
+using utils::now_unix_ms;
+
 /* ===================================================================== */
 /*                        文件内全局状态与辅助                            */
 /* ===================================================================== */
@@ -61,12 +64,11 @@ std::atomic<bool> g_running{false};
 int g_interval_ms = 1000;
 // 日志级别过滤
 dw_log_level_t g_log_level = DW_LOG_INFO;
+// BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文。
+// 默认 3.0（下载:上传=1:3）；init 从 cfg->seed_ratio_limit 读取（0=默认，<0=永久做种）。
+double g_seed_ratio_limit = 3.0;
 
-// 当前 Unix 毫秒时间戳
-int64_t now_unix_ms() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-}
+// 当前 Unix 毫秒时间戳（统一由 dw::utils::now_unix_ms 提供）
 
 // 内部格式化日志（带级别过滤），统一走 dw::log_message
 void tlogf(dw_log_level_t level, const char* fmt, ...) {
@@ -358,6 +360,10 @@ int32_t TorrentEngine::init(const dw_config_t* cfg) {
             if (cfg->upload_rate_limit > 0) {
                 pack.set_int(lt::settings_pack::upload_rate_limit, cfg->upload_rate_limit);
             }
+            // 做种分享率上限：0 保持库内默认 3.0，非 0（含负数=永久做种）以配置为准。
+            if (cfg->seed_ratio_limit != 0.0) {
+                g_seed_ratio_limit = cfg->seed_ratio_limit;
+            }
         }
         if (listen_port > 0) {
             pack.set_str(lt::settings_pack::listen_interfaces,
@@ -610,6 +616,57 @@ int32_t TorrentEngine::delete_task(const char*         id,
     }
     set_result(out_result, id, DW_REASON_NONE, nullptr);
     return 0;
+}
+
+void TorrentEngine::sweep() {
+    if (!initialized_ || !g_session) return;
+    // g_seed_ratio_limit < 0 表示永久做种，不回收。
+    if (g_seed_ratio_limit < 0.0) return;
+    // 先在锁内收集达阈值的 key，避免边遍历边修改 g_handles。
+    std::vector<std::string> to_release;
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        for (const auto& [key, handle] : g_handles) {
+            if (!handle.is_valid()) continue;
+            lt::torrent_status s;
+            try { s = handle.status(); } catch (...) { continue; }
+            if (!s.is_seeding || s.total_done <= 0) continue; // 仅做种中任务；规避除零
+            const double ratio = static_cast<double>(s.total_upload)
+                                 / static_cast<double>(s.total_done);
+            if (ratio >= g_seed_ratio_limit) to_release.push_back(key);
+        }
+    }
+    for (const auto& key : to_release) {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        const auto it = g_handles.find(key);
+        if (it == g_handles.end()) continue;
+        try {
+            if (g_session) g_session->remove_torrent(it->second);
+        } catch (const std::exception& e) {
+            tlogf(DW_LOG_ERROR, "[ERROR] sweep remove_torrent 失败 key=%s msg=%s",
+                  key.c_str(), e.what());
+            continue;
+        }
+        g_handles.erase(it);
+        tlogf(DW_LOG_INFO, "[CLEANUP] 分享率达标释放做种上下文 key=%s", key.c_str());
+    }
+}
+
+void TorrentEngine::set_network_paused(bool paused) {
+    if (!initialized_ || !g_session) return;
+    try {
+        if (paused) {
+            // session 级挂起：覆盖下载中 + 做种中 + peer 全部流量（含不在上层注册表的做种任务）。
+            g_session->pause();
+            tlogf(DW_LOG_INFO, "[EVENT] 流量闸门关闭：session 已挂起");
+        } else {
+            g_session->resume();
+            tlogf(DW_LOG_INFO, "[EVENT] 流量闸门开启：session 已恢复");
+        }
+    } catch (const std::exception& e) {
+        tlogf(DW_LOG_ERROR, "[ERROR] set_network_paused 失败 paused=%d msg=%s",
+              paused ? 1 : 0, e.what());
+    }
 }
 
 char* TorrentEngine::magnet_to_info_hash(const char* magnet_link) {

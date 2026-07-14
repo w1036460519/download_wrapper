@@ -212,6 +212,7 @@ struct dl_task_ctx {
     int fd = -1;
     std::atomic<int> pause_req{0};
     std::atomic<int> cancel_req{0};
+    std::atomic<int> thread_done{0};   // 任务线程是否已结束（含终态推送完成）；sweep 据此安全回收
     int probing = 1;
     int cleanup_done = 0;
     std::mutex speed_mtx;
@@ -238,9 +239,6 @@ extern dw_log_cb g_log_cb;
 
 /* ===================== 内部函数声明 ===================== */
 namespace dw { namespace http_engine { namespace internal {
-
-/** 获取当前 Unix 时间戳（毫秒）。 */
-int64_t now_unix_ms();
 
 /** 输出日志：优先走回调，无回调时 fallback 到 stderr。 */
 void dl_emit_log(const char *trace_id, const char *msg,
