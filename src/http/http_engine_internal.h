@@ -189,7 +189,6 @@ struct dl_part_ctx {
 /* ===================== 任务运行时上下文 ===================== */
 struct dl_task_ctx {
     std::string url;
-    std::string trace_id;
     std::string output_path;
     std::string filename;
     std::string full_file_path;
@@ -233,21 +232,11 @@ extern std::thread g_monitor_thread;
 extern std::atomic<bool> g_exit_flag;
 extern std::atomic<bool> g_running;
 extern dw_progress_cb g_progress_cb;
-extern dw_log_cb g_log_cb;
 
 }} /* namespace dw::http_engine */
 
 /* ===================== 内部函数声明 ===================== */
 namespace dw { namespace http_engine { namespace internal {
-
-/** 输出日志：优先走回调，无回调时 fallback 到 stderr。 */
-void dl_emit_log(const char *trace_id, const char *msg,
-                 const char *file, int line, const char *func, int lvl);
-
-/** 格式化日志：lvl < cfg.log_level 时自动过滤。 */
-void dl_logf(int lvl, const char *trace_id,
-             const char *file, int line, const char *func,
-             const char *fmt, ...);
 
 /** 将任务上下文填充到 dw_progress_t（不持锁，调用方需按需加锁）。 */
 void fill_progress(dl_task_ctx *tCtx, dw_progress_t *task_progress);
@@ -315,16 +304,13 @@ void start_task(dl_task_ctx *tCtx);
 
 /** 创建新任务上下文 */
 std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path,
-                                             const char *trace_id, const char *filename);
+                                             const char *filename);
 
 /** 校验添加输入参数 */
 int validate_add_input(const char *url, const char *output_path, const char **err_out);
 
 /** 设置提交结果 */
-void set_result(dw_submit_result_t *r, const char *task_id, const char *trace_id,
+void set_result(dw_submit_result_t *r, const char *task_id,
                 dw_reason_t code, const char *msg, const char *fmt, ...);
 
 }}} /* namespace dw::http_engine::internal */
-
-#define HTTP_LOG(lvl, trace, fmt, ...) \
-    dw::http_engine::internal::dl_logf((lvl), (trace), __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)

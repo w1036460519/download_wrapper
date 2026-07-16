@@ -54,6 +54,8 @@ void log_message(dw_log_level_t level,
                  const char*    trace_id,
                  const char*    func,
                  int32_t        line) {
+    // 统一日志级别过滤：低于全局配置级别的消息直接丢弃
+    if (g_downloader && level < g_downloader->config.log_level) return;
     const char* tid = (trace_id && trace_id[0]) ? trace_id : "";
     const int64_t ts = utils::now_unix_ms();
     if (g_downloader && g_downloader->log_cb) {

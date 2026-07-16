@@ -11,6 +11,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace dw {
 
@@ -79,14 +80,33 @@ void emit_logf(dw_log_level_t level, const char* trace_id,
                const char* func, int32_t line,
                const char* fmt, ...);
 
+/// 从 task_id 计算 trace_id（hash 截取 8 位十六进制），无需跨层透传。
+inline std::string make_trace(const char* task_id) {
+    if (!task_id || !task_id[0]) return {};
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%08zx",
+                  std::hash<std::string_view>{}(task_id));
+    return buf;
+}
+
 } // namespace dw
 
 /// 日志宏：自动捕获调用方函数名与行号。
 #define DW_LOG(level, message, trace_id) \
     dw::log_message((level), (message), (trace_id), __FUNCTION__, __LINE__)
 
-/// 格式化日志宏：自动捕获调用方函数名与行号。
+/// 格式化日志宏：自动捕获调用方函数名与行号（需调用方预计算 trace_id）。
 #define DW_LOGF(level, trace_id, fmt, ...) \
     dw::emit_logf((level), (trace_id), __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__)
+
+/// 任务级格式化日志：从 task_id 自动计算 trace_id，无需调用方透传。
+#define DW_LOG_TASK(level, task_id, fmt, ...) do { \
+    const std::string _dw_tr = dw::make_trace(task_id); \
+    dw::emit_logf((level), _dw_tr.c_str(), __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__); \
+} while (0)
+
+/// 系统级格式化日志：无关联任务，trace_id 为空。
+#define DW_LOG_SYS(level, fmt, ...) \
+    dw::emit_logf((level), "", __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__)
 
 #endif /* DOWNLOADER_INTERNAL_H */

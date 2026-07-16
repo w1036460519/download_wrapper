@@ -26,7 +26,6 @@ std::thread g_monitor_thread;
 std::atomic<bool> g_exit_flag{false};
 std::atomic<bool> g_running{false};
 dw_progress_cb g_progress_cb = nullptr;
-dw_log_cb g_log_cb = nullptr;
 
 namespace internal {
 
@@ -34,56 +33,6 @@ namespace internal {
     using dw::utils::now_unix_ms;
 
     static constexpr int64_t DEFAULT_PART_SIZE = 1 * 1024 * 1024; /* 1 MiB */
-
-    static constexpr const char *log_level_name(int lvl) {
-        switch (lvl) {
-            case DW_LOG_DEBUG: return "DEBUG";
-            case DW_LOG_ERROR: return "ERROR";
-            default: return "INFO ";
-        }
-    }
-
-    void dl_emit_log(const char *trace_id, const char *msg,
-                     const char *file, const int line, const char *func, const int lvl) {
-        const dw_log_cb cb = g_log_cb;
-        const int64_t ts = now_unix_ms();
-
-        if (cb) {
-            /* 回调就绪：func/line 作为独立参数传递，不再拼入 message */
-            cb(static_cast<dw_log_level_t>(lvl), msg,
-               trace_id ? trace_id : "",
-               func ? func : "", line, ts);
-        } else {
-            /* 回调未就绪，fallback 到 stderr：格式化全部信息 */
-            const std::string ts_buf = format_unix_ms(ts);
-            const std::string base_name = file ? std::filesystem::path(file).filename().string() : std::string{};
-            const char *base = base_name.empty() ? "?" : base_name.c_str();
-            std::fprintf(stderr, "[%s] [%s] %s:%d (%s): %s\n",
-                         ts_buf.c_str(), log_level_name(lvl),
-                         base, line, func ? func : "?", msg);
-        }
-    }
-
-    void dl_logf(const int lvl, const char *trace_id,
-                 const char *file, const int line, const char *func,
-                 const char *fmt, ...) {
-        if (lvl < g_cfg.log_level) return;
-        va_list ap1, ap2;
-        va_start(ap1, fmt);
-        va_copy(ap2, ap1);
-        const int n = std::vsnprintf(nullptr, 0, fmt, ap1);
-        va_end(ap1);
-        if (n < 0) {
-            va_end(ap2);
-            return;
-        }
-        try {
-            std::vector<char> buf(static_cast<size_t>(n) + 1);
-            std::vsnprintf(buf.data(), buf.size(), fmt, ap2);
-            va_end(ap2);
-            dl_emit_log(trace_id, buf.data(), file, line, func, lvl);
-        } catch (...) { va_end(ap2); }
-    }
 
     /* ---------- 字符串工具 ---------- */
 
@@ -183,7 +132,7 @@ namespace internal {
     void fill_progress(dl_task_ctx *tCtx, dw_progress_t *task_progress) {
         *task_progress = {};
         task_progress->task_id = tCtx->url.c_str();
-        task_progress->trace_id = tCtx->trace_id.c_str();
+        task_progress->trace_id = "";
         task_progress->protocol = DW_PROTOCOL_HTTP;
         task_progress->name = tCtx->filename.c_str();
         task_progress->output_path = tCtx->output_path.c_str();
@@ -295,7 +244,7 @@ namespace internal {
                 return len;
             }
 
-            HTTP_LOG(DW_LOG_DEBUG, tCtx->trace_id.c_str(), "[part %d] header: %.*s",
+            DW_LOG_TASK(DW_LOG_DEBUG, tCtx->url.c_str(), "[part %d] header: %.*s",
                 pCtx->index, static_cast<int>(raw.size()), raw.data());
 
             if (raw.starts_with("HTTP/")) {
@@ -305,7 +254,7 @@ namespace internal {
                         if (tCtx->support_range
                             && static_cast<int32_t>(tCtx->parts.size()) > 1
                             && code == 200) {
-                            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(),
+                            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
                                 "[part %d] drift: expected 206, got http_code=%ld (multi-part task)",
                                 pCtx->index, code);
                             return mark_drift_error();
@@ -331,7 +280,7 @@ namespace internal {
                                 tCtx->total_size = total;
                             }
                             if (tCtx->total_size > 0 && total != tCtx->total_size) {
-                                HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(),
+                                DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
                                     "[part %d] drift: Content-Range total=%lld, expected=%lld",
                                     pCtx->index, static_cast<long long>(total),
                                     static_cast<long long>(tCtx->total_size));
@@ -353,7 +302,7 @@ namespace internal {
                 pCtx->seen_etag.assign(val);
                 if (tCtx->etag.empty()) tCtx->etag = pCtx->seen_etag;
                 if (!tCtx->etag.empty() && pCtx->seen_etag != tCtx->etag) {
-                    HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(),
+                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
                         "[part %d] drift: ETag changed, expected=\"%s\", got=\"%s\"",
                         pCtx->index, tCtx->etag.c_str(), pCtx->seen_etag.c_str());
                     return mark_drift_error();
@@ -362,7 +311,7 @@ namespace internal {
                 pCtx->seen_last_modified.assign(val);
                 if (tCtx->last_modified.empty()) tCtx->last_modified = pCtx->seen_last_modified;
                 if (!tCtx->last_modified.empty() && pCtx->seen_last_modified != tCtx->last_modified) {
-                    HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(),
+                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
                         "[part %d] drift: Last-Modified changed, expected=\"%s\", got=\"%s\"",
                         pCtx->index, tCtx->last_modified.c_str(), pCtx->seen_last_modified.c_str());
                     return mark_drift_error();
@@ -370,7 +319,7 @@ namespace internal {
             }
             return len;
         } catch (...) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] header_cb exception", pCtx->index);
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] header_cb exception", pCtx->index);
             return 0;
         }
     }
@@ -398,7 +347,7 @@ namespace internal {
         if (pCtx->fd < 0) {
             pCtx->fd = dw_file_open_write(tCtx->full_file_path.c_str());
             if (pCtx->fd < 0) {
-                HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] open failed: path=%s errno=%d",
+                DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] open failed: path=%s errno=%d",
                     pCtx->index, tCtx->full_file_path.c_str(), errno);
                 std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                 part.status = DW_TASK_STATUS_ERROR;
@@ -409,7 +358,7 @@ namespace internal {
         const long long off = static_cast<long long>(part.start + part.done);
         const dw_ssize_t w = dw_file_pwrite(pCtx->fd, ptr, len, off);
         if (w < 0 || static_cast<size_t>(w) != len) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] pwrite failed: wanted=%zu got=%lld errno=%d",
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] pwrite failed: wanted=%zu got=%lld errno=%d",
                 pCtx->index, len, static_cast<long long>(w), errno);
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             part.status = DW_TASK_STATUS_ERROR;
@@ -606,7 +555,7 @@ namespace internal {
         if (!tCtx->full_file_path.empty()) {
             if (const auto dir_path = std::filesystem::path(tCtx->full_file_path).parent_path();
                 !dir_path.empty() && !mkdir_recursive(dir_path.string())) {
-                HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "mkdir failed: %s", dir_path.string().c_str());
+                DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "mkdir failed: %s", dir_path.string().c_str());
                 tCtx->status = DW_TASK_STATUS_ERROR;
                 tCtx->reason = DW_REASON_INTERNAL;
                 tCtx->message = "目录创建失败";
@@ -614,7 +563,7 @@ namespace internal {
             }
             tCtx->fd = dw_file_open_write(tCtx->full_file_path.c_str());
             if (tCtx->fd < 0) {
-                HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "open failed: %s errno=%d",
+                DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "open failed: %s errno=%d",
                     tCtx->full_file_path.c_str(), errno);
                 tCtx->status = DW_TASK_STATUS_ERROR;
                 tCtx->reason = DW_REASON_INTERNAL;
@@ -625,7 +574,7 @@ namespace internal {
 
         if (tCtx->total_size > 0 && tCtx->fd >= 0 &&
             dw_file_truncate(tCtx->fd, tCtx->total_size) != 0) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "ftruncate failed: size=%lld errno=%d",
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "ftruncate failed: size=%lld errno=%d",
                 static_cast<long long>(tCtx->total_size), errno);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_INTERNAL;
@@ -708,7 +657,7 @@ namespace internal {
                 part.download_rate = 0.0;
                 return false;
             }
-            HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+            DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
                 "incomplete: part=%d done=%lld/%lld",
                 pCtx->index, static_cast<long long>(part.done), static_cast<long long>(part.size));
             if (pCtx->retry_count >= g_cfg.max_retries) {
@@ -718,20 +667,20 @@ namespace internal {
                 return false;
             }
             pCtx->retry_count++;
-            HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+            DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
                 "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
             return true;
         }
 
         int retryable = 0;
         const dw_reason_t reason = classify_failure(rc, http_code, &retryable);
-        HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+        DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
             "failed: part=%d rc=%d http=%ld reason=%d retryable=%d",
             pCtx->index, static_cast<int>(rc), http_code, static_cast<int>(reason), retryable);
 
         if (retryable && pCtx->retry_count < g_cfg.max_retries) {
             pCtx->retry_count++;
-            HTTP_LOG(DW_LOG_INFO, tCtx->trace_id.c_str(),
+            DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
                 "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
             return true;
         }
@@ -758,7 +707,7 @@ namespace internal {
     void run_parts_multi(dl_task_ctx *tCtx) {
         CURLM *multi = curl_multi_init();
         if (!multi) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "curl_multi_init failed");
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "curl_multi_init failed");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_INTERNAL;
@@ -787,7 +736,7 @@ namespace internal {
             auto add_part = [&](dl_part_ctx *pCtx) -> bool {
                 CURL *curl = build_easy_for_part(tCtx, pCtx);
                 if (!curl) {
-                    HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "[part %d] build_easy_for_part failed", pCtx->index);
+                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] build_easy_for_part failed", pCtx->index);
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
                     tCtx->parts[pCtx->index].reason = DW_REASON_INTERNAL;
@@ -826,7 +775,7 @@ namespace internal {
                 if (mc == CURLM_OK)
                     mc = curl_multi_poll(multi, nullptr, 0, 200, nullptr);
                 if (mc != CURLM_OK) {
-                    HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "curl_multi error: %d", static_cast<int>(mc));
+                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "curl_multi error: %d", static_cast<int>(mc));
                     break;
                 }
 
@@ -856,13 +805,13 @@ namespace internal {
                 }
             }
         } catch (const std::exception &e) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "run_parts_multi exception: %s", e.what());
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "run_parts_multi exception: %s", e.what());
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_INTERNAL;
             if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
         } catch (...) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "run_parts_multi unknown exception");
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "run_parts_multi unknown exception");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_INTERNAL;
@@ -923,14 +872,14 @@ namespace internal {
         }
         push_progress(tCtx);
         } catch (const std::exception &e) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "task_thread_func exception: %s", e.what());
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func exception: %s", e.what());
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_INTERNAL;
             tCtx->message = "任务线程异常终止";
             push_progress(tCtx);
         } catch (...) {
-            HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "task_thread_func unknown exception");
+            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func unknown exception");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_INTERNAL;
@@ -957,9 +906,9 @@ namespace internal {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
         } catch (const std::exception &e) {
-            HTTP_LOG(DW_LOG_ERROR, "", "monitor_thread_func exception: %s", e.what());
+            DW_LOG_SYS(DW_LOG_ERROR, "monitor_thread_func exception: %s", e.what());
         } catch (...) {
-            HTTP_LOG(DW_LOG_ERROR, "", "monitor_thread_func unknown exception");
+            DW_LOG_SYS(DW_LOG_ERROR, "monitor_thread_func unknown exception");
         }
     }
 
@@ -972,11 +921,10 @@ namespace internal {
      * ===================================================================== */
 
     std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path,
-                                 const char *trace_id, const char *filename) {
+                                 const char *filename) {
         auto tCtx = std::make_unique<dl_task_ctx>();
         tCtx->url = url;
         tCtx->output_path = output_path;
-        tCtx->trace_id = trace_id ? trace_id : "";
         tCtx->filename = filename ? filename : "";
         tCtx->total_size = -1;
         tCtx->status = DW_TASK_STATUS_DOWNLOADING;
@@ -1017,10 +965,12 @@ namespace internal {
         return 1;
     }
 
-    void set_result(dw_submit_result_t *r, const char *task_id, const char *trace_id,
+    void set_result(dw_submit_result_t *r, const char *task_id,
                     dw_reason_t code, const char *msg, const char *fmt, ...) {
         r->task_id = task_id;
         r->code = code;
+        // trace_id 由 task_id 实时计算，无需存储透传
+        const std::string trace_id = dw::make_trace(task_id);
         if (msg) {
             const size_t n = std::strlen(msg);
             auto p = static_cast<char *>(std::malloc(n + 1));
@@ -1033,8 +983,7 @@ namespace internal {
             char buf[512];
             std::vsnprintf(buf, sizeof(buf), fmt, args);
             va_end(args);
-            dl_logf(DW_LOG_ERROR, trace_id ? trace_id : "",
-                    __FILE__, __LINE__, __FUNCTION__, "%s", buf);
+            DW_LOGF(DW_LOG_ERROR, trace_id.c_str(), "%s", buf);
         }
     }
 
