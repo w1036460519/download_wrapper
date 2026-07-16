@@ -37,6 +37,7 @@ endif()
 set(DW_SOURCES
     src/download_wrapper.cpp
     src/core/task_manager.cpp
+    src/core/task_store.cpp
     src/http/http_engine.cpp
     src/http/http_engine_impl.cpp
     src/torrent/torrent_engine.cpp

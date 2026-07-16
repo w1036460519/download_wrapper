@@ -181,7 +181,7 @@ namespace internal {
      * ===================================================================== */
 
     void fill_progress(dl_task_ctx *tCtx, dw_progress_t *task_progress) {
-        std::memset(task_progress, 0, sizeof(*task_progress));
+        *task_progress = {};
         task_progress->task_id = tCtx->url.c_str();
         task_progress->trace_id = tCtx->trace_id.c_str();
         task_progress->protocol = DW_PROTOCOL_HTTP;
@@ -470,23 +470,11 @@ namespace internal {
         int64_t rend = part.end;
         std::string range_hdr;
         if (tCtx->probing) {
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%lld-%lld", (long long)restart, (long long)restart);
-            range_hdr = buf;
-        }
+            range_hdr = std::to_string(restart) + "-" + std::to_string(restart);
         } else if (rend >= restart) {
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%lld-%lld", (long long)restart, (long long)rend);
-            range_hdr = buf;
-        }
+            range_hdr = std::to_string(restart) + "-" + std::to_string(rend);
         } else {
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%lld-", (long long)restart);
-            range_hdr = buf;
-        }
+            range_hdr = std::to_string(restart) + "-";
         }
         curl_easy_setopt(curl, CURLOPT_RANGE, range_hdr.c_str());
 
@@ -638,7 +626,7 @@ namespace internal {
         if (tCtx->total_size > 0 && tCtx->fd >= 0 &&
             dw_file_truncate(tCtx->fd, tCtx->total_size) != 0) {
             HTTP_LOG(DW_LOG_ERROR, tCtx->trace_id.c_str(), "ftruncate failed: size=%lld errno=%d",
-                (long long)tCtx->total_size, errno);
+                static_cast<long long>(tCtx->total_size), errno);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_INTERNAL;
             tCtx->message = (errno == ENOSPC) ? "存储空间不足" : "存储异常，无法保存文件";
@@ -983,10 +971,9 @@ namespace internal {
      *          Part 6: 辅助函数
      * ===================================================================== */
 
-    dl_task_ctx *task_create_new(const char *url, const char *output_path,
+    std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path,
                                  const char *trace_id, const char *filename) {
-        auto *tCtx = new(std::nothrow) dl_task_ctx();
-        if (!tCtx) return nullptr;
+        auto tCtx = std::make_unique<dl_task_ctx>();
         tCtx->url = url;
         tCtx->output_path = output_path;
         tCtx->trace_id = trace_id ? trace_id : "";
@@ -1008,7 +995,7 @@ namespace internal {
         part.progress = 0.0;
         part.status = DW_TASK_STATUS_DOWNLOADING;
         part.reason = DW_REASON_NONE;
-        tCtx->part_ctx[0].task = tCtx;
+        tCtx->part_ctx[0].task = tCtx.get();
         tCtx->part_ctx[0].index = 0;
         return tCtx;
     }

@@ -11,21 +11,21 @@
 #include <cstdint>
 #include <string>
 
-namespace dw { namespace utils {
+namespace dw::utils {
 
-/**
+    /**
  * 获取当前 Unix 时间戳（毫秒）。
  * @return 自 epoch 起经过的毫秒数。
  */
-int64_t now_unix_ms();
+    int64_t now_unix_ms();
 
-/**
+    /**
  * 将 Unix 毫秒时间戳格式化为本地时间字符串。
  * @param ms Unix 毫秒时间戳。
  * @return 形如 "YYYY-MM-DD HH:MM:SS" 的本地时间字符串。
  */
-std::string format_unix_ms(int64_t ms);
+    std::string format_unix_ms(int64_t ms);
 
-}} // namespace dw::utils
+}
 
 #endif /* DW_UTILS_TIME_UTIL_H */

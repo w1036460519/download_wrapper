@@ -18,6 +18,8 @@
 #define DW_TASK_MANAGER_H
 
 #include "download_wrapper/download_wrapper.h"
+#include "task_record.h"
+#include "task_store.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -28,51 +30,10 @@
 #include <thread>
 #include <vector>
 
-struct sqlite3;
-
 namespace dw {
 
 class HttpEngine;
 class TorrentEngine;
-
-/**
- * 任务记录：注册表内存态 = 来源参数（恢复/晋升重建用）+ 最新快照 + 队列元数据。
- */
-struct TaskRecord {
-    // 标识
-    std::string   task_id;
-    dw_protocol_t protocol = DW_PROTOCOL_HTTP;
-
-    // 来源参数（恢复 / 队列晋升时重建引擎任务）
-    std::string              save_path;
-    std::string              filename;
-    std::string              url;           // HTTP
-    std::string              magnet_link;   // BT
-    std::string              torrent_file;  // BT
-    std::vector<std::string> trackers;
-    std::vector<int32_t>     file_indexes;
-    std::vector<dw_part_state_t> parts;      // HTTP 分片续传态（仅 index/start/end/done 持久化）
-    int32_t                  auto_start = 1;
-
-    // 队列元数据
-    int64_t created_at = 0;  // Unix 毫秒
-    int64_t submit_seq = 0;  // 单调递增，同优先级下的 FIFO 次序
-    int32_t priority   = 0;  // 越大越优先
-
-    // 最新快照（用于 dw_list_tasks 与断点恢复展示）
-    dw_task_status_t status       = DW_TASK_STATUS_QUEUED;
-    std::string      name;
-    int64_t          total_size   = -1;
-    int64_t          total_done   = -1;
-    double           progress     = -1.0;
-    int32_t          support_range = 0;
-    std::string      etag;
-    std::string      last_modified;
-
-    // 运行态标记（不持久化）
-    bool dirty          = false;  // 进度待刷库
-    bool queued_notified = false; // 已向上层合成过 QUEUED 回调
-};
 
 /**
  * 任务中枢单例（由 dw_downloader 持有）。
@@ -97,14 +58,18 @@ public:
 
     // ---- 控制操作（C ABI 转发到此） ----
     int32_t add(dw_protocol_t proto, const dw_task_params_t* params, dw_submit_result_t* out);
-    int32_t pause(dw_protocol_t proto, const char* id, dw_submit_result_t* out);
-    int32_t resume(dw_protocol_t proto, const dw_task_params_t* params, dw_submit_result_t* out);
-    int32_t remove(dw_protocol_t proto, const char* id, dw_submit_result_t* out);
-    int32_t set_priority(const char* id, int32_t priority);
+    int32_t pause(dw_protocol_t proto, int64_t id, dw_submit_result_t* out);
+    int32_t resume(dw_protocol_t proto, int64_t id, dw_submit_result_t* out);
+    int32_t remove(dw_protocol_t proto, int64_t id, dw_submit_result_t* out);
+    int32_t set_priority(int64_t id, int32_t priority);
+
+    /// 按自增 id 翻译得业务键 task_id（低频；供 BT 工具函数转 info_hash 用）。命中返回 true。
+    bool task_id_of(int64_t id, std::string& out_task_id);
 
     // ---- 回调拦截（post_progress / post_resume_data 调用） ----
     void on_progress(const dw_progress_t* p);
-    void on_resume_data(const char* id, dw_protocol_t proto, const uint8_t* data, size_t size);
+    /// 持久化 resume_data；命中记录返回其自增 id（供上层回调），未命中返回 0。
+    int64_t on_resume_data(const char* task_id, dw_protocol_t proto, const uint8_t* data, size_t size);
 
     // ---- 快照查询 ----
     int32_t list(dw_task_snapshot_t** out_tasks, int32_t* out_count);
@@ -123,19 +88,6 @@ private:
     // 向上层推送一次合成进度（用于 QUEUED/PAUSED）
     void emit_synthetic(const TaskRecord& r);
 
-    // ---- DB 辅助（均在持有 mtx_ 时调用） ----
-    bool db_open(const std::string& path);
-    void db_close();
-    void db_init_schema();
-    void db_load_active();                    // 仅载入排队/活跃任务（暂停/完成/错误留库）
-    int64_t db_max_submit_seq();              // 全量最大 submit_seq（恢复 seq_counter_ 单调性）
-    bool db_load_by_id(const std::string& task_id, TaskRecord& out); // 按 id 载入全字段（含分片）
-    void db_upsert(const TaskRecord& r);      // 全量 upsert
-    void db_update_progress(const TaskRecord& r); // 仅进度/状态快照
-    void db_delete(const std::string& task_id);
-    void db_save_resume(const std::string& task_id, const uint8_t* data, size_t size);
-    std::vector<uint8_t> db_load_resume(const std::string& task_id);
-
     // ---- 内部工具 ----
     int32_t active_count_locked() const;      // 占用下载额度的任务数
 
@@ -143,12 +95,11 @@ private:
     std::condition_variable cv_;
     std::map<std::string, TaskRecord> tasks_;
 
-    sqlite3*         db_ = nullptr;
+    TaskStore        store_;                  // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
     std::thread      worker_;
     std::atomic<bool> running_{false};
     bool             schedule_needed_ = false;
     bool             net_allowed_     = true;  // 流量闸门：false=关闭（不准入新任务）；默认开启，不持久化，由调用方重启后重新下发
-    int64_t          seq_counter_     = 0;
     int32_t          max_concurrent_  = 3;
     int32_t          flush_interval_ms_ = 1000;
 

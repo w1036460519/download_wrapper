@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <string>
 
 namespace dw {
 
@@ -23,10 +25,10 @@ namespace {
 
 // 全局单例实例
 std::once_flag g_init_flag;
-dw_downloader* g_downloader = nullptr;
+std::unique_ptr<dw_downloader> g_downloader;
 
 void do_init_singleton() {
-    g_downloader = new dw_downloader();
+    g_downloader = std::make_unique<dw_downloader>();
 }
 
 } // namespace
@@ -44,7 +46,7 @@ void emit_logf(dw_log_level_t level, const char* trace_id,
 }
 
 dw_downloader* global_downloader() {
-    return g_downloader;
+    return g_downloader.get();
 }
 
 void log_message(dw_log_level_t level,
@@ -91,11 +93,13 @@ void post_resume_data(const char*    task_id,
         return;
     }
     // resume_data 由库内 SQLite 持久化；同时保留对外回调以兼容已注册的调用方。
+    int64_t id = 0;
     if (g_downloader->task_manager) {
-        g_downloader->task_manager->on_resume_data(task_id, protocol, data, size);
+        // 内部持久化用 task_id 定位；返回命中记录的自增 id 供对外回调。
+        id = g_downloader->task_manager->on_resume_data(task_id, protocol, data, size);
     }
-    if (g_downloader->resume_data_cb) {
-        g_downloader->resume_data_cb(task_id, protocol, data, size);
+    if (g_downloader->resume_data_cb && id != 0) {
+        g_downloader->resume_data_cb(id, protocol, data, size);
     }
 }
 
@@ -280,13 +284,13 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
 }
 
 DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
-                             const char*         id,
+                             int64_t             id,
                              dw_submit_result_t* out_result) {
     auto* d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !id || !out_result) {
+    if (!d || !d->initialized.load() || !out_result) {
         DW_LOGF(DW_LOG_ERROR, "",
-            "失败: 参数非法 d=%p init=%d id=%p out=%p",
-            d, d ? d->initialized.load() : 0, id, out_result);
+            "失败: 参数非法 d=%p init=%d id=%lld out=%p",
+            d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
             out_result->task_id = nullptr;
             out_result->code    = DW_REASON_INVALID_INPUT;
@@ -305,15 +309,14 @@ DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
     return d->task_manager->pause(protocol, id, out_result);
 }
 
-DW_API int32_t dw_resume_task(dw_protocol_t           protocol,
-                              const dw_task_params_t* params,
-                              dw_submit_result_t*     out_result) {
+DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
+                              int64_t             id,
+                              dw_submit_result_t* out_result) {
     auto* d = dw::global_downloader();
-    const char* trace_id = (params && params->trace_id) ? params->trace_id : "";
-    if (!d || !d->initialized.load() || !params || !out_result) {
-        DW_LOGF(DW_LOG_ERROR, trace_id,
-            "失败: 参数非法 d=%p init=%d params=%p out=%p",
-            d, d ? d->initialized.load() : 0, params, out_result);
+    if (!d || !d->initialized.load() || !out_result) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld out=%p",
+            d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
             out_result->task_id = nullptr;
             out_result->code    = DW_REASON_INVALID_INPUT;
@@ -326,20 +329,20 @@ DW_API int32_t dw_resume_task(dw_protocol_t           protocol,
         out_result->task_id = nullptr;
         out_result->code    = DW_REASON_INVALID_INPUT;
         out_result->message = nullptr;
-        DW_LOGF(DW_LOG_ERROR, trace_id, "失败: 未知协议 protocol=%d", protocol);
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
         return -1;
     }
-    return d->task_manager->resume(protocol, params, out_result);
+    return d->task_manager->resume(protocol, id, out_result);
 }
 
 DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
-                              const char*         id,
+                              int64_t             id,
                               dw_submit_result_t* out_result) {
     auto* d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !id || !out_result) {
+    if (!d || !d->initialized.load() || !out_result) {
         DW_LOGF(DW_LOG_ERROR, "",
-            "失败: 参数非法 d=%p init=%d id=%p out=%p",
-            d, d ? d->initialized.load() : 0, id, out_result);
+            "失败: 参数非法 d=%p init=%d id=%lld out=%p",
+            d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
             out_result->task_id = nullptr;
             out_result->code    = DW_REASON_INVALID_INPUT;
@@ -384,28 +387,39 @@ DW_API char* dw_torrent_file_to_info_hash(const char* torrent_file_path) {
     return d->torrent_engine->torrent_file_to_info_hash(torrent_file_path);
 }
 
-DW_API char* dw_info_hash_to_magnet(const char* info_hash) {
+DW_API char* dw_info_hash_to_magnet(int64_t id) {
     auto* d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !info_hash) {
+    if (!d || !d->initialized.load() || !d->task_manager) {
         DW_LOGF(DW_LOG_ERROR, "",
-            "失败: 参数非法 d=%p init=%d info_hash=%p",
-            d, d ? d->initialized.load() : 0, info_hash);
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
         return nullptr;
     }
-    return d->torrent_engine->info_hash_to_magnet(info_hash);
+    // 低频操作：按 id 回读 info_hash（BT 的 task_id 即 info_hash）后调引擎。
+    std::string info_hash;
+    if (!d->task_manager->task_id_of(id, info_hash)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        return nullptr;
+    }
+    return d->torrent_engine->info_hash_to_magnet(info_hash.c_str());
 }
 
-DW_API int dw_set_file_priority(const char* info_hash,
-                                int32_t     file_index,
-                                int32_t     priority) {
+DW_API int dw_set_file_priority(int64_t id,
+                                int32_t file_index,
+                                int32_t priority) {
     auto* d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !info_hash) {
+    if (!d || !d->initialized.load() || !d->task_manager) {
         DW_LOGF(DW_LOG_ERROR, "",
-            "失败: 参数非法 d=%p init=%d info_hash=%p",
-            d, d ? d->initialized.load() : 0, info_hash);
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
         return 0;
     }
-    return d->torrent_engine->set_file_priority(info_hash, file_index, priority);
+    std::string info_hash;
+    if (!d->task_manager->task_id_of(id, info_hash)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        return 0;
+    }
+    return d->torrent_engine->set_file_priority(info_hash.c_str(), file_index, priority);
 }
 
 DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
@@ -426,18 +440,24 @@ DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
                                                   out_count);
 }
 
-DW_API int32_t dw_get_file_list(const char*      task_id,
+DW_API int32_t dw_get_file_list(int64_t          id,
                                 dw_file_info_t** out_files,
                                 int32_t*         out_count) {
     auto* d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !task_id ||
+    if (!d || !d->initialized.load() || !d->task_manager ||
         !out_files || !out_count) {
         DW_LOGF(DW_LOG_ERROR, "",
-            "失败: 参数非法 d=%p init=%d task_id=%p",
-            d, d ? d->initialized.load() : 0, task_id);
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
         return -1;
     }
-    return d->torrent_engine->get_file_list(task_id, out_files, out_count);
+    // 低频操作：按 id 回读 info_hash 后调引擎。
+    std::string info_hash;
+    if (!d->task_manager->task_id_of(id, info_hash)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        return -1;
+    }
+    return d->torrent_engine->get_file_list(info_hash.c_str(), out_files, out_count);
 }
 
 /* ------------------------------------------------------------------ */
@@ -459,15 +479,15 @@ DW_API int32_t dw_list_tasks(dw_task_snapshot_t** out_tasks,
     return d->task_manager->list(out_tasks, out_count);
 }
 
-DW_API int32_t dw_set_task_priority(const char* task_id, int32_t priority) {
+DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority) {
     auto* d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !d->task_manager || !task_id) {
+    if (!d || !d->initialized.load() || !d->task_manager) {
         DW_LOGF(DW_LOG_ERROR, "",
-            "失败: 参数非法 d=%p init=%d task_id=%p",
-            d, d ? d->initialized.load() : 0, task_id);
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
         return -1;
     }
-    return d->task_manager->set_priority(task_id, priority);
+    return d->task_manager->set_priority(id, priority);
 }
 
 /* ------------------------------------------------------------------ */

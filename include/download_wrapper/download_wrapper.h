@@ -132,7 +132,7 @@ typedef void (*dw_log_cb)(dw_log_level_t  level,
  * 调用方如需持久化必须立即深拷贝。
  * 目前仅 BT（libtorrent）任务会触发；HTTP 任务不产生 resume_data。
  */
-typedef void (*dw_resume_data_cb)(const char*    task_id,
+typedef void (*dw_resume_data_cb)(int64_t        id,
                                   dw_protocol_t  protocol,
                                   const uint8_t* data,
                                   size_t         size);
@@ -232,6 +232,11 @@ typedef struct dw_progress {
 
     const dw_part_state_t* part_states; /**< 分片状态数组。 */
     int32_t                part_count;  /**< 分片数量。 */
+
+    /* ===== 交互主键（追加，保持既有字段偏移） ===== */
+
+    int64_t          id;               /**< 任务自增 id：上层交互主键，由库内回填；
+                                            task_id 保留为引擎内部标识与展示数据。 */
 } dw_progress_t;
 
 /* ------------------------------------------------------------------ */
@@ -283,16 +288,17 @@ typedef struct dw_task_params {
 /**
  * 同步返回结果（每个任务一条，与入参顺序对应）。
  *
- * task_id：HTTP 任务回传 URL，BT 任务回传 info_hash。
- *           添加 BT 磁力链接时，库内解析后生成 info_hash 写入此字段。
- *           该字段引用入参或库内分配的字符串，由 dw_submit_results_release 统一释放。
+ * task_id：HTTP 任务回传 URL，BT 任务回传 info_hash（引擎标识 / 展示数据）。
+ *           控制操作（pause/resume/delete）不回传字符串，置 NULL。
  * code：    同步返回码；DW_REASON_NONE 表示成功。
  * message： 错误描述；成功时为 NULL，由库分配并通过 dw_submit_results_release 释放。
+ * id：      任务自增 id（上层交互主键）；add 成功回填新建 id，控制操作回显入参 id。
  */
 typedef struct dw_submit_result {
     const char* task_id;
     dw_reason_t code;
     char*       message;
+    int64_t     id;      /**< 任务自增 id：add 成功后回填新建 id，控制操作回显入参 id。 */
 } dw_submit_result_t;
 
 /* ------------------------------------------------------------------ */
@@ -373,6 +379,7 @@ typedef struct dw_task_snapshot {
     int64_t          total_done;   /**< 已完成字节；-1=未知。 */
     int32_t          priority;     /**< 队列优先级。 */
     int64_t          created_at;   /**< 创建时间（Unix 毫秒）。 */
+    int64_t          id;           /**< 任务自增 id（上层交互主键）。 */
 } dw_task_snapshot_t;
 
 /* ================================================================== */
@@ -455,36 +462,36 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
  * 暂停单个任务。
  *
  * @param protocol    协议类型。
- * @param id          任务标识符（HTTP=URL，BT=info_hash），不可为 NULL。
+ * @param id          任务自增 id（由 add / 快照获知），库内按 id 回读定位。
  * @param out_result  同步返回结果指针，不可为 NULL。
  * @return            0=成功，-1=失败（参数非法或内部错误）。
  */
 DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
-                             const char*         id,
+                             int64_t             id,
                              dw_submit_result_t* out_result);
 
 /**
  * 恢复（继续）单个任务。
  *
  * @param protocol    协议类型。
- * @param params      任务参数指针（恢复时可能需要 save_path / resume_data 等）。
+ * @param id          任务自增 id；库内按 id 回读全字段还原引擎参数。
  * @param out_result  同步返回结果指针，不可为 NULL。
  * @return            0=成功，-1=失败（参数非法或内部错误）。
  */
-DW_API int32_t dw_resume_task(dw_protocol_t           protocol,
-                              const dw_task_params_t* params,
-                              dw_submit_result_t*     out_result);
+DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
+                              int64_t             id,
+                              dw_submit_result_t* out_result);
 
 /**
  * 删除单个任务。
  *
  * @param protocol    协议类型。
- * @param id          任务标识符，不可为 NULL。
+ * @param id          任务自增 id，库内按 id 回读定位。
  * @param out_result  同步返回结果指针，不可为 NULL。
  * @return            0=成功，-1=失败（参数非法或内部错误）。
  */
 DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
-                              const char*         id,
+                              int64_t             id,
                               dw_submit_result_t* out_result);
 
 /* ================================================================== */
@@ -514,26 +521,26 @@ DW_API char* dw_magnet_to_info_hash(const char* magnet_link);
 DW_API char* dw_torrent_file_to_info_hash(const char* torrent_file_path);
 
 /**
- * 通过 info_hash 获取磁力链接。
+ * 通过任务 id 获取磁力链接。
  *
- * 任务必须已存在于 session 中。
+ * 任务必须已存在于 session 中；库内按 id 回读 info_hash 后调引擎。
  *
- * @param info_hash  任务 info_hash，不可为 NULL。
- * @return           成功返回堆分配的磁力链接（调用者 dw_free 释放），失败返回 NULL。
+ * @param id  任务自增 id。
+ * @return    成功返回堆分配的磁力链接（调用者 dw_free 释放），失败返回 NULL。
  */
-DW_API char* dw_info_hash_to_magnet(const char* info_hash);
+DW_API char* dw_info_hash_to_magnet(int64_t id);
 
 /**
  * 设置 BT 任务的文件下载优先级。
  *
- * @param info_hash   任务 info_hash，不可为 NULL。
+ * @param id          任务自增 id；库内按 id 回读 info_hash 后调引擎。
  * @param file_index  文件索引。
  * @param priority    优先级：0=不下载，1=正常，7=最高。
  * @return            1=成功，0=失败。
  */
-DW_API int dw_set_file_priority(const char* info_hash,
-                                int32_t     file_index,
-                                int32_t     priority);
+DW_API int dw_set_file_priority(int64_t id,
+                                int32_t file_index,
+                                int32_t priority);
 
 /**
  * 本地解析 .torrent 文件（不创建任务、不依赖 session）。
@@ -556,12 +563,12 @@ DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
  *
  * 用于磁力链接任务 PARSING → PARSED 后获取文件列表。
  *
- * @param task_id     任务标识（BT=info_hash），不可为 NULL。
+ * @param id          任务自增 id；库内按 id 回读 info_hash 后调引擎。
  * @param out_files   输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
  * @param out_count   输出：文件数量。
  * @return            0=成功，-1=失败（元数据未就绪或任务不存在）。
  */
-DW_API int32_t dw_get_file_list(const char*      task_id,
+DW_API int32_t dw_get_file_list(int64_t          id,
                                 dw_file_info_t** out_files,
                                 int32_t*         out_count);
 
@@ -587,11 +594,11 @@ DW_API int32_t dw_list_tasks(dw_task_snapshot_t** out_tasks,
  *
  * 立即持久化并触发一次队列调度；对下载中任务仅更新优先级、不中断。
  *
- * @param task_id   任务标识，不可为 NULL。
+ * @param id        任务自增 id。
  * @param priority  新优先级值。
  * @return          0=成功，-1=失败（任务不存在）。
  */
-DW_API int32_t dw_set_task_priority(const char* task_id, int32_t priority);
+DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority);
 
 /* ================================================================== */
 /*                          资源释放                                  */

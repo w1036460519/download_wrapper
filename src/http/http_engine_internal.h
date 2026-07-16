@@ -314,8 +314,8 @@ void monitor_thread_func();
 void start_task(dl_task_ctx *tCtx);
 
 /** 创建新任务上下文 */
-dl_task_ctx *task_create_new(const char *url, const char *output_path,
-                             const char *trace_id, const char *filename);
+std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path,
+                                             const char *trace_id, const char *filename);
 
 /** 校验添加输入参数 */
 int validate_add_input(const char *url, const char *output_path, const char **err_out);

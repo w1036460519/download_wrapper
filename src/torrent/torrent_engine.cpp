@@ -113,8 +113,7 @@ dw_task_status_t map_status(const lt::torrent_status& s) {
 
 // 组装 dw_progress_t 并推送。task_id 使用传入的 key（回调周期内有效）。
 void push_status(const std::string& key, const lt::torrent_status& s) {
-    dw_progress_t p;
-    std::memset(&p, 0, sizeof(p));
+    dw_progress_t p{};
 
     // errc 消息在推送期间需保持有效
     const std::string msg = s.errc ? s.errc.message() : std::string{};
@@ -206,8 +205,7 @@ void handle_alert(const lt::alert* a) {
         if (!key.empty()) {
             try {
                 lt::torrent_status s = mr->handle.status();
-                dw_progress_t p;
-                std::memset(&p, 0, sizeof(p));
+                dw_progress_t p{};
                 p.task_id     = key.c_str();
                 p.trace_id    = "";
                 p.protocol    = DW_PROTOCOL_TORRENT;

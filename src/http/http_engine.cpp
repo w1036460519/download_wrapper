@@ -187,14 +187,13 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
     const bool has_filename = (params->filename && params->filename[0]);
     const bool need_probing = !has_filename || !params->resume_data;
 
-    dl_task_ctx *tCtx_raw = task_create_new(url, params->save_path, trace_id, params->filename);
-    if (!tCtx_raw) {
+    auto tCtx_guard = task_create_new(url, params->save_path, trace_id, params->filename);
+    if (!tCtx_guard) {
         set_result(out_result, url, trace_id, DW_REASON_INTERNAL, nullptr,
                    "task_create_new failed: url=%s", url);
         return -1;
     }
-    std::unique_ptr<dl_task_ctx> tCtx_guard(tCtx_raw);
-    dl_task_ctx *tCtx = tCtx_raw;
+    dl_task_ctx *tCtx = tCtx_guard.get();
 
     /* 不需要探测（有 resume_data 且有 filename）的情况 */
     if (!need_probing) {
