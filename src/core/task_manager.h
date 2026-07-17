@@ -78,6 +78,14 @@ public:
     /// 调度线程不再准入新任务；true 时恢复 session 并唤醒调度自动重启排队任务。
     void set_network_allowed(bool allowed);
 
+    // ---- 任务文件持久化 ----
+
+    /// 保存任务的文件信息到数据库。
+    void save_files(const std::string& task_id,
+                    const std::vector<dw_file_info_t>& files);
+    /// 从数据库加载任务的文件列表。
+    std::vector<dw_file_info_t> load_files(const std::string& task_id);
+
 private:
     // 调度线程主循环
     void scheduler_loop();

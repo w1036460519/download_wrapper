@@ -47,7 +47,7 @@ public:
     /**
      * 暂停单个 BT 下载任务。
      */
-    int32_t pause_task(const char*         id,
+    int32_t pause_task(const char*         task_id,
                        dw_submit_result_t* out_result);
 
     /**
@@ -59,7 +59,7 @@ public:
     /**
      * 删除单个 BT 下载任务。
      */
-    int32_t delete_task(const char*         id,
+    int32_t delete_task(const char*         task_id,
                         dw_submit_result_t* out_result);
 
     /**
@@ -75,12 +75,12 @@ public:
     /**
      * info_hash 转磁力链接。
      */
-    char* info_hash_to_magnet(const char* info_hash);
+    char* info_hash_to_magnet(const char* task_id);
 
     /**
      * 设置文件下载优先级。
      */
-    int set_file_priority(const char* info_hash,
+    int set_file_priority(const char* task_id,
                           int32_t     file_index,
                           int32_t     priority);
 
@@ -108,9 +108,9 @@ public:
     void sweep();
 
     /**
-     * 流量闸门：整体挂起 / 恢复 session。
-     * paused=true 时 session.pause()，停止所有 torrent 的下载、做种、peer 流量（含已完成仍在做种的任务）；
-     * paused=false 时 session.resume() 恢复。由上层流量闸门驱动，不改变单个任务状态。
+     * 流量闸门：整体挂起 / 恢复。
+     * paused=true 时遍历全部 handle 逐个暂停；
+     * paused=false 时遍历全部 handle 逐个恢复。由上层流量闸门驱动，不改变单个任务状态。
      */
     void set_network_paused(bool paused);
 

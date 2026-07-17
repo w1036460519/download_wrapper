@@ -205,18 +205,24 @@ DW_API int32_t dw_set_config(const dw_config_t* cfg) {
         return -1;
     }
 
-    dw::TaskManager* tm = nullptr;
     {
         std::lock_guard<std::mutex> lock(d->mutex);
         d->config = *cfg;
-        tm = d->task_manager.get();
-    }
-    // 流量闸门：wifi_only 且当前非 WiFi 时关闭。锁外下发，避免持 d->mutex 时触发合成回调重入。
-    if (tm) {
-        const bool allowed = !(cfg->wifi_only != 0 && cfg->is_wifi == 0);
-        tm->set_network_allowed(allowed);
     }
     return 0;
+}
+
+DW_API void dw_set_network_allowed(bool allowed) {
+    auto* d = dw::global_downloader();
+    if (!d) return;
+    dw::TaskManager* tm = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(d->mutex);
+        tm = d->task_manager.get();
+    }
+    if (tm) {
+        tm->set_network_allowed(allowed);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -268,7 +274,7 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
             d, d ? d->initialized.load() : 0, params, out_result);
         if (out_result) {
             out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
+            out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
         return -1;
@@ -276,7 +282,7 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
         out_result->task_id = nullptr;
-        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, trace_id, "失败: 未知协议 protocol=%d", protocol);
         return -1;
@@ -295,7 +301,7 @@ DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
             d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
             out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
+            out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
         return -1;
@@ -303,7 +309,7 @@ DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
         out_result->task_id = nullptr;
-        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
         return -1;
@@ -321,7 +327,7 @@ DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
             d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
             out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
+            out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
         return -1;
@@ -329,7 +335,7 @@ DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
         out_result->task_id = nullptr;
-        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
         return -1;
@@ -347,7 +353,7 @@ DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
             d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
             out_result->task_id = nullptr;
-            out_result->code    = DW_REASON_INVALID_INPUT;
+            out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
         return -1;
@@ -355,7 +361,7 @@ DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
         out_result->task_id = nullptr;
-        out_result->code    = DW_REASON_INVALID_INPUT;
+        out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
         return -1;
@@ -490,6 +496,86 @@ DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority) {
         return -1;
     }
     return d->task_manager->set_priority(id, priority);
+}
+
+/* ------------------------------------------------------------------ */
+/*  任务文件持久化                                                    */
+/* ------------------------------------------------------------------ */
+
+DW_API int32_t dw_save_task_files(int64_t id,
+                                   const dw_file_info_t* files,
+                                   int32_t count) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager ||
+        !files || count <= 0) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld files=%p count=%d",
+            d, d ? d->initialized.load() : 0, (long long)id, files, count);
+        return -1;
+    }
+    // 按 id 回读 task_id
+    std::string task_id;
+    if (!d->task_manager->task_id_of(id, task_id)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        return -1;
+    }
+    // 转换为 vector 后批量写入
+    std::vector<dw_file_info_t> file_vec(files, files + count);
+    d->task_manager->save_files(task_id, file_vec);
+    return 0;
+}
+
+DW_API int32_t dw_load_task_files(int64_t id,
+                                   dw_file_info_t** out_files,
+                                   int32_t* out_count) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager ||
+        !out_files || !out_count) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld out_files=%p out_count=%p",
+            d, d ? d->initialized.load() : 0, (long long)id, out_files, out_count);
+        if (out_files) *out_files = nullptr;
+        if (out_count) *out_count = 0;
+        return -1;
+    }
+    // 按 id 回读 task_id
+    std::string task_id;
+    if (!d->task_manager->task_id_of(id, task_id)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        *out_files = nullptr;
+        *out_count = 0;
+        return -1;
+    }
+    // 从数据库加载
+    auto file_vec = d->task_manager->load_files(task_id);
+    if (file_vec.empty()) {
+        *out_files = nullptr;
+        *out_count = 0;
+        return -1;
+    }
+    // 深拷贝为堆数组（调用者 dw_file_list_free 释放）
+    const int32_t n = static_cast<int32_t>(file_vec.size());
+    dw_file_info_t* arr = static_cast<dw_file_info_t*>(
+        std::malloc(sizeof(dw_file_info_t) * n));
+    if (!arr) {
+        *out_files = nullptr;
+        *out_count = 0;
+        return -1;
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        arr[i].index = file_vec[i].index;
+        arr[i].size  = file_vec[i].size;
+        if (file_vec[i].name) {
+            const size_t len = std::strlen(file_vec[i].name);
+            arr[i].name = static_cast<char*>(std::malloc(len + 1));
+            if (arr[i].name) std::memcpy(arr[i].name, file_vec[i].name, len + 1);
+        } else {
+            arr[i].name = nullptr;
+        }
+    }
+    *out_files = arr;
+    *out_count = n;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */

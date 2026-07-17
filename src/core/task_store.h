@@ -57,6 +57,16 @@ public:
     /// 读取断点续传数据；不存在返回空 vector。
     std::vector<uint8_t> load_resume(const std::string& task_id);
 
+    // ---- 任务文件信息 ----
+
+    /// 批量保存文件信息（upsert，事务包裹）。
+    void save_task_files(const std::string& task_id,
+                         const std::vector<dw_file_info_t>& files);
+    /// 加载任务的文件列表（按 file_index 升序）；不存在返回空 vector。
+    std::vector<dw_file_info_t> load_task_files(const std::string& task_id);
+    /// 删除任务关联的全部文件记录。
+    void delete_task_files(const std::string& task_id);
+
 private:
     sqlite3* db_ = nullptr;
 };

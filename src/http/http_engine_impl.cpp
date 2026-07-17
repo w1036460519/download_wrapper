@@ -228,10 +228,10 @@ namespace internal {
             auto mark_drift_error = [&]() -> size_t {
                 std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                 tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
-                tCtx->parts[pCtx->index].reason = DW_REASON_INVALID_INPUT;
+                tCtx->parts[pCtx->index].reason = DW_REASON_ERROR;
                 tCtx->parts[pCtx->index].download_rate = 0.0;
                 tCtx->status = DW_TASK_STATUS_ERROR;
-                tCtx->reason = DW_REASON_INVALID_INPUT;
+                tCtx->reason = DW_REASON_ERROR;
                 tCtx->message = "文件已变更，需重新下载";
                 return 0;
             };
@@ -351,7 +351,7 @@ namespace internal {
                     pCtx->index, tCtx->full_file_path.c_str(), errno);
                 std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                 part.status = DW_TASK_STATUS_ERROR;
-                part.reason = DW_REASON_INTERNAL;
+                part.reason = DW_REASON_ERROR;
                 return 0;
             }
         }
@@ -362,7 +362,7 @@ namespace internal {
                 pCtx->index, len, static_cast<long long>(w), errno);
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             part.status = DW_TASK_STATUS_ERROR;
-            part.reason = DW_REASON_INTERNAL;
+            part.reason = DW_REASON_ERROR;
             return 0;
         }
         {
@@ -461,8 +461,8 @@ namespace internal {
             }
             if (http_code == 401 || http_code == 403) return DW_REASON_AUTH;
             if (http_code == 416 || http_code == 400 || http_code == 404 || http_code == 410)
-                return DW_REASON_INVALID_INPUT;
-            return DW_REASON_INTERNAL;
+                return DW_REASON_ERROR;
+            return DW_REASON_ERROR;
         }
         switch (rc) {
             case CURLE_COULDNT_RESOLVE_HOST:
@@ -477,13 +477,13 @@ namespace internal {
             case CURLE_PEER_FAILED_VERIFICATION:
                 *retryable = 1;
                 return DW_REASON_NETWORK;
-            case CURLE_WRITE_ERROR: return DW_REASON_INTERNAL;
-            default: return DW_REASON_INTERNAL;
+            case CURLE_WRITE_ERROR: return DW_REASON_ERROR;
+            default: return DW_REASON_ERROR;
         }
     }
 
     void aggregate_status(dl_task_ctx *tCtx) {
-        if (tCtx->status == DW_TASK_STATUS_ERROR && tCtx->reason == DW_REASON_INVALID_INPUT) return;
+        if (tCtx->status == DW_TASK_STATUS_ERROR && tCtx->reason == DW_REASON_ERROR) return;
         int has_downloading = 0, has_error = 0, all_completed = 1;
         dw_reason_t best = DW_REASON_NONE;
         int best_rank = -1;
@@ -498,8 +498,7 @@ namespace internal {
                     int rank;
                     switch (part.reason) {
                         case DW_REASON_AUTH: rank = 4; break;
-                        case DW_REASON_INVALID_INPUT: rank = 3; break;
-                        case DW_REASON_INTERNAL: rank = 2; break;
+                        case DW_REASON_ERROR: rank = 3; break;
                         case DW_REASON_NETWORK: rank = 1; break;
                         default: rank = 0; break;
                     }
@@ -557,7 +556,7 @@ namespace internal {
                 !dir_path.empty() && !mkdir_recursive(dir_path.string())) {
                 DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "mkdir failed: %s", dir_path.string().c_str());
                 tCtx->status = DW_TASK_STATUS_ERROR;
-                tCtx->reason = DW_REASON_INTERNAL;
+                tCtx->reason = DW_REASON_ERROR;
                 tCtx->message = "目录创建失败";
                 return;
             }
@@ -566,7 +565,7 @@ namespace internal {
                 DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "open failed: %s errno=%d",
                     tCtx->full_file_path.c_str(), errno);
                 tCtx->status = DW_TASK_STATUS_ERROR;
-                tCtx->reason = DW_REASON_INTERNAL;
+                tCtx->reason = DW_REASON_ERROR;
                 tCtx->message = (errno == ENOSPC) ? "存储空间不足" : "存储异常，无法保存文件";
                 return;
             }
@@ -577,7 +576,7 @@ namespace internal {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "ftruncate failed: size=%lld errno=%d",
                 static_cast<long long>(tCtx->total_size), errno);
             tCtx->status = DW_TASK_STATUS_ERROR;
-            tCtx->reason = DW_REASON_INTERNAL;
+            tCtx->reason = DW_REASON_ERROR;
             tCtx->message = (errno == ENOSPC) ? "存储空间不足" : "存储异常，无法保存文件";
             return;
         }
@@ -693,7 +692,7 @@ namespace internal {
         if (tCtx->message.empty()) {
             switch (reason) {
                 case DW_REASON_AUTH: tCtx->message = "认证失败"; break;
-                case DW_REASON_INVALID_INPUT: tCtx->message = "资源不存在或已失效"; break;
+                case DW_REASON_ERROR: tCtx->message = "资源不存在或已失效"; break;
                 case DW_REASON_NETWORK: tCtx->message = "网络连接异常"; break;
                 default: tCtx->message = "下载过程中出现异常"; break;
             }
@@ -710,7 +709,7 @@ namespace internal {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "curl_multi_init failed");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
-            tCtx->reason = DW_REASON_INTERNAL;
+            tCtx->reason = DW_REASON_ERROR;
             if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
             return;
         }
@@ -739,7 +738,7 @@ namespace internal {
                     DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] build_easy_for_part failed", pCtx->index);
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
-                    tCtx->parts[pCtx->index].reason = DW_REASON_INTERNAL;
+                    tCtx->parts[pCtx->index].reason = DW_REASON_ERROR;
                     tCtx->parts[pCtx->index].download_rate = 0.0;
                     return false;
                 }
@@ -768,7 +767,7 @@ namespace internal {
 
             while (active > 0) {
                 if (tCtx->cancel_req.load() || tCtx->pause_req.load()) break;
-                if (tCtx->status == DW_TASK_STATUS_ERROR && tCtx->reason == DW_REASON_INVALID_INPUT) break;
+                if (tCtx->status == DW_TASK_STATUS_ERROR && tCtx->reason == DW_REASON_ERROR) break;
 
                 int still_running = 0;
                 CURLMcode mc = curl_multi_perform(multi, &still_running);
@@ -808,13 +807,13 @@ namespace internal {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "run_parts_multi exception: %s", e.what());
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
-            tCtx->reason = DW_REASON_INTERNAL;
+            tCtx->reason = DW_REASON_ERROR;
             if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
         } catch (...) {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "run_parts_multi unknown exception");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
-            tCtx->reason = DW_REASON_INTERNAL;
+            tCtx->reason = DW_REASON_ERROR;
             if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
         }
 
@@ -852,7 +851,7 @@ namespace internal {
                 }
             } else {
                 tCtx->status = DW_TASK_STATUS_ERROR;
-                tCtx->reason = DW_REASON_INTERNAL;
+                tCtx->reason = DW_REASON_ERROR;
                 tCtx->message = "创建请求失败";
             }
         }
@@ -875,14 +874,14 @@ namespace internal {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func exception: %s", e.what());
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
-            tCtx->reason = DW_REASON_INTERNAL;
+            tCtx->reason = DW_REASON_ERROR;
             tCtx->message = "任务线程异常终止";
             push_progress(tCtx);
         } catch (...) {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func unknown exception");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
-            tCtx->reason = DW_REASON_INTERNAL;
+            tCtx->reason = DW_REASON_ERROR;
             tCtx->message = "任务线程异常终止";
             push_progress(tCtx);
         }
@@ -969,7 +968,6 @@ namespace internal {
                     dw_reason_t code, const char *msg, const char *fmt, ...) {
         r->task_id = task_id;
         r->code = code;
-        // trace_id 由 task_id 实时计算，无需存储透传
         const std::string trace_id = dw::make_trace(task_id);
         if (msg) {
             const size_t n = std::strlen(msg);
@@ -977,13 +975,17 @@ namespace internal {
             if (p) std::memcpy(p, msg, n + 1);
             r->message = p;
         } else { r->message = nullptr; }
-        if (code != DW_REASON_NONE && fmt) {
-            va_list args;
-            va_start(args, fmt);
-            char buf[512];
-            std::vsnprintf(buf, sizeof(buf), fmt, args);
-            va_end(args);
-            DW_LOGF(DW_LOG_ERROR, trace_id.c_str(), "%s", buf);
+        if (code != DW_REASON_NONE) {
+            if (fmt) {
+                va_list args;
+                va_start(args, fmt);
+                char buf[512];
+                std::vsnprintf(buf, sizeof(buf), fmt, args);
+                va_end(args);
+                DW_LOGF(DW_LOG_ERROR, trace_id.c_str(), "%s", buf);
+            } else if (msg) {
+                DW_LOGF(DW_LOG_ERROR, trace_id.c_str(), "%s", msg);
+            }
         }
     }
 

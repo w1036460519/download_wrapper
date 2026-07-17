@@ -33,7 +33,6 @@ struct TaskRecord {
     std::vector<std::string> trackers;
     std::vector<int32_t>     file_indexes;
     std::vector<dw_part_state_t> parts;      // HTTP 分片续传态（仅 index/start/end/done 持久化）
-    int32_t                  auto_start = 1;
 
     // 队列元数据
     int64_t created_at = 0;  // Unix 毫秒

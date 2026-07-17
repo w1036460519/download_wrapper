@@ -81,6 +81,7 @@ typedef enum {
     DW_REASON_NETWORK       = 2, /**< 网络问题。 */
     DW_REASON_INVALID_INPUT = 3, /**< 输入非法。 */
     DW_REASON_AUTH          = 4, /**< 认证问题。 */
+    DW_REASON_ERROR         = 5, /**< 通用错误。 */
 } dw_reason_t;
 
 /** 日志级别（从低到高）。 */
@@ -256,7 +257,6 @@ typedef struct dw_task_params {
     const char*    task_id;          /**< 任务标识：HTTP=URL，BT=info_hash。 */
     const char*    save_path;        /**< 保存目录（必填）。 */
     const char*    filename;         /**< 目标文件名（HTTP 必填）。 */
-    int32_t        auto_start;       /**< 1=立即开始，0=暂停状态。 */
     const uint8_t* resume_data;      /**< 断点续传数据（可为 NULL）。 */
     size_t         resume_data_size; /**< resume_data 字节长度。 */
 
@@ -350,10 +350,6 @@ typedef struct dw_config {
     /* ===== 追加字段（置于末尾以保持既有字段偏移的 ABI 兼容） ===== */
 
     double seed_ratio_limit;   /**< BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文；0=库内默认 3.0（即下载:上传=1:3），<0=永久做种。 */
-
-    int32_t wifi_only;         /**< 仅 WiFi 下载开关：0=不限网络（默认），1=仅在 WiFi 下下载。 */
-    int32_t is_wifi;           /**< 当前网络是否为 WiFi（由调用方实时上报）：0=否，1=是；仅当 wifi_only=1 时参与流量闸门判定。
-                                    闸门关闭条件：wifi_only!=0 && is_wifi==0，此时暂停所有下载与做种流量。 */
 } dw_config_t;
 
 /* ------------------------------------------------------------------ */
@@ -413,6 +409,17 @@ DW_API void dw_destroy(void);
  * @return     0=成功，-1=失败。
  */
 DW_API int32_t dw_set_config(const dw_config_t* cfg);
+
+/**
+ * 流量闸门：由调用方根据网络状态主动下发。
+ *
+ * allowed=false 时暂停所有下载与做种流量（torrent session 挂起 + HTTP 活跃任务暂停回落排队）；
+ * allowed=true 时恢复 torrent session 并唤醒调度重启排队任务。
+ * 幂等：状态未变时直接跳过。
+ *
+ * @param allowed  是否允许网络传输：true=允许，false=禁止。
+ */
+DW_API void dw_set_network_allowed(bool allowed);
 
 /* ================================================================== */
 /*                            回调注册                                */
@@ -599,6 +606,38 @@ DW_API int32_t dw_list_tasks(dw_task_snapshot_t** out_tasks,
  * @return          0=成功，-1=失败（任务不存在）。
  */
 DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority);
+
+/* ================================================================== */
+/*                        任务文件持久化                              */
+/* ================================================================== */
+
+/**
+ * 保存任务的文件信息到数据库（批量 upsert）。
+ *
+ * 用于元数据就绪后持久化文件列表，确保引擎句柄释放后仍可查看。
+ *
+ * @param id     任务自增 id；库内按 id 回读 task_id 后写入。
+ * @param files  文件信息数组。
+ * @param count  数组长度。
+ * @return       0=成功，-1=失败。
+ */
+DW_API int32_t dw_save_task_files(int64_t id,
+                                   const dw_file_info_t* files,
+                                   int32_t count);
+
+/**
+ * 从数据库加载任务的文件信息（无需引擎运行）。
+ *
+ * 用于任务详情页展示文件列表；即使引擎句柄已释放仍可读取。
+ *
+ * @param id          任务自增 id；库内按 id 回读 task_id 后查询。
+ * @param out_files   输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
+ * @param out_count   输出：文件数量。
+ * @return            0=成功，-1=失败（任务不存在或无文件记录）。
+ */
+DW_API int32_t dw_load_task_files(int64_t id,
+                                   dw_file_info_t** out_files,
+                                   int32_t* out_count);
 
 /* ================================================================== */
 /*                          资源释放                                  */

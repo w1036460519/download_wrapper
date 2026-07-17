@@ -78,17 +78,16 @@ void fill_record(sqlite3_stmt* st, TaskRecord& r) {
     r.torrent_file  = col_text(st, 8);
     r.trackers      = split_lines(col_text(st, 9));
     r.file_indexes  = split_ints(col_text(st, 10));
-    r.auto_start    = sqlite3_column_int(st, 11);
-    r.priority      = sqlite3_column_int(st, 12);
-    r.status        = static_cast<dw_task_status_t>(sqlite3_column_int(st, 13));
-    r.progress      = sqlite3_column_double(st, 14);
-    r.total_size    = sqlite3_column_int64(st, 15);
-    r.total_done    = sqlite3_column_int64(st, 16);
-    r.support_range = sqlite3_column_int(st, 17);
-    r.etag          = col_text(st, 18);
-    r.last_modified = col_text(st, 19);
-    r.created_at    = sqlite3_column_int64(st, 20);
-    r.parts         = deserialize_parts(col_text(st, 21));
+    r.priority      = sqlite3_column_int(st, 11);
+    r.status        = static_cast<dw_task_status_t>(sqlite3_column_int(st, 12));
+    r.progress      = sqlite3_column_double(st, 13);
+    r.total_size    = sqlite3_column_int64(st, 14);
+    r.total_done    = sqlite3_column_int64(st, 15);
+    r.support_range = sqlite3_column_int(st, 16);
+    r.etag          = col_text(st, 17);
+    r.last_modified = col_text(st, 18);
+    r.created_at    = sqlite3_column_int64(st, 19);
+    r.parts         = deserialize_parts(col_text(st, 20));
 }
 
 } // namespace
@@ -129,7 +128,6 @@ void TaskStore::init_schema() {
         "  torrent_file TEXT,"
         "  trackers TEXT,"
         "  file_indexes TEXT,"
-        "  auto_start INTEGER,"
         "  priority INTEGER,"
         "  status INTEGER,"
         "  progress REAL,"
@@ -145,7 +143,16 @@ void TaskStore::init_schema() {
         "  task_id TEXT PRIMARY KEY,"
         "  data BLOB,"
         "  saved_at INTEGER"
-        ");";
+        ");"
+        "CREATE TABLE IF NOT EXISTS task_files ("
+        "  task_id TEXT NOT NULL,"
+        "  file_index INTEGER NOT NULL,"
+        "  name TEXT NOT NULL,"
+        "  size INTEGER NOT NULL,"
+        "  PRIMARY KEY (task_id, file_index)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_task_files_task_id"
+        "  ON task_files(task_id);";
     sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
 }
 
@@ -155,7 +162,7 @@ std::vector<TaskRecord> TaskStore::load_active() {
     std::vector<TaskRecord> out;
     const char* sql =
         "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
-        "       torrent_file, trackers, file_indexes, auto_start, priority,"
+        "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
         "       last_modified, created_at, http_parts FROM tasks"
         "  WHERE status IN (0,4,5,6);";
@@ -176,7 +183,7 @@ std::vector<TaskRecord> TaskStore::load_all() {
     std::vector<TaskRecord> out;
     const char* sql =
         "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
-        "       torrent_file, trackers, file_indexes, auto_start, priority,"
+        "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
         "       last_modified, created_at, http_parts FROM tasks;";
     sqlite3_stmt* st = nullptr;
@@ -194,7 +201,7 @@ std::vector<TaskRecord> TaskStore::load_all() {
 bool TaskStore::load_by_task_id(const std::string& task_id, TaskRecord& out) {
     const char* sql =
         "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
-        "       torrent_file, trackers, file_indexes, auto_start, priority,"
+        "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
         "       last_modified, created_at, http_parts"
         " FROM tasks WHERE task_id=?;";
@@ -213,7 +220,7 @@ bool TaskStore::load_by_task_id(const std::string& task_id, TaskRecord& out) {
 bool TaskStore::load_by_id(int64_t id, TaskRecord& out) {
     const char* sql =
         "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
-        "       torrent_file, trackers, file_indexes, auto_start, priority,"
+        "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
         "       last_modified, created_at, http_parts"
         " FROM tasks WHERE id=?;";
@@ -234,14 +241,14 @@ void TaskStore::upsert(TaskRecord& r) {
     const char* sql =
         "INSERT INTO tasks (task_id, protocol, name, save_path,"
         " filename, url, magnet_link, torrent_file, trackers, file_indexes,"
-        " auto_start, priority, status, progress, total_size, total_done,"
+        " priority, status, progress, total_size, total_done,"
         " support_range, etag, last_modified, created_at, http_parts)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(task_id) DO UPDATE SET"
         "   protocol=excluded.protocol, name=excluded.name, save_path=excluded.save_path,"
         "   filename=excluded.filename, url=excluded.url, magnet_link=excluded.magnet_link,"
         "   torrent_file=excluded.torrent_file, trackers=excluded.trackers,"
-        "   file_indexes=excluded.file_indexes, auto_start=excluded.auto_start,"
+        "   file_indexes=excluded.file_indexes,"
         "   priority=excluded.priority, status=excluded.status, progress=excluded.progress,"
         "   total_size=excluded.total_size, total_done=excluded.total_done,"
         "   support_range=excluded.support_range, etag=excluded.etag,"
@@ -264,17 +271,16 @@ void TaskStore::upsert(TaskRecord& r) {
     sqlite3_bind_text(st, 8, r.torrent_file.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 9, trackers.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 10, indexes.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 11, r.auto_start);
-    sqlite3_bind_int(st, 12, r.priority);
-    sqlite3_bind_int(st, 13, r.status);
-    sqlite3_bind_double(st, 14, r.progress);
-    sqlite3_bind_int64(st, 15, r.total_size);
-    sqlite3_bind_int64(st, 16, r.total_done);
-    sqlite3_bind_int(st, 17, r.support_range);
-    sqlite3_bind_text(st, 18, r.etag.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 19, r.last_modified.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 20, r.created_at);
-    sqlite3_bind_text(st, 21, parts.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 11, r.priority);
+    sqlite3_bind_int(st, 12, r.status);
+    sqlite3_bind_double(st, 13, r.progress);
+    sqlite3_bind_int64(st, 14, r.total_size);
+    sqlite3_bind_int64(st, 15, r.total_done);
+    sqlite3_bind_int(st, 16, r.support_range);
+    sqlite3_bind_text(st, 17, r.etag.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 18, r.last_modified.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 19, r.created_at);
+    sqlite3_bind_text(st, 20, parts.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(st) == SQLITE_DONE && r.id == 0) {
         // 新插入（内存 id 未定）：回填自增主键，供 (priority, id) 排序使用。
@@ -299,6 +305,8 @@ void TaskStore::remove(const std::string& task_id) {
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
+    // 联动删除任务关联的文件信息
+    delete_task_files(task_id);
 }
 
 void TaskStore::save_resume(const std::string& task_id,
@@ -333,6 +341,73 @@ std::vector<uint8_t> TaskStore::load_resume(const std::string& task_id) {
     }
     sqlite3_finalize(st);
     return out;
+}
+
+// ---- 任务文件信息 ----
+
+void TaskStore::save_task_files(const std::string& task_id,
+                                const std::vector<dw_file_info_t>& files) {
+    if (files.empty()) return;
+
+    // 事务包裹批量写入，保证原子性与性能
+    sqlite3_exec(db_, "BEGIN;", nullptr, nullptr, nullptr);
+
+    const char* sql =
+        "INSERT OR REPLACE INTO task_files (task_id, file_index, name, size)"
+        " VALUES (?,?,?,?);";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return;
+    }
+
+    for (const auto& f : files) {
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, f.index);
+        sqlite3_bind_text(st, 3, f.name ? f.name : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, f.size);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+}
+
+std::vector<dw_file_info_t> TaskStore::load_task_files(const std::string& task_id) {
+    std::vector<dw_file_info_t> out;
+    const char* sql =
+        "SELECT file_index, name, size FROM task_files"
+        " WHERE task_id=? ORDER BY file_index;";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
+
+    sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        dw_file_info_t f{};
+        f.index = sqlite3_column_int(st, 0);
+        const char* n = reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
+        if (n) {
+            const size_t len = std::strlen(n);
+            f.name = static_cast<char*>(std::malloc(len + 1));
+            if (f.name) std::memcpy(f.name, n, len + 1);
+        } else {
+            f.name = nullptr;
+        }
+        f.size = sqlite3_column_int64(st, 2);
+        out.push_back(f);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+void TaskStore::delete_task_files(const std::string& task_id) {
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, "DELETE FROM task_files WHERE task_id=?;", -1,
+                           &st, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
 }
 
 } // namespace dw

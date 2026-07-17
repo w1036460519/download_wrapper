@@ -141,6 +141,8 @@ void HttpEngine::destroy() {
 int32_t HttpEngine::add_task(const dw_task_params_t *params,
                              dw_submit_result_t *    out_result) {
     if (!params || !out_result) return -1;
+    DW_LOG_TASK(DW_LOG_DEBUG, params->task_id ? params->task_id : params->url ? params->url : "",
+                "[EVENT] HTTP add_task 进入");
 
     /* 同步回调指针 */
     if (auto *dl = global_downloader()) {
@@ -151,13 +153,13 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
     const char *err = nullptr;
 
     if (!ensure_running()) {
-        set_result(out_result, url, DW_REASON_INTERNAL, nullptr,
+        set_result(out_result, url, DW_REASON_ERROR, nullptr,
                    "ensure_running failed");
         return -1;
     }
 
     if (!validate_add_input(url, params->save_path, &err)) {
-        set_result(out_result, url, DW_REASON_INVALID_INPUT, nullptr,
+        set_result(out_result, url, DW_REASON_ERROR, nullptr,
                    "validate_add_input failed: url=%s output=%s err=%s",
                    url ? url : "(null)", params->save_path ? params->save_path : "(null)", err);
         return -1;
@@ -167,6 +169,7 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
     {
         std::lock_guard<std::mutex> lk(he::g_map_mtx);
         if (he::g_tasks.contains(url)) {
+            DW_LOG_TASK(DW_LOG_INFO, url, "[EVENT] HTTP add_task 任务已存在（幂等返回）");
             set_result(out_result, url, DW_REASON_NONE, nullptr, nullptr);
             return 0;
         }
@@ -175,7 +178,7 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
     /* 创建目录 */
     if (auto dir_path = std::filesystem::path(params->save_path);
         !dir_path.empty() && !mkdir_recursive(dir_path.string())) {
-        set_result(out_result, url, DW_REASON_INTERNAL, "目录创建失败",
+        set_result(out_result, url, DW_REASON_ERROR, "目录创建失败",
                    "mkdir_recursive failed: dir=%s", dir_path.string().c_str());
         return -1;
     }
@@ -185,7 +188,7 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
 
     auto tCtx_guard = task_create_new(url, params->save_path, params->filename);
     if (!tCtx_guard) {
-        set_result(out_result, url, DW_REASON_INTERNAL, nullptr,
+        set_result(out_result, url, DW_REASON_ERROR, nullptr,
                    "task_create_new failed: url=%s", url);
         return -1;
     }
@@ -199,7 +202,7 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
         }
         const int fd = dw_file_open_write(full_path.c_str());
         if (fd < 0) {
-            set_result(out_result, url, DW_REASON_INTERNAL, nullptr,
+            set_result(out_result, url, DW_REASON_ERROR, nullptr,
                        "open failed: path=%s errno=%d (%s)", full_path.c_str(), errno, std::strerror(errno));
             return -1;
         }
@@ -216,28 +219,29 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
         inserted = snd;
     } catch (...) { inserted = false; }
     if (!inserted) {
-        set_result(out_result, url, DW_REASON_INTERNAL, nullptr,
+        set_result(out_result, url, DW_REASON_ERROR, nullptr,
                    "g_tasks.emplace failed: url=%s", url);
         return -1;
     }
 
     start_task(tCtx);
 
+    DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+        "[EVENT] HTTP add_task 成功: output=%s probing=%d",
+        tCtx->output_path.c_str(), tCtx->probing);
     set_result(out_result, url, DW_REASON_NONE,
                need_probing ? nullptr : "跳过探测，使用 resume_data",
                "add_task ok: url=%s probing=%d", tCtx->url.c_str(), tCtx->probing);
-    DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
-        "add_task ok: url=%s output=%s probing=%d",
-        tCtx->url.c_str(), tCtx->output_path.c_str(), tCtx->probing);
     return 0;
 }
 
 int32_t HttpEngine::pause_task(const char *         id,
                                 dw_submit_result_t * out_result) {
     if (!id || !*id || !out_result) return -1;
+    DW_LOG_TASK(DW_LOG_DEBUG, id, "[EVENT] HTTP pause_task 进入");
 
     if (!ensure_running()) {
-        set_result(out_result, id, DW_REASON_INTERNAL, nullptr,
+        set_result(out_result, id, DW_REASON_ERROR, nullptr,
                    "ensure_running failed");
         return -1;
     }
@@ -264,16 +268,16 @@ int32_t HttpEngine::pause_task(const char *         id,
             hit->status = DW_TASK_STATUS_PAUSED;
             hit->reason = DW_REASON_NONE;
             hit->message = "已暂停";
-            DW_LOG_TASK(DW_LOG_INFO, url_str.c_str(), "pause_task ok: url=%s downloaded=%lld",
-                url_str.c_str(), static_cast<long long>(downloaded));
+            DW_LOG_TASK(DW_LOG_INFO, url_str.c_str(), "[EVENT] HTTP pause_task 成功: downloaded=%lld",
+                static_cast<long long>(downloaded));
         }
         set_result(out_result, url, DW_REASON_NONE, nullptr, nullptr);
         return 0;
     } catch (const std::exception &e) {
-        DW_LOG_SYS(DW_LOG_ERROR, "pause_task exception: %s", e.what());
+        DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP pause_task exception: %s", e.what());
         return -1;
     } catch (...) {
-        DW_LOG_SYS(DW_LOG_ERROR, "pause_task unknown exception");
+        DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP pause_task unknown exception");
         return -1;
     }
 }
@@ -287,9 +291,10 @@ int32_t HttpEngine::resume_task(const dw_task_params_t *params,
 int32_t HttpEngine::delete_task(const char *         id,
                                  dw_submit_result_t * out_result) {
     if (!id || !*id || !out_result) return -1;
+    DW_LOG_TASK(DW_LOG_DEBUG, id, "[EVENT] HTTP delete_task 进入");
 
     if (!ensure_running()) {
-        set_result(out_result, id, DW_REASON_INTERNAL, nullptr,
+        set_result(out_result, id, DW_REASON_ERROR, nullptr,
                    "ensure_running failed");
         return -1;
     }
@@ -314,16 +319,16 @@ int32_t HttpEngine::delete_task(const char *         id,
             if (hit->task_thread.joinable()) hit->task_thread.join();
             if (!output_path.empty() && dw_file_unlink(output_path.c_str()) != 0 && errno != ENOENT)
                 DW_LOG_TASK(DW_LOG_ERROR, url_str.c_str(),
-                "delete_task: unlink failed url=%s path=%s errno=%d", url_str.c_str(), output_path.c_str(), errno);
-            DW_LOG_TASK(DW_LOG_INFO, url_str.c_str(), "delete_task ok: url=%s", url_str.c_str());
+                    "[ERROR] HTTP delete_task unlink failed: path=%s errno=%d", output_path.c_str(), errno);
+            DW_LOG_TASK(DW_LOG_INFO, url_str.c_str(), "[CLEANUP] HTTP delete_task 成功");
         }
         set_result(out_result, url, DW_REASON_NONE, nullptr, nullptr);
         return 0;
     } catch (const std::exception &e) {
-        DW_LOG_SYS(DW_LOG_ERROR, "delete_task exception: %s", e.what());
+        DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP delete_task exception: %s", e.what());
         return -1;
     } catch (...) {
-        DW_LOG_SYS(DW_LOG_ERROR, "delete_task unknown exception");
+        DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP delete_task unknown exception");
         return -1;
     }
 }

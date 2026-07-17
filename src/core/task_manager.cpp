@@ -90,9 +90,6 @@ int32_t TaskManager::start(const dw_config_t& cfg) {
     }
 
     running_.store(true);
-    // 初始流量闸门：wifi_only 且非 WiFi 时关闭（挂起 torrent session、不准入新任务）。
-    net_allowed_ = !(cfg.wifi_only != 0 && cfg.is_wifi == 0);
-    if (!net_allowed_ && torrent_) torrent_->set_network_paused(true);
     schedule_needed_ = true; // 唤醒后立即准入恢复的排队任务
     worker_ = std::thread(&TaskManager::scheduler_loop, this);
 
@@ -125,7 +122,7 @@ void TaskManager::stop() {
 int32_t TaskManager::add(dw_protocol_t proto, const dw_task_params_t* params,
                          dw_submit_result_t* out) {
     if (!params || !out) {
-        if (out) { out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+        if (out) { out->task_id = nullptr; out->code = DW_REASON_ERROR;
                    out->message = nullptr; }
         return -1;
     }
@@ -133,7 +130,7 @@ int32_t TaskManager::add(dw_protocol_t proto, const dw_task_params_t* params,
     const char* raw_id = params->task_id;
     if ((!raw_id || !raw_id[0]) && proto == DW_PROTOCOL_HTTP) raw_id = params->url;
     if (!raw_id || !raw_id[0]) {
-        out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+        out->task_id = nullptr; out->code = DW_REASON_ERROR;
         out->message = nullptr;
         return -1;
     }
@@ -183,12 +180,10 @@ int32_t TaskManager::add(dw_protocol_t proto, const dw_task_params_t* params,
                 r.file_indexes.assign(params->file_indexes,
                                       params->file_indexes + params->file_index_size);
             }
-            r.auto_start  = params->auto_start;
             r.priority    = params->priority;
             r.created_at  = now_unix_ms();
             r.name        = r.filename.empty() ? id : r.filename;
-            r.status      = params->auto_start == 0 ? DW_TASK_STATUS_PAUSED
-                                                    : DW_TASK_STATUS_QUEUED;
+            r.status      = DW_TASK_STATUS_QUEUED;
             r.queued_notified = false;
             store_.upsert(r);         // 先落库回填自增 id，再入内存注册表
             tasks_[id] = r;
@@ -217,7 +212,7 @@ int32_t TaskManager::pause(dw_protocol_t proto, int64_t id,
         // 低频控制操作：按 id 回读得 task_id（未命中即无效 id）。
         TaskRecord probe;
         if (!store_.load_by_id(id, probe)) {
-            out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+            out->task_id = nullptr; out->code = DW_REASON_ERROR;
             out->message = nullptr;
             return -1;
         }
@@ -225,7 +220,7 @@ int32_t TaskManager::pause(dw_protocol_t proto, int64_t id,
         auto it = tasks_.find(task_id);
         if (it == tasks_.end()) {
             // 仅活跃/排队任务（常驻内存）可暂停；暂停/终态任务视为无效操作。
-            out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+            out->task_id = nullptr; out->code = DW_REASON_ERROR;
             out->message = nullptr;
             return -1;
         }
@@ -268,7 +263,7 @@ int32_t TaskManager::resume(dw_protocol_t /*proto*/, int64_t id,
         // 低频控制操作：按 id 回读全字段（未命中即无效 id）。
         TaskRecord probe;
         if (!store_.load_by_id(id, probe)) {
-            out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+            out->task_id = nullptr; out->code = DW_REASON_ERROR;
             out->message = nullptr;
             return -1;
         }
@@ -307,7 +302,7 @@ int32_t TaskManager::remove(dw_protocol_t proto, int64_t id,
         // 低频控制操作：按 id 回读得 task_id（未命中即无效 id）。
         TaskRecord probe;
         if (!store_.load_by_id(id, probe)) {
-            out->task_id = nullptr; out->code = DW_REASON_INVALID_INPUT;
+            out->task_id = nullptr; out->code = DW_REASON_ERROR;
             out->message = nullptr;
             return -1;
         }
@@ -628,13 +623,25 @@ void TaskManager::set_network_allowed(bool allowed) {
     for (auto& r : to_notify) emit_synthetic(r);
 }
 
+// ---- 任务文件持久化 ----
+
+void TaskManager::save_files(const std::string& task_id,
+                             const std::vector<dw_file_info_t>& files) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    store_.save_task_files(task_id, files);
+}
+
+std::vector<dw_file_info_t> TaskManager::load_files(const std::string& task_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return store_.load_task_files(task_id);
+}
+
 bool TaskManager::start_engine_task(const TaskRecord& r,
                                     const std::vector<uint8_t>& resume) {
     dw_task_params_t p{};
     p.task_id    = r.task_id.c_str();
     p.save_path  = r.save_path.c_str();
     p.filename   = r.filename.empty() ? nullptr : r.filename.c_str();
-    p.auto_start = 1;
     p.trace_id   = r.task_id.c_str();
     p.priority   = r.priority;
 
