@@ -76,7 +76,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       # 缓存 vcpkg 的二进制归档目录（files provider 默认写入该目录）；
       # 命中后 libtorrent/boost/openssl/curl 等重依赖无需重复编译。
