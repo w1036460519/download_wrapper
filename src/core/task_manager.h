@@ -3,7 +3,7 @@
  * @brief 库内任务中枢：SQLite 持久化 + 内存注册表 + 优先级就绪队列 + 事件驱动调度。
  *
  * 设计要点：
- *   - 注册表仅常驻排队 / 活跃任务（DOWNLOADING/QUEUED/PARSING/PARSED），
+ *   - 注册表仅常驻排队 / 活跃任务（DOWNLOADING/QUEUED），
  *     暂停 / 完成 / 错误任务落库后从内存移除，按需经 add/resume/list 回读；
  *     引擎仅持有当前活跃任务的运行时句柄；
  *   - 所有状态经 dw::post_progress 汇入 on_progress，断点续传经 on_resume_data 汇入，
@@ -28,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace dw {
@@ -63,28 +64,28 @@ public:
     int32_t remove(dw_protocol_t proto, int64_t id, dw_submit_result_t* out);
     int32_t set_priority(int64_t id, int32_t priority);
 
-    /// 按自增 id 翻译得业务键 task_id（低频；供 BT 工具函数转 info_hash 用）。命中返回 true。
-    bool task_id_of(int64_t id, std::string& out_task_id);
+    /// 按自增 id 回读引擎识别键（HTTP=url，BT=info_hash）：先查常驻内存，未命中回落 DB。
+    /// 供低频 BT 工具函数（磁力/优先级/文件列表）定位引擎句柄。命中返回 true。
+    bool engine_key_of(int64_t id, std::string& out_key);
 
     // ---- 回调拦截（post_progress / post_resume_data 调用） ----
     void on_progress(const dw_progress_t* p);
-    /// 持久化 resume_data；命中记录返回其自增 id（供上层回调），未命中返回 0。
-    int64_t on_resume_data(const char* task_id, dw_protocol_t proto, const uint8_t* data, size_t size);
+    /// 持久化 resume_data；命中内存记录返回其自增 id（供上层回调），非激活任务丢弃返回 0。
+    int64_t on_resume_data(const char* engine_key, dw_protocol_t proto, const uint8_t* data, size_t size);
 
     // ---- 快照查询 ----
     int32_t list(dw_task_snapshot_t** out_tasks, int32_t* out_count);
 
-    /// 设置流量闸门：allowed=false 时挂起 torrent session 并将活跃 HTTP 任务回落 QUEUED，
-    /// 调度线程不再准入新任务；true 时恢复 session 并唤醒调度自动重启排队任务。
+    /// 设置流量闸门：allowed=false 时逐任务暂停所有活跃下载（BT/HTTP）并回落 QUEUED，
+    /// 调度线程不再准入新任务；true 时唤醒调度按 QUEUED→准入路径自动重启。
     void set_network_allowed(bool allowed);
 
     // ---- 任务文件持久化 ----
 
-    /// 保存任务的文件信息到数据库。
-    void save_files(const std::string& task_id,
-                    const std::vector<dw_file_info_t>& files);
-    /// 从数据库加载任务的文件列表。
-    std::vector<dw_file_info_t> load_files(const std::string& task_id);
+    /// 保存任务的文件信息到数据库（key 为自增 id）。
+    void save_files(int64_t id, const std::vector<dw_file_info_t>& files);
+    /// 从数据库加载任务的文件列表（key 为自增 id）。
+    std::vector<dw_file_info_t> load_files(int64_t id);
 
 private:
     // 调度线程主循环
@@ -98,10 +99,19 @@ private:
 
     // ---- 内部工具 ----
     int32_t active_count_locked() const;      // 占用下载额度的任务数
+    void    flush_dirty_locked();             // 刷写全部脏任务进度到库（假定已持 mtx_）
+
+    // 内存索引维护（tasks_ 以自增 id 为键，另维护两张自然键反查表，增删三者严格同步防悬置）
+    void register_task(TaskRecord r);         // 登记：写 tasks_ 并按协议登记 url→id / info_hash→id
+    void unregister_task(int64_t id);         // 注销：清 tasks_ 及其反查表项
+    // 引擎回调自然键 → 自增 id：HTTP 查 url_index_，BT 查 info_hash_index_；未命中返回 0（须持锁调用）
+    int64_t id_of_engine_key(dw_protocol_t proto, const std::string& key) const;
 
     std::mutex              mtx_;
     std::condition_variable cv_;
-    std::map<std::string, TaskRecord> tasks_;
+    std::map<int64_t, TaskRecord>             tasks_;           // 注册表：自增 id → 记录（仅常驻活跃/排队任务）
+    std::unordered_map<std::string, int64_t>  url_index_;       // HTTP 自然键反查：url → id
+    std::unordered_map<std::string, int64_t>  info_hash_index_; // BT 自然键反查：info_hash → id
 
     TaskStore        store_;                  // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
     std::thread      worker_;

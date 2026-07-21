@@ -66,7 +66,7 @@ void post_progress(const dw_progress_t* progress);
  *
  * data / size 仅在调用期间有效，回调内如需持有须深拷贝。
  */
-void post_resume_data(const char*    task_id,
+void post_resume_data(const char*    engine_key,
                       dw_protocol_t  protocol,
                       const uint8_t* data,
                       size_t         size);

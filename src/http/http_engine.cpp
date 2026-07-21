@@ -141,7 +141,7 @@ void HttpEngine::destroy() {
 int32_t HttpEngine::add_task(const dw_task_params_t *params,
                              dw_submit_result_t *    out_result) {
     if (!params || !out_result) return -1;
-    DW_LOG_TASK(DW_LOG_DEBUG, params->task_id ? params->task_id : params->url ? params->url : "",
+    DW_LOG_TASK(DW_LOG_DEBUG, params->url ? params->url : "",
                 "[EVENT] HTTP add_task 进入");
 
     /* 同步回调指针 */
@@ -149,7 +149,7 @@ int32_t HttpEngine::add_task(const dw_task_params_t *params,
         he::g_progress_cb = dl->progress_cb;
     }
 
-    const char *url = (params->url && params->url[0]) ? params->url : params->task_id;
+    const char *url = (params->url && params->url[0]) ? params->url : nullptr;
     const char *err = nullptr;
 
     if (!ensure_running()) {

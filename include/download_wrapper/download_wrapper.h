@@ -57,16 +57,14 @@ typedef enum {
  * 任务状态枚举。
  *
  * 前 4 值与 libcurl_wrapper 的 tw_task_status_t 完全对齐，
- * 后 3 值为 download_app / torrent 扩展状态。
+ * 第 5 值 QUEUED 为 download_app / torrent 扩展状态。
  */
 typedef enum {
-    DW_TASK_STATUS_DOWNLOADING = 0, /**< 下载中。 */
+    DW_TASK_STATUS_DOWNLOADING = 0, /**< 下载中（含 BT 元数据获取 / 待选文件阶段）。 */
     DW_TASK_STATUS_PAUSED      = 1, /**< 已暂停。 */
     DW_TASK_STATUS_COMPLETED   = 2, /**< 已完成（终态）。 */
     DW_TASK_STATUS_ERROR       = 3, /**< 已失败（终态）。 */
     DW_TASK_STATUS_QUEUED      = 4, /**< 排队中（等待调度）。 */
-    DW_TASK_STATUS_PARSING     = 5, /**< 解析中（BT 元数据获取阶段）。 */
-    DW_TASK_STATUS_PARSED      = 6, /**< 解析完成（元数据已接收）。 */
 } dw_task_status_t;
 
 /**
@@ -197,7 +195,8 @@ typedef struct dw_file_info {
 typedef struct dw_progress {
     /* ===== 通用字段（所有协议共用） ===== */
 
-    const char*      task_id;          /**< 任务标识：HTTP=URL，BT=info_hash。 */
+    const char*      url;              /**< 下载 URL：HTTP 任务的识别键与展示；BT 为空串。 */
+    const char*      info_hash;        /**< 种子 info_hash：BT 任务的识别键与展示；HTTP 为空串。 */
     const char*      trace_id;         /**< 日志追踪 ID；BT 可为空字符串。 */
     dw_protocol_t    protocol;         /**< 协议类型。 */
     const char*      name;             /**< 任务显示名称。 */
@@ -237,7 +236,7 @@ typedef struct dw_progress {
     /* ===== 交互主键（追加，保持既有字段偏移） ===== */
 
     int64_t          id;               /**< 任务自增 id：上层交互主键，由库内回填；
-                                            task_id 保留为引擎内部标识与展示数据。 */
+                                            url / info_hash 为引擎内部识别键与展示数据。 */
 } dw_progress_t;
 
 /* ------------------------------------------------------------------ */
@@ -254,7 +253,6 @@ typedef struct dw_progress {
 typedef struct dw_task_params {
     /* ===== 通用字段 ===== */
 
-    const char*    task_id;          /**< 任务标识：HTTP=URL，BT=info_hash。 */
     const char*    save_path;        /**< 保存目录（必填）。 */
     const char*    filename;         /**< 目标文件名（HTTP 必填）。 */
     const uint8_t* resume_data;      /**< 断点续传数据（可为 NULL）。 */
@@ -262,11 +260,12 @@ typedef struct dw_task_params {
 
     /* ===== HTTP 特有 ===== */
 
-    const char*    url;              /**< 下载 URL（与 task_id 可同值）。 */
+    const char*    url;              /**< 下载 URL：HTTP 任务识别键（必填）。 */
     const char*    trace_id;         /**< 追踪 ID。 */
 
     /* ===== BT 特有 ===== */
 
+    const char*    info_hash;        /**< 种子 info_hash：BT 任务识别键（必填）。 */
     const char*    magnet_link;      /**< 磁力链接（优先级最高）。 */
     const char*    torrent_file;     /**< .torrent 文件路径。 */
     const char**   trackers;         /**< tracker URL 数组（可为 NULL）。 */
@@ -288,14 +287,11 @@ typedef struct dw_task_params {
 /**
  * 同步返回结果（每个任务一条，与入参顺序对应）。
  *
- * task_id：HTTP 任务回传 URL，BT 任务回传 info_hash（引擎标识 / 展示数据）。
- *           控制操作（pause/resume/delete）不回传字符串，置 NULL。
  * code：    同步返回码；DW_REASON_NONE 表示成功。
  * message： 错误描述；成功时为 NULL，由库分配并通过 dw_submit_results_release 释放。
  * id：      任务自增 id（上层交互主键）；add 成功回填新建 id，控制操作回显入参 id。
  */
 typedef struct dw_submit_result {
-    const char* task_id;
     dw_reason_t code;
     char*       message;
     int64_t     id;      /**< 任务自增 id：add 成功后回填新建 id，控制操作回显入参 id。 */
@@ -364,7 +360,8 @@ typedef struct dw_config {
  * 所有字符串由库分配，整个数组通过 dw_task_list_free 统一释放。
  */
 typedef struct dw_task_snapshot {
-    char*            task_id;      /**< 任务标识：HTTP=URL，BT=info_hash。 */
+    char*            url;          /**< 下载 URL：HTTP 任务识别键与展示；BT 为空串。 */
+    char*            info_hash;    /**< 种子 info_hash：BT 任务识别键与展示；HTTP 为空串。 */
     dw_protocol_t    protocol;     /**< 协议类型。 */
     char*            name;         /**< 任务显示名称。 */
     char*            save_path;    /**< 保存目录。 */
@@ -413,8 +410,9 @@ DW_API int32_t dw_set_config(const dw_config_t* cfg);
 /**
  * 流量闸门：由调用方根据网络状态主动下发。
  *
- * allowed=false 时暂停所有下载与做种流量（torrent session 挂起 + HTTP 活跃任务暂停回落排队）；
- * allowed=true 时恢复 torrent session 并唤醒调度重启排队任务。
+ * allowed=false 时逐任务暂停所有活跃下载（BT 暂停句柄 / HTTP 停传输线程）并回落 QUEUED，
+ *   调度线程不再准入新任务；session 存活以维持连接与心跳（不分享载荷）。
+ * allowed=true 时唤醒调度按 QUEUED→准入路径重启（BT 经 add_task 幂等分支恢复）。
  * 幂等：状态未变时直接跳过。
  *
  * @param allowed  是否允许网络传输：true=允许，false=禁止。
@@ -568,7 +566,7 @@ DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
 /**
  * 获取已存在任务的文件列表（元数据就绪后可用）。
  *
- * 用于磁力链接任务 PARSING → PARSED 后获取文件列表。
+ * 用于磁力链接任务元数据就绪后获取文件列表。
  *
  * @param id          任务自增 id；库内按 id 回读 info_hash 后调引擎。
  * @param out_files   输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
@@ -616,7 +614,7 @@ DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority);
  *
  * 用于元数据就绪后持久化文件列表，确保引擎句柄释放后仍可查看。
  *
- * @param id     任务自增 id；库内按 id 回读 task_id 后写入。
+ * @param id     任务自增 id；task_files 表按 id 直接关联。
  * @param files  文件信息数组。
  * @param count  数组长度。
  * @return       0=成功，-1=失败。
@@ -630,7 +628,7 @@ DW_API int32_t dw_save_task_files(int64_t id,
  *
  * 用于任务详情页展示文件列表；即使引擎句柄已释放仍可读取。
  *
- * @param id          任务自增 id；库内按 id 回读 task_id 后查询。
+ * @param id          任务自增 id；task_files 表按 id 直接关联。
  * @param out_files   输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
  * @param out_count   输出：文件数量。
  * @return            0=成功，-1=失败（任务不存在或无文件记录）。

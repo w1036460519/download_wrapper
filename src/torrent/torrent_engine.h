@@ -95,7 +95,7 @@ public:
 
     /**
      * 获取 session 中已存在任务的文件列表。
-     * 任务元数据就绪后可用（磁力链接 PARSED 后）。
+     * 任务元数据就绪后可用。
      */
     int32_t get_file_list(const char*      task_id,
                           dw_file_info_t** out_files,
@@ -106,13 +106,6 @@ public:
      * 由上层调度循环定时调用；无匹配任务时为空操作。
      */
     void sweep();
-
-    /**
-     * 流量闸门：整体挂起 / 恢复。
-     * paused=true 时遍历全部 handle 逐个暂停；
-     * paused=false 时遍历全部 handle 逐个恢复。由上层流量闸门驱动，不改变单个任务状态。
-     */
-    void set_network_paused(bool paused);
 
 private:
     bool initialized_ = false;

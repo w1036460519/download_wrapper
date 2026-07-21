@@ -131,7 +131,7 @@ namespace internal {
 
     void fill_progress(dl_task_ctx *tCtx, dw_progress_t *task_progress) {
         *task_progress = {};
-        task_progress->task_id = tCtx->url.c_str();
+        task_progress->url = tCtx->url.c_str();   // HTTP 识别键与展示（info_hash 保持空）
         task_progress->trace_id = "";
         task_progress->protocol = DW_PROTOCOL_HTTP;
         task_progress->name = tCtx->filename.c_str();
@@ -966,7 +966,7 @@ namespace internal {
 
     void set_result(dw_submit_result_t *r, const char *task_id,
                     dw_reason_t code, const char *msg, const char *fmt, ...) {
-        r->task_id = task_id;
+        // task_id 仅用于日志 trace；dw_submit_result_t 不再回传字符串标识。
         r->code = code;
         const std::string trace_id = dw::make_trace(task_id);
         if (msg) {

@@ -65,10 +65,10 @@ std::vector<dw_part_state_t> deserialize_parts(const std::string& s) {
     return parts;
 }
 
-/// 从查询行填充 TaskRecord（load_active / load_by_task_id / load_by_id 共用，列序须与 SELECT 一致）。
+/// 从查询行填充 TaskRecord（load_active / load_by_url / load_by_info_hash / load_by_id 共用，列序须与 SELECT 一致）。
 void fill_record(sqlite3_stmt* st, TaskRecord& r) {
     r.id            = sqlite3_column_int64(st, 0);
-    r.task_id       = col_text(st, 1);
+    r.info_hash     = col_text(st, 1);
     r.protocol      = static_cast<dw_protocol_t>(sqlite3_column_int(st, 2));
     r.name          = col_text(st, 3);
     r.save_path     = col_text(st, 4);
@@ -114,11 +114,13 @@ void TaskStore::close() {
 }
 
 void TaskStore::init_schema() {
-    // 表结构：自增主键 id + task_id 唯一键（id 升序即提交次序）。
+    // 表结构：自增主键 id（升序即提交次序）。身份为协议专属列——BT 存 info_hash，HTTP 用 url；
+    // 不再设唯一约束，去重由业务层在 add 时按 url / info_hash 查重实现。
+    // resume_data / task_files 的 task_id 列统一引用 tasks.id（整型自增主键）。
     const char* sql =
         "CREATE TABLE IF NOT EXISTS tasks ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  task_id TEXT UNIQUE NOT NULL,"
+        "  info_hash TEXT,"
         "  protocol INTEGER,"
         "  name TEXT,"
         "  save_path TEXT,"
@@ -139,13 +141,16 @@ void TaskStore::init_schema() {
         "  created_at INTEGER,"
         "  http_parts TEXT"
         ");"
+        // 去重查询加速：add 时按协议查 url / info_hash（非唯一索引）。
+        "CREATE INDEX IF NOT EXISTS idx_tasks_info_hash ON tasks(info_hash);"
+        "CREATE INDEX IF NOT EXISTS idx_tasks_url ON tasks(url);"
         "CREATE TABLE IF NOT EXISTS resume_data ("
-        "  task_id TEXT PRIMARY KEY,"
+        "  task_id INTEGER PRIMARY KEY,"
         "  data BLOB,"
         "  saved_at INTEGER"
         ");"
         "CREATE TABLE IF NOT EXISTS task_files ("
-        "  task_id TEXT NOT NULL,"
+        "  task_id INTEGER NOT NULL,"
         "  file_index INTEGER NOT NULL,"
         "  name TEXT NOT NULL,"
         "  size INTEGER NOT NULL,"
@@ -157,11 +162,11 @@ void TaskStore::init_schema() {
 }
 
 std::vector<TaskRecord> TaskStore::load_active() {
-    // 仅载入排队 / 活跃任务（DOWNLOADING=0, QUEUED=4, PARSING=5, PARSED=6）；
-    // 暂停(1)/完成(2)/错误(3) 留库，按需经 add/resume/list 回读，减小常驻内存。
+    // 载入排队 / 活跃任务（DOWNLOADING=0, QUEUED=4）；兼容旧库遗留的 5/6（原解析态），
+    // 由上层重启归一化统一回落 QUEUED。暂停(1)/完成(2)/错误(3) 留库，按需回读，减小常驻内存。
     std::vector<TaskRecord> out;
     const char* sql =
-        "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
+        "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
         "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
         "       last_modified, created_at, http_parts FROM tasks"
@@ -182,7 +187,7 @@ std::vector<TaskRecord> TaskStore::load_all() {
     // 全量任务（含暂停 / 完成 / 错误），供 dw_list_tasks 快照使用。列序与 fill_record 一致。
     std::vector<TaskRecord> out;
     const char* sql =
-        "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
+        "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
         "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
         "       last_modified, created_at, http_parts FROM tasks;";
@@ -198,16 +203,22 @@ std::vector<TaskRecord> TaskStore::load_all() {
     return out;
 }
 
-bool TaskStore::load_by_task_id(const std::string& task_id, TaskRecord& out) {
-    const char* sql =
-        "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
+namespace {
+/// 按协议 + 指定列查询单条任务（列序与 fill_record 一致）。命中填充 out 返回 true。
+/// col 为库内固定列名（"url" / "info_hash"），值走绑定参数，无注入风险。
+bool load_one_by(sqlite3* db, dw_protocol_t protocol, const char* col,
+                 const std::string& value, TaskRecord& out) {
+    std::string sql =
+        "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
         "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
-        "       last_modified, created_at, http_parts"
-        " FROM tasks WHERE task_id=?;";
+        "       last_modified, created_at, http_parts FROM tasks WHERE protocol=? AND ";
+    sql += col;
+    sql += "=? LIMIT 1;";
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
-    sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_int(st, 1, protocol);
+    sqlite3_bind_text(st, 2, value.c_str(), -1, SQLITE_TRANSIENT);
     bool found = false;
     if (sqlite3_step(st) == SQLITE_ROW) {
         fill_record(st, out);
@@ -216,10 +227,21 @@ bool TaskStore::load_by_task_id(const std::string& task_id, TaskRecord& out) {
     sqlite3_finalize(st);
     return found;
 }
+} // namespace
+
+bool TaskStore::load_by_url(const std::string& url, TaskRecord& out) {
+    // HTTP 按 url 查（url 列有非唯一索引）。业务层据此判重。
+    return load_one_by(db_, DW_PROTOCOL_HTTP, "url", url, out);
+}
+
+bool TaskStore::load_by_info_hash(const std::string& info_hash, TaskRecord& out) {
+    // BT 按 info_hash 查（info_hash 列有非唯一索引）。业务层据此判重。
+    return load_one_by(db_, DW_PROTOCOL_TORRENT, "info_hash", info_hash, out);
+}
 
 bool TaskStore::load_by_id(int64_t id, TaskRecord& out) {
     const char* sql =
-        "SELECT id, task_id, protocol, name, save_path, filename, url, magnet_link,"
+        "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
         "       torrent_file, trackers, file_indexes, priority,"
         "       status, progress, total_size, total_done, support_range, etag,"
         "       last_modified, created_at, http_parts"
@@ -236,24 +258,14 @@ bool TaskStore::load_by_id(int64_t id, TaskRecord& out) {
     return found;
 }
 
-void TaskStore::upsert(TaskRecord& r) {
-    // 真正的 UPSERT：冲突时按 task_id 原地更新（保留 id 与 rowid），避免 INSERT OR REPLACE 的删+插。
+void TaskStore::insert(TaskRecord& r) {
+    // 新增任务：纯 INSERT，回填自增主键。去重已由调用方（add）预先按 url / info_hash 判定。
     const char* sql =
-        "INSERT INTO tasks (task_id, protocol, name, save_path,"
+        "INSERT INTO tasks (info_hash, protocol, name, save_path,"
         " filename, url, magnet_link, torrent_file, trackers, file_indexes,"
         " priority, status, progress, total_size, total_done,"
         " support_range, etag, last_modified, created_at, http_parts)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        " ON CONFLICT(task_id) DO UPDATE SET"
-        "   protocol=excluded.protocol, name=excluded.name, save_path=excluded.save_path,"
-        "   filename=excluded.filename, url=excluded.url, magnet_link=excluded.magnet_link,"
-        "   torrent_file=excluded.torrent_file, trackers=excluded.trackers,"
-        "   file_indexes=excluded.file_indexes,"
-        "   priority=excluded.priority, status=excluded.status, progress=excluded.progress,"
-        "   total_size=excluded.total_size, total_done=excluded.total_done,"
-        "   support_range=excluded.support_range, etag=excluded.etag,"
-        "   last_modified=excluded.last_modified, created_at=excluded.created_at,"
-        "   http_parts=excluded.http_parts;";
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
 
@@ -261,7 +273,7 @@ void TaskStore::upsert(TaskRecord& r) {
     const std::string indexes  = join_ints(r.file_indexes);
     const std::string parts    = serialize_parts(r.parts);
 
-    sqlite3_bind_text(st, 1, r.task_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, r.info_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, r.protocol);
     sqlite3_bind_text(st, 3, r.name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 4, r.save_path.c_str(), -1, SQLITE_TRANSIENT);
@@ -282,55 +294,94 @@ void TaskStore::upsert(TaskRecord& r) {
     sqlite3_bind_int64(st, 19, r.created_at);
     sqlite3_bind_text(st, 20, parts.c_str(), -1, SQLITE_TRANSIENT);
 
-    if (sqlite3_step(st) == SQLITE_DONE && r.id == 0) {
-        // 新插入（内存 id 未定）：回填自增主键，供 (priority, id) 排序使用。
-        // 此路径必为 INSERT（task_id 不存在才会以 id==0 落库），last_insert_rowid 可靠。
-        r.id = sqlite3_last_insert_rowid(db_);
+    if (sqlite3_step(st) == SQLITE_DONE) {
+        r.id = sqlite3_last_insert_rowid(db_); // 回填自增主键，供 (priority, id) 排序使用
     }
     sqlite3_finalize(st);
 }
 
-void TaskStore::remove(const std::string& task_id) {
+void TaskStore::update(const TaskRecord& r) {
+    // 更新既有任务：按 id 原地 UPDATE 全字段（保留 rowid 与提交次序）。要求 r.id 有效。
+    const char* sql =
+        "UPDATE tasks SET info_hash=?, protocol=?, name=?, save_path=?,"
+        " filename=?, url=?, magnet_link=?, torrent_file=?, trackers=?, file_indexes=?,"
+        " priority=?, status=?, progress=?, total_size=?, total_done=?,"
+        " support_range=?, etag=?, last_modified=?, created_at=?, http_parts=?"
+        " WHERE id=?;";
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM tasks WHERE task_id=?;", -1, &st,
+    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
+
+    const std::string trackers = join_lines(r.trackers);
+    const std::string indexes  = join_ints(r.file_indexes);
+    const std::string parts    = serialize_parts(r.parts);
+
+    sqlite3_bind_text(st, 1, r.info_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, r.protocol);
+    sqlite3_bind_text(st, 3, r.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, r.save_path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, r.filename.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, r.url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, r.magnet_link.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, r.torrent_file.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9, trackers.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 10, indexes.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 11, r.priority);
+    sqlite3_bind_int(st, 12, r.status);
+    sqlite3_bind_double(st, 13, r.progress);
+    sqlite3_bind_int64(st, 14, r.total_size);
+    sqlite3_bind_int64(st, 15, r.total_done);
+    sqlite3_bind_int(st, 16, r.support_range);
+    sqlite3_bind_text(st, 17, r.etag.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 18, r.last_modified.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 19, r.created_at);
+    sqlite3_bind_text(st, 20, parts.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 21, r.id);
+
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void TaskStore::remove(int64_t id) {
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, "DELETE FROM tasks WHERE id=?;", -1, &st,
                            nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 1, id);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
     st = nullptr;
     if (sqlite3_prepare_v2(db_, "DELETE FROM resume_data WHERE task_id=?;", -1,
                            &st, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 1, id);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
-    // 联动删除任务关联的文件信息
-    delete_task_files(task_id);
+    // 联动删除任务关联的文件信息（子表统一以自增 id 为键）
+    delete_task_files(id);
 }
 
-void TaskStore::save_resume(const std::string& task_id,
+void TaskStore::save_resume(int64_t id,
                             const uint8_t* data, size_t size) {
     const char* sql =
         "INSERT OR REPLACE INTO resume_data (task_id, data, saved_at)"
         " VALUES (?,?,?);";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 1, id);
     sqlite3_bind_blob(st, 2, data, static_cast<int>(size), SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 3, now_unix_ms());
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
 
-std::vector<uint8_t> TaskStore::load_resume(const std::string& task_id) {
+std::vector<uint8_t> TaskStore::load_resume(int64_t id) {
     std::vector<uint8_t> out;
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, "SELECT data FROM resume_data WHERE task_id=?;",
                            -1, &st, nullptr) != SQLITE_OK) {
         return out;
     }
-    sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 1, id);
     if (sqlite3_step(st) == SQLITE_ROW) {
         const void* blob = sqlite3_column_blob(st, 0);
         const int   n    = sqlite3_column_bytes(st, 0);
@@ -345,7 +396,7 @@ std::vector<uint8_t> TaskStore::load_resume(const std::string& task_id) {
 
 // ---- 任务文件信息 ----
 
-void TaskStore::save_task_files(const std::string& task_id,
+void TaskStore::save_task_files(int64_t id,
                                 const std::vector<dw_file_info_t>& files) {
     if (files.empty()) return;
 
@@ -363,7 +414,7 @@ void TaskStore::save_task_files(const std::string& task_id,
 
     for (const auto& f : files) {
         sqlite3_reset(st);
-        sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 1, id);
         sqlite3_bind_int(st, 2, f.index);
         sqlite3_bind_text(st, 3, f.name ? f.name : "", -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 4, f.size);
@@ -373,7 +424,7 @@ void TaskStore::save_task_files(const std::string& task_id,
     sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
 }
 
-std::vector<dw_file_info_t> TaskStore::load_task_files(const std::string& task_id) {
+std::vector<dw_file_info_t> TaskStore::load_task_files(int64_t id) {
     std::vector<dw_file_info_t> out;
     const char* sql =
         "SELECT file_index, name, size FROM task_files"
@@ -381,7 +432,7 @@ std::vector<dw_file_info_t> TaskStore::load_task_files(const std::string& task_i
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
 
-    sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 1, id);
     while (sqlite3_step(st) == SQLITE_ROW) {
         dw_file_info_t f{};
         f.index = sqlite3_column_int(st, 0);
@@ -400,11 +451,11 @@ std::vector<dw_file_info_t> TaskStore::load_task_files(const std::string& task_i
     return out;
 }
 
-void TaskStore::delete_task_files(const std::string& task_id) {
+void TaskStore::delete_task_files(int64_t id) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db_, "DELETE FROM task_files WHERE task_id=?;", -1,
                            &st, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 1, id);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }

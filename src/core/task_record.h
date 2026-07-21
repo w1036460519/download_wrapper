@@ -21,15 +21,16 @@ namespace dw {
  */
 struct TaskRecord {
     // 标识
-    std::string   task_id;
+    std::string   info_hash;               // BT 身份（info_hash）；HTTP 该字段为空，身份见 url
     dw_protocol_t protocol = DW_PROTOCOL_HTTP;
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
     std::string              save_path;
     std::string              filename;
-    std::string              url;           // HTTP
+    std::string              url;           // HTTP 身份 + 下载地址
     std::string              magnet_link;   // BT
     std::string              torrent_file;  // BT
+
     std::vector<std::string> trackers;
     std::vector<int32_t>     file_indexes;
     std::vector<dw_part_state_t> parts;      // HTTP 分片续传态（仅 index/start/end/done 持久化）

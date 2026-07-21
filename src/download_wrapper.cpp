@@ -87,18 +87,18 @@ void post_progress(const dw_progress_t* progress) {
     }
 }
 
-void post_resume_data(const char*    task_id,
+void post_resume_data(const char*    engine_key,
                       dw_protocol_t  protocol,
                       const uint8_t* data,
                       size_t         size) {
-    if (!g_downloader || !task_id) {
+    if (!g_downloader || !engine_key) {
         return;
     }
     // resume_data 由库内 SQLite 持久化；同时保留对外回调以兼容已注册的调用方。
     int64_t id = 0;
     if (g_downloader->task_manager) {
-        // 内部持久化用 task_id 定位；返回命中记录的自增 id 供对外回调。
-        id = g_downloader->task_manager->on_resume_data(task_id, protocol, data, size);
+        // 内部用引擎键（HTTP=url，BT=info_hash）定位；返回命中记录的自增 id 供对外回调。
+        id = g_downloader->task_manager->on_resume_data(engine_key, protocol, data, size);
     }
     if (g_downloader->resume_data_cb && id != 0) {
         g_downloader->resume_data_cb(id, protocol, data, size);
@@ -273,7 +273,6 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
             "失败: 参数非法 d=%p init=%d params=%p out=%p",
             d, d ? d->initialized.load() : 0, params, out_result);
         if (out_result) {
-            out_result->task_id = nullptr;
             out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
@@ -281,7 +280,6 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
     }
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
-        out_result->task_id = nullptr;
         out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, trace_id, "失败: 未知协议 protocol=%d", protocol);
@@ -300,7 +298,6 @@ DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
             "失败: 参数非法 d=%p init=%d id=%lld out=%p",
             d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
-            out_result->task_id = nullptr;
             out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
@@ -308,7 +305,6 @@ DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
     }
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
-        out_result->task_id = nullptr;
         out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
@@ -326,7 +322,6 @@ DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
             "失败: 参数非法 d=%p init=%d id=%lld out=%p",
             d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
-            out_result->task_id = nullptr;
             out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
@@ -334,7 +329,6 @@ DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
     }
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
-        out_result->task_id = nullptr;
         out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
@@ -352,7 +346,6 @@ DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
             "失败: 参数非法 d=%p init=%d id=%lld out=%p",
             d, d ? d->initialized.load() : 0, (long long)id, out_result);
         if (out_result) {
-            out_result->task_id = nullptr;
             out_result->code    = DW_REASON_ERROR;
             out_result->message = nullptr;
         }
@@ -360,7 +353,6 @@ DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
     }
 
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
-        out_result->task_id = nullptr;
         out_result->code    = DW_REASON_ERROR;
         out_result->message = nullptr;
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
@@ -403,9 +395,9 @@ DW_API char* dw_info_hash_to_magnet(int64_t id) {
             d, d ? d->initialized.load() : 0, (long long)id);
         return nullptr;
     }
-    // 低频操作：按 id 回读 info_hash（BT 的 task_id 即 info_hash）后调引擎。
+    // 低频操作：按 id 回读 info_hash（BT 的引擎键即 info_hash）后调引擎。
     std::string info_hash;
-    if (!d->task_manager->task_id_of(id, info_hash)) {
+    if (!d->task_manager->engine_key_of(id, info_hash)) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
         return nullptr;
     }
@@ -423,7 +415,7 @@ DW_API int dw_set_file_priority(int64_t id,
         return 0;
     }
     std::string info_hash;
-    if (!d->task_manager->task_id_of(id, info_hash)) {
+    if (!d->task_manager->engine_key_of(id, info_hash)) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
         return 0;
     }
@@ -461,7 +453,7 @@ DW_API int32_t dw_get_file_list(int64_t          id,
     }
     // 低频操作：按 id 回读 info_hash 后调引擎。
     std::string info_hash;
-    if (!d->task_manager->task_id_of(id, info_hash)) {
+    if (!d->task_manager->engine_key_of(id, info_hash)) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
         return -1;
     }
@@ -513,15 +505,9 @@ DW_API int32_t dw_save_task_files(int64_t id,
             d, d ? d->initialized.load() : 0, (long long)id, files, count);
         return -1;
     }
-    // 按 id 回读 task_id
-    std::string task_id;
-    if (!d->task_manager->task_id_of(id, task_id)) {
-        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
-        return -1;
-    }
-    // 转换为 vector 后批量写入
+    // task_files 表按自增 id 直接关联，无需回读引擎键；转换为 vector 后批量写入。
     std::vector<dw_file_info_t> file_vec(files, files + count);
-    d->task_manager->save_files(task_id, file_vec);
+    d->task_manager->save_files(id, file_vec);
     return 0;
 }
 
@@ -538,16 +524,8 @@ DW_API int32_t dw_load_task_files(int64_t id,
         if (out_count) *out_count = 0;
         return -1;
     }
-    // 按 id 回读 task_id
-    std::string task_id;
-    if (!d->task_manager->task_id_of(id, task_id)) {
-        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
-        *out_files = nullptr;
-        *out_count = 0;
-        return -1;
-    }
-    // 从数据库加载
-    auto file_vec = d->task_manager->load_files(task_id);
+    // task_files 表按自增 id 直接关联，无需回读引擎键；直接从数据库加载。
+    auto file_vec = d->task_manager->load_files(id);
     if (file_vec.empty()) {
         *out_files = nullptr;
         *out_count = 0;
@@ -610,7 +588,8 @@ DW_API void dw_task_list_free(dw_task_snapshot_t* tasks, int32_t count) {
         return;
     }
     for (int32_t i = 0; i < count; ++i) {
-        std::free(tasks[i].task_id);
+        std::free(tasks[i].url);
+        std::free(tasks[i].info_hash);
         std::free(tasks[i].name);
         std::free(tasks[i].save_path);
         std::free(tasks[i].filename);
