@@ -75,18 +75,6 @@ void log_message(dw_log_level_t level,
     }
 }
 
-void post_progress(const dw_progress_t* progress) {
-    if (!g_downloader || !progress) {
-        return;
-    }
-    // 优先经 TaskManager 拦截（更新快照 / 持久化 / 触发调度），内部再转发上层。
-    if (g_downloader->task_manager) {
-        g_downloader->task_manager->on_progress(progress);
-    } else if (g_downloader->progress_cb) {
-        g_downloader->progress_cb(progress);
-    }
-}
-
 void post_resume_data(const char*    engine_key,
                       dw_protocol_t  protocol,
                       const uint8_t* data,
@@ -103,6 +91,32 @@ void post_resume_data(const char*    engine_key,
     if (g_downloader->resume_data_cb && id != 0) {
         g_downloader->resume_data_cb(id, protocol, data, size);
     }
+}
+
+void post_task_files(const char*           engine_key,
+                     dw_protocol_t         protocol,
+                     const dw_file_info_t* files,
+                     int32_t               count) {
+    if (!g_downloader || !engine_key || !files || count <= 0) {
+        return;
+    }
+    // 节点树由引擎构好、经此汇入库内 SQLite 持久化（仅内部通道，不对外回调）。
+    if (g_downloader->task_manager) {
+        g_downloader->task_manager->on_task_files(engine_key, protocol, files, count);
+    }
+}
+
+std::string request_unique_name(const char*   engine_key,
+                                dw_protocol_t protocol,
+                                const char*   dir,
+                                const char*   name) {
+    if (!engine_key || !dir || !name) return name ? name : "";
+    // 定名上调：TaskManager 持锁取占用名集 → 解唯一名 → 回写任务并落库（持久预留）。
+    // alert 线程上调锁 mtx_ 与现有 on_task_files 同模式，无死锁。
+    if (g_downloader && g_downloader->task_manager) {
+        return g_downloader->task_manager->resolve_and_record_name(engine_key, protocol, dir, name);
+    }
+    return name;
 }
 
 } // namespace dw
@@ -461,6 +475,185 @@ DW_API int32_t dw_get_file_list(int64_t          id,
 }
 
 /* ------------------------------------------------------------------ */
+/*  边下边播（区间 / 提优 / 进度）                                    */
+/* ------------------------------------------------------------------ */
+
+DW_API int32_t dw_get_file_ranges(int64_t           id,
+                                  int32_t           file_index,
+                                  dw_byte_range_t** out_ranges,
+                                  int32_t*          out_count) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager ||
+        !out_ranges || !out_count) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
+        return -1;
+    }
+    *out_ranges = nullptr;
+    *out_count  = 0;
+
+    std::string key;
+    dw_protocol_t proto = DW_PROTOCOL_HTTP;
+    if (!d->task_manager->engine_ref_of(id, key, proto)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        return -1;
+    }
+
+    // 接口统一双参签名：HTTP 单文件模型忽略 file_index。
+    std::vector<dw_byte_range_t> vec =
+        (proto == DW_PROTOCOL_TORRENT)
+            ? d->torrent_engine->get_file_ranges(key.c_str(), file_index)
+            : d->http_engine->get_file_ranges(key.c_str(), file_index);
+    if (vec.empty()) {
+        // 引擎实时无区间：任务可能未加载进引擎（暂停 / 跨重启空窗）。
+        // 回退读 file_segments 表的低频快照，支撑任务未加载时的播放兜底。
+        vec = d->task_manager->load_segments(id, file_index);
+    }
+    if (vec.empty()) {
+        // 元数据未就绪 / 无已下区间且无快照：返回空结果（成功）。
+        return 0;
+    }
+    const int32_t n = static_cast<int32_t>(vec.size());
+    auto* arr = static_cast<dw_byte_range_t*>(
+        std::calloc(static_cast<size_t>(n), sizeof(dw_byte_range_t)));
+    if (!arr) {
+        return -1;
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        arr[i] = vec[static_cast<size_t>(i)];
+    }
+    *out_ranges = arr;
+    *out_count  = n;
+    return 0;
+}
+
+DW_API void dw_byte_range_free(dw_byte_range_t* ranges, int32_t count) {
+    (void)count; // 无嵌套指针，直接释放主数组
+    if (ranges) {
+        std::free(ranges);
+    }
+}
+
+DW_API int32_t dw_set_file_priorities(int64_t             id,
+                                      const int32_t*      file_indexes,
+                                      const int32_t*      priorities,
+                                      int32_t             count,
+                                      dw_submit_result_t* out_result) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager ||
+        !file_indexes || !priorities || count <= 0 || !out_result) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld count=%d",
+            d, d ? d->initialized.load() : 0, (long long)id, count);
+        if (out_result) { out_result->code = DW_REASON_ERROR; out_result->message = nullptr; }
+        return -1;
+    }
+    out_result->message = nullptr;
+    out_result->id      = id;
+
+    std::string key;
+    dw_protocol_t proto = DW_PROTOCOL_HTTP;
+    if (!d->task_manager->engine_ref_of(id, key, proto)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        out_result->code = DW_REASON_ERROR;
+        return -1;
+    }
+    if (proto != DW_PROTOCOL_TORRENT) {
+        // HTTP 单文件：no-op。
+        out_result->code = DW_REASON_NONE;
+        return 0;
+    }
+    const int ok = d->torrent_engine->set_file_priorities(
+        key.c_str(), file_indexes, priorities, count);
+    out_result->code = ok ? DW_REASON_NONE : DW_REASON_ERROR;
+    return ok ? 0 : -1;
+}
+
+DW_API int32_t dw_confirm_file_selection(int64_t             id,
+                                         const int32_t*      file_indexes,
+                                         int32_t             count,
+                                         dw_submit_result_t* out_result) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager || !out_result) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
+        if (out_result) { out_result->code = DW_REASON_ERROR; out_result->message = nullptr; }
+        return -1;
+    }
+    // 确认意图落库 + 重新入队均由 TaskManager 处理（file_indexes 为 NULL/空 = 全部）。
+    return d->task_manager->confirm_file_selection(id, file_indexes, count, out_result);
+}
+
+DW_API int32_t dw_set_playing_file(int64_t             id,
+                                   int32_t             file_index,
+                                   int64_t             byte_offset,
+                                   dw_submit_result_t* out_result) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager || !out_result) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
+        if (out_result) { out_result->code = DW_REASON_ERROR; out_result->message = nullptr; }
+        return -1;
+    }
+    out_result->message = nullptr;
+    out_result->id      = id;
+
+    std::string key;
+    dw_protocol_t proto = DW_PROTOCOL_HTTP;
+    if (!d->task_manager->engine_ref_of(id, key, proto)) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+        out_result->code = DW_REASON_ERROR;
+        return -1;
+    }
+    if (proto != DW_PROTOCOL_TORRENT) {
+        // HTTP：no-op（顺序下载，无 piece 提优概念）。
+        out_result->code = DW_REASON_NONE;
+        return 0;
+    }
+    const int ok = d->torrent_engine->set_playing_file(key.c_str(), file_index, byte_offset);
+    out_result->code = ok ? DW_REASON_NONE : DW_REASON_ERROR;
+    return ok ? 0 : -1;
+}
+
+DW_API int32_t dw_set_play_position(int64_t             id,
+                                    int32_t             file_index,
+                                    int64_t             position_ms,
+                                    dw_submit_result_t* out_result) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager || !out_result) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
+        if (out_result) { out_result->code = DW_REASON_ERROR; out_result->message = nullptr; }
+        return -1;
+    }
+    // 播放进度直落 task_store，与协议无关。
+    d->task_manager->set_play_position(id, file_index, position_ms);
+    out_result->code    = DW_REASON_NONE;
+    out_result->message = nullptr;
+    out_result->id      = id;
+    return 0;
+}
+
+DW_API int32_t dw_get_play_position(int64_t  id,
+                                    int32_t  file_index,
+                                    int64_t* out_position_ms) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager || !out_position_ms) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
+        if (out_position_ms) *out_position_ms = 0;
+        return -1;
+    }
+    *out_position_ms = d->task_manager->get_play_position(id, file_index);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  任务快照与队列                                              */
 /* ------------------------------------------------------------------ */
 
@@ -531,25 +724,23 @@ DW_API int32_t dw_load_task_files(int64_t id,
         *out_count = 0;
         return -1;
     }
-    // 深拷贝为堆数组（调用者 dw_file_list_free 释放）
+    // 转为堆数组：直接移交 file_vec 各节点的字符串所有权（库内已堆分配），
+    // 避免二次拷贝与释放遗漏；调用方经 dw_file_list_free 统一释放。
     const int32_t n = static_cast<int32_t>(file_vec.size());
     dw_file_info_t* arr = static_cast<dw_file_info_t*>(
         std::malloc(sizeof(dw_file_info_t) * n));
     if (!arr) {
+        // 分配失败：释放已持有的堆字符串，避免泄露。
+        for (auto& f : file_vec) {
+            std::free(f.name); std::free(f.prefix);
+            std::free(f.temp_dir); std::free(f.ext);
+        }
         *out_files = nullptr;
         *out_count = 0;
         return -1;
     }
     for (int32_t i = 0; i < n; ++i) {
-        arr[i].index = file_vec[i].index;
-        arr[i].size  = file_vec[i].size;
-        if (file_vec[i].name) {
-            const size_t len = std::strlen(file_vec[i].name);
-            arr[i].name = static_cast<char*>(std::malloc(len + 1));
-            if (arr[i].name) std::memcpy(arr[i].name, file_vec[i].name, len + 1);
-        } else {
-            arr[i].name = nullptr;
-        }
+        arr[i] = file_vec[i];   // 结构拷贝（含指针），所有权转移至 arr
     }
     *out_files = arr;
     *out_count = n;
@@ -574,11 +765,16 @@ DW_API void dw_file_list_free(dw_file_info_t* files, int32_t count) {
     if (!files || count <= 0) {
         return;
     }
+    // 释放各节点由库分配的全部字符串字段。
     for (int32_t i = 0; i < count; ++i) {
-        if (files[i].name) {
-            std::free(files[i].name);
-            files[i].name = nullptr;
-        }
+        std::free(files[i].name);
+        std::free(files[i].prefix);
+        std::free(files[i].temp_dir);
+        std::free(files[i].ext);
+        files[i].name = nullptr;
+        files[i].prefix = nullptr;
+        files[i].temp_dir = nullptr;
+        files[i].ext = nullptr;
     }
     std::free(files);
 }

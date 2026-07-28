@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace dw {
 
@@ -19,6 +20,44 @@ namespace dw {
 class HttpEngine;
 class TorrentEngine;
 class TaskManager;
+
+/**
+ * 引擎进度采集快照（拉模型）。
+ *
+ * TaskManager 周期性向引擎查询得到；自带值语义存储（std::string / std::vector），
+ * 可安全跨引擎内部锁边界按值返回。TaskManager 据此落库并构造 dw_progress_t 转发上层。
+ * 仅承载进度数值与终态判定，调度权威态（QUEUED/PAUSED/DOWNLOADING 切换）由 TaskManager 独占。
+ */
+struct EngineProgress {
+    bool             valid  = false;  // 引擎中是否存在该任务运行时上下文
+    dw_protocol_t    protocol = DW_PROTOCOL_HTTP;
+    dw_task_status_t status = DW_TASK_STATUS_QUEUED;  // 引擎视角状态；上层仅取终态（COMPLETED/ERROR）
+
+    // 进度数值
+    int64_t          total_size    = -1;
+    int64_t          total_done    = -1;
+    double           progress      = -1.0;
+    double           download_rate = 0.0;
+
+    // 展示 / 元数据
+    std::string      name;
+    std::string      output_path;   // 当前物理目录（即最终目录 save_path，开始即定名后无临时目录）
+    int32_t          support_range = 0;
+    std::string      etag;
+    std::string      last_modified;
+
+    // 终态原因
+    dw_reason_t      reason  = DW_REASON_NONE;
+    std::string      message;
+
+    // BT 扩展字段
+    double           upload_rate  = 0.0;
+    bool             metadata_ready = false; // BT 元数据是否就绪（torrent_status::has_metadata）；HTTP 不使用
+    bool             naming_ready   = false; // BT 无进行中改名（rename_file 计数为零）；query_progress 出口现算，HTTP 不使用
+
+    // HTTP 扩展字段
+    std::string      server_name;   // Content-Disposition 原始建议名（未判重）；完成拍与定名不一致时触发补偿改名，BT 不使用
+};
 
 /**
  * 下载器全局单例内部实现。
@@ -57,11 +96,6 @@ void log_message(dw_log_level_t level,
                  int32_t        line = 0);
 
 /**
- * 内部进度推送，调用 progress_cb（若已注册）。
- */
-void post_progress(const dw_progress_t* progress);
-
-/**
  * 内部断点续传数据推送，调用 resume_data_cb（若已注册）。
  *
  * data / size 仅在调用期间有效，回调内如需持有须深拷贝。
@@ -70,6 +104,28 @@ void post_resume_data(const char*    engine_key,
                       dw_protocol_t  protocol,
                       const uint8_t* data,
                       size_t         size);
+
+/**
+ * 内部任务节点树推送：引擎元数据就绪时构树后经此落库。
+ *
+ * files 为包含文件夹 + 文件的扁平节点数组（仅在调用期间有效，数据由库内深拷）。
+ */
+void post_task_files(const char*           engine_key,
+                     dw_protocol_t         protocol,
+                     const dw_file_info_t* files,
+                     int32_t               count);
+
+/**
+ * 内部唯一名上调：引擎在元数据就绪 / 探测出名时请求定名。
+ *
+ * 内部转 TaskManager::resolve_and_record_name：持锁取占用名集合 → 解唯一名 →
+ * 回写任务 name/filename 并立即落库（持久预留）。返回定名后的 basename；
+ * 任务未知时仅按磁盘存在性解唯一名返回（不落库）。
+ */
+std::string request_unique_name(const char*   engine_key,
+                                dw_protocol_t protocol,
+                                const char*   dir,
+                                const char*   name);
 
 /**
  * 格式化日志输出（内部）。

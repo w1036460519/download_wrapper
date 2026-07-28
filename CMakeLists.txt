@@ -43,6 +43,7 @@ set(DW_SOURCES
     src/torrent/torrent_engine.cpp
     src/utils/string_util.cpp
     src/utils/time_util.cpp
+    src/utils/unique_name.cpp
 )
 
 # 库类型开关：桌面端 / Android 构建动态库（.dylib/.so/.dll）；

@@ -189,7 +189,7 @@ struct dl_part_ctx {
 /* ===================== 任务运行时上下文 ===================== */
 struct dl_task_ctx {
     std::string url;
-    std::string output_path;
+    std::string output_path;   // 落盘目录（= 上层传入的 save_path，开始即定名，无临时目录）
     std::string filename;
     std::string full_file_path;
     int64_t total_size = -1;
@@ -211,9 +211,13 @@ struct dl_task_ctx {
     int fd = -1;
     std::atomic<int> pause_req{0};
     std::atomic<int> cancel_req{0};
-    std::atomic<int> thread_done{0};   // 任务线程是否已结束（含终态推送完成）；sweep 据此安全回收
+    std::atomic<int> thread_done{0};   // 任务线程是否已结束；sweep 据此安全回收
+    std::atomic<int> terminal_reported{0}; // 终态已被 query_progress 采集至少一次；sweep 仅在置位后回收，避免抢在采集前回收导致任务卡在下载中
     int probing = 1;
     int cleanup_done = 0;
+    int name_resolved = 0;   // 唯一名已定：add 时带入已定名置 1；否则 probing 出名后经 request_unique_name 定名时置位
+    std::string server_filename;   // Content-Disposition 原始建议名（未判重）；供完成拍与定名不一致时改名比对，无则为空
+    int64_t last_emit_done = -1;   // 上次 emit resume_data 时的总已下载字节（预留的续传去重基准）。
     std::mutex speed_mtx;
     std::thread task_thread;
 
@@ -228,10 +232,8 @@ namespace dw { namespace http_engine {
 extern dw_config_t g_cfg;
 extern std::mutex g_map_mtx;
 extern std::unordered_map<std::string, std::unique_ptr<dl_task_ctx>> g_tasks;
-extern std::thread g_monitor_thread;
 extern std::atomic<bool> g_exit_flag;
 extern std::atomic<bool> g_running;
-extern dw_progress_cb g_progress_cb;
 
 }} /* namespace dw::http_engine */
 
@@ -240,9 +242,6 @@ namespace dw { namespace http_engine { namespace internal {
 
 /** 将任务上下文填充到 dw_progress_t（不持锁，调用方需按需加锁）。 */
 void fill_progress(dl_task_ctx *tCtx, dw_progress_t *task_progress);
-
-/** 构造 dw_progress_t 并推送到用户回调（线程安全）。 */
-void push_progress(dl_task_ctx *tCtx);
 
 /** libcurl header 回调 */
 size_t header_cb(const char *buffer, size_t size, size_t n_items, void *userdata);
@@ -263,11 +262,8 @@ dw_reason_t classify_failure(CURLcode rc, long http_code, int *retryable);
 /** 聚合所有分片状态，确定任务终态 */
 void aggregate_status(dl_task_ctx *tCtx);
 
-/** 从 URL 路径末段提取文件名 */
+/** 从 URL 提取文件名：query 参数 filename > query 参数 name > 路径末段（均 percent-decode） */
 std::string extract_filename_from_url(std::string_view url);
-
-/** 在 dir 下拼接 filename，若已存在则追加 (n) 后缀去重 */
-std::string resolve_unique_path(const std::string &dir, const std::string &filename);
 
 /** 递归创建目录 */
 bool mkdir_recursive(const std::string &path);
@@ -287,6 +283,26 @@ std::string parse_content_disposition_filename(std::string_view value);
 /** 探测完成后冻结元数据字段 */
 void finalize_probing(dl_task_ctx *tCtx, const dl_part_ctx *pCtx);
 
+/** HTTP 续传数据（引擎自持序列化，落 resume_data 表；反序列化回灌 dl_task_ctx）。 */
+struct HttpResumeData {
+    bool ok = false;
+    int64_t total_size = -1;
+    int32_t support_range = 0;
+    std::string etag;
+    std::string last_modified;
+    std::string full_file_path;   // 落盘物理完整路径（即最终路径），续传据此复用同一文件
+    std::vector<dw_part_state_t> parts;
+};
+
+/** 将任务续传态序列化为自描述文本 BLOB（total_size/support_range/etag/last_modified + parts）。 */
+std::string serialize_resume(dl_task_ctx *tCtx);
+
+/** 反序列化续传 BLOB；格式不符时 ok=false。 */
+HttpResumeData deserialize_resume(const uint8_t *data, size_t size);
+
+/** 序列化当前续传态并经全局下载器回灌 resume_data 表（以 url 为 key）。 */
+void emit_resume(dl_task_ctx *tCtx);
+
 /** 单个分片一次请求完成后的结果判定，返回 true 表示需重试 */
 bool handle_part_result(dl_task_ctx *tCtx, dl_part_ctx *pCtx, CURLcode rc, long http_code);
 
@@ -295,9 +311,6 @@ void run_parts_multi(dl_task_ctx *tCtx);
 
 /** 任务工作线程 */
 void task_thread_func(dl_task_ctx *tCtx);
-
-/** 全局 monitor 线程 */
-void monitor_thread_func();
 
 /** 启动任务 */
 void start_task(dl_task_ctx *tCtx);

@@ -22,10 +22,8 @@ namespace dw { namespace http_engine {
 dw_config_t g_cfg{};
 std::mutex g_map_mtx;
 std::unordered_map<std::string, std::unique_ptr<dl_task_ctx>> g_tasks;
-std::thread g_monitor_thread;
 std::atomic<bool> g_exit_flag{false};
 std::atomic<bool> g_running{false};
-dw_progress_cb g_progress_cb = nullptr;
 
 namespace internal {
 
@@ -79,38 +77,74 @@ namespace internal {
         return {};
     }
 
+    std::string percent_decode(std::string_view in) {
+        auto hex = [](const char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::string out;
+        out.reserve(in.size());
+        for (size_t i = 0; i < in.size(); ++i) {
+            if (in[i] == '%' && i + 2 < in.size()) {
+                const int hi = hex(in[i + 1]), lo = hex(in[i + 2]);
+                if (hi >= 0 && lo >= 0) {
+                    out.push_back(static_cast<char>((hi << 4) | lo));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push_back(in[i] == '+' ? ' ' : in[i]);
+        }
+        return out;
+    }
+
+    /// 剥离路径分隔符，仅保留 basename（防 query 参数携路径逃逸落盘目录）。
+    std::string sanitize_basename(std::string s) {
+        if (const auto pos = s.find_last_of("/\\"); pos != std::string::npos) {
+            s = s.substr(pos + 1);
+        }
+        return s;
+    }
+
     std::string extract_filename_from_url(std::string_view url) {
         if (const auto hash = url.find('#'); hash != std::string_view::npos) {
             url = url.substr(0, hash);
         }
-        if (const auto query = url.find('?'); query != std::string_view::npos) {
-            url = url.substr(0, query);
+        std::string_view query;
+        if (const auto q = url.find('?'); q != std::string_view::npos) {
+            query = url.substr(q + 1);
+            url = url.substr(0, q);
         }
+        // 优先级：query 参数 filename > query 参数 name > 路径末段（键大小写不敏感，均 percent-decode）。
+        std::string by_filename, by_name;
+        size_t pos = 0;
+        while (pos < query.size()) {
+            const size_t amp = query.find('&', pos);
+            const std::string_view kv = (amp == std::string_view::npos)
+                                            ? query.substr(pos)
+                                            : query.substr(pos, amp - pos);
+            pos = (amp == std::string_view::npos) ? query.size() : amp + 1;
+            const auto eq = kv.find('=');
+            if (eq == std::string_view::npos) continue;
+            const auto key = kv.substr(0, eq);
+            const auto val = kv.substr(eq + 1);
+            if (val.empty()) continue;
+            if (by_filename.empty() && equal_ignore_case(key, "filename")) {
+                by_filename = sanitize_basename(percent_decode(val));
+            } else if (by_name.empty() && equal_ignore_case(key, "name")) {
+                by_name = sanitize_basename(percent_decode(val));
+            }
+        }
+        if (!by_filename.empty()) return by_filename;
+        if (!by_name.empty()) return by_name;
         if (const auto slash = url.find_last_of('/'); slash != std::string_view::npos) {
             if (const auto filename = url.substr(slash + 1); !filename.empty()) {
-                return std::string(filename);
+                return sanitize_basename(percent_decode(filename));
             }
         }
         return {};
-    }
-
-    std::string resolve_unique_path(const std::string &dir, const std::string &filename) {
-        if (filename.empty()) return {};
-        if (std::string full_path = (std::filesystem::path(dir) / filename).string(); !
-            std::filesystem::exists(full_path)) {
-            return full_path;
-        }
-        const std::filesystem::path p(filename);
-        const std::string base = p.stem().string();
-        const std::string ext = p.extension().string();
-        for (int n = 1; n <= 9999; ++n) {
-            const std::string candidate = (std::filesystem::path(dir) / (base + " (" + std::to_string(n) + ")" + ext)).
-                    string();
-            if (!std::filesystem::exists(candidate)) {
-                return candidate;
-            }
-        }
-        return base + "_" + std::to_string(now_unix_ms()) + ext;
     }
 
     bool mkdir_recursive(const std::string &path) {
@@ -155,42 +189,14 @@ namespace internal {
                                      ? static_cast<double>(total_downloaded) / static_cast<double>(tCtx->total_size)
                                      : -1.0;
         task_progress->download_rate = total_speed;
-        task_progress->eta = (total_speed > 0.0 && tCtx->total_size > 0 && task_progress->remaining >= 0)
-                                 ? static_cast<double>(task_progress->remaining) / total_speed
-                                 : -1.0;
+        // remaining / eta 由 wrapper 层现算（EngineProgress 不承载 eta），此处不再计算 eta。
         task_progress->task_status = tCtx->status;
         task_progress->support_range = tCtx->support_range;
         task_progress->etag = tCtx->etag.c_str();
         task_progress->last_modified = tCtx->last_modified.c_str();
-        task_progress->probing = tCtx->probing;
         task_progress->saved_at_unix_ms = now_unix_ms();
         task_progress->reason = tCtx->reason;
         task_progress->message = tCtx->message.c_str();
-        task_progress->part_states = tCtx->parts.empty()
-                                         ? nullptr
-                                         : const_cast<dw_part_state_t *>(tCtx->parts.data());
-        task_progress->part_count = static_cast<int32_t>(tCtx->parts.size());
-    }
-
-    void push_progress(dl_task_ctx *tCtx) {
-        if (!tCtx) return;
-        dw_progress_t snap;
-        bool should_push = false;
-        try {
-            std::lock_guard<std::mutex> lk(g_map_mtx);
-            if (const auto it = g_tasks.find(tCtx->url); it != g_tasks.end() && it->second.get() == tCtx) {
-                fill_progress(tCtx, &snap);
-                should_push = true;
-            }
-        } catch (...) { return; }
-        if (should_push) {
-            try {
-                if (const dw_progress_cb cb = g_progress_cb) {
-                    cb(&snap);
-                }
-            } catch (...) {
-            }
-        }
     }
 
     int part_progress_cb(void *userdata, curl_off_t /*dl_total*/, const curl_off_t dl_now,
@@ -251,12 +257,21 @@ namespace internal {
                 if (const auto sp = raw.find(' '); sp != std::string_view::npos) {
                     if (long code = 0; sv_to_int(raw.substr(sp + 1), code)) {
                         pCtx->seen_http_code = code;
-                        if (tCtx->support_range
-                            && static_cast<int32_t>(tCtx->parts.size()) > 1
-                            && code == 200) {
+                        // 期望 206/partial 却收到 200：多分片任务，或续传分片（done>0）。
+                        // 后者意味着 If-Range 失配/内容已变，服务器忽略 Range 回全量，
+                        // 无法在原偏移续写。标记为需重新下载：经管理层重启时会 clear_resume+clear_segments
+                        // 并重探测、ftruncate 至新 total_size，完成全量复位。
+                        const bool resuming_part =
+                                !tCtx->probing && tCtx->parts[pCtx->index].done > 0;
+                        if (code == 200
+                            && ((tCtx->support_range
+                                 && static_cast<int32_t>(tCtx->parts.size()) > 1)
+                                || resuming_part)) {
                             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
-                                "[part %d] drift: expected 206, got http_code=%ld (multi-part task)",
-                                pCtx->index, code);
+                                "[part %d] drift: expected 206, got http_code=%ld (multi-part=%d resuming=%d)",
+                                pCtx->index, code,
+                                static_cast<int>(tCtx->parts.size()) > 1 ? 1 : 0,
+                                resuming_part ? 1 : 0);
                             return mark_drift_error();
                         }
                     }
@@ -294,9 +309,12 @@ namespace internal {
                     pCtx->seen_total_size = cl;
                 }
             } else if (equal_ignore_case(name, "Content-Disposition")) {
-                if (tCtx->filename.empty()) {
-                    auto parsed = parse_content_disposition_filename(val);
-                    if (!parsed.empty()) tCtx->filename = parsed;
+                auto parsed = parse_content_disposition_filename(val);
+                if (!parsed.empty()) {
+                    // 原始建议名无条件记录：add 时已按 URL 定名的任务，完成拍据此
+                    // 比对服务器名并补偿改名（Content-Disposition 更权威）。
+                    if (tCtx->server_filename.empty()) tCtx->server_filename = parsed;
+                    if (tCtx->filename.empty()) tCtx->filename = parsed;
                 }
             } else if (equal_ignore_case(name, "ETag")) {
                 pCtx->seen_etag.assign(val);
@@ -540,11 +558,20 @@ namespace internal {
         if (tCtx->filename.empty()) {
             tCtx->filename = extract_filename_from_url(tCtx->url);
         }
+        if (tCtx->filename.empty()) {
+            tCtx->filename = "download"; // 兜底名：URL 与 Content-Disposition 均解析不出
+        }
 
-        if (!tCtx->filename.empty() && tCtx->output_path.empty())
-            tCtx->full_file_path = resolve_unique_path(".", tCtx->filename);
-        else if (!tCtx->filename.empty() && !tCtx->output_path.empty())
-            tCtx->full_file_path = resolve_unique_path(tCtx->output_path, tCtx->filename);
+        // 定名上调：add 时未定名（URL 解析不出，靠 Content-Disposition/兜底出名）时，
+        // 经 request_unique_name 上调 TaskManager 定唯一名并落库（持久预留），再落盘。
+        if (!tCtx->name_resolved) {
+            tCtx->filename = dw::request_unique_name(
+                    tCtx->url.c_str(), DW_PROTOCOL_HTTP,
+                    tCtx->output_path.c_str(), tCtx->filename.c_str());
+            tCtx->name_resolved = 1;
+        }
+        tCtx->full_file_path =
+                (std::filesystem::path(tCtx->output_path) / tCtx->filename).string();
 
         if (tCtx->fd >= 0) {
             dw_file_close(tCtx->fd);
@@ -637,6 +664,115 @@ namespace internal {
                                              : -1.0;
             }
         }
+    }
+
+    /* =====================================================================
+     *          Part 4.5: 续传数据序列化 / 反序列化 / emit
+     * ===================================================================== */
+
+    std::string serialize_resume(dl_task_ctx *tCtx) {
+        // 自描述文本：首行 V1，随后 key=value 元数据与 P,index,start,end,done 分片行。
+        // etag / last_modified 不含换行（HTTP 头值约定），故以行为分隔安全。
+        std::string out;
+        out += "V1\n";
+        std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
+        out += "total_size=" + std::to_string(tCtx->total_size) + "\n";
+        out += "support_range=" + std::to_string(tCtx->support_range) + "\n";
+        out += "etag=" + tCtx->etag + "\n";
+        out += "last_modified=" + tCtx->last_modified + "\n";
+        // 持久化落盘物理完整路径（即最终路径），续传直接回落同一文件。
+        out += "path=" + tCtx->full_file_path + "\n";
+        for (const auto &p: tCtx->parts) {
+            out += "P," + std::to_string(p.index) + "," + std::to_string(p.start) +
+                   "," + std::to_string(p.end) + "," + std::to_string(p.done) + "\n";
+        }
+        return out;
+    }
+
+    HttpResumeData deserialize_resume(const uint8_t *data, size_t size) {
+        HttpResumeData rd;
+        if (!data || size == 0) return rd;
+        std::string_view text(reinterpret_cast<const char *>(data), size);
+        bool header_ok = false;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            const size_t nl = text.find('\n', pos);
+            std::string_view line = (nl == std::string_view::npos)
+                                        ? text.substr(pos)
+                                        : text.substr(pos, nl - pos);
+            pos = (nl == std::string_view::npos) ? text.size() : nl + 1;
+            while (!line.empty() && (line.back() == '\r')) line.remove_suffix(1);
+            if (line.empty()) continue;
+            if (line == "V1") { header_ok = true; continue; }
+            if (line.front() == 'P') {
+                // P,index,start,end,done
+                std::string_view rest = line.substr(1);
+                if (!rest.empty() && rest.front() == ',') rest.remove_prefix(1);
+                int64_t vals[4] = {0, 0, 0, 0};
+                int fi = 0;
+                size_t fp = 0;
+                bool bad = false;
+                while (fi < 4) {
+                    const size_t comma = rest.find(',', fp);
+                    std::string_view tok = (comma == std::string_view::npos)
+                                               ? rest.substr(fp)
+                                               : rest.substr(fp, comma - fp);
+                    if (!sv_to_int(tok, vals[fi])) { bad = true; break; }
+                    ++fi;
+                    if (comma == std::string_view::npos) break;
+                    fp = comma + 1;
+                }
+                if (bad || fi < 4) continue;
+                dw_part_state_t part{};
+                part.index = static_cast<int32_t>(vals[0]);
+                part.start = vals[1];
+                part.end = vals[2];
+                part.done = vals[3];
+                part.size = (part.end >= part.start) ? (part.end - part.start + 1) : 0;
+                const bool done = (part.size > 0 && part.done >= part.size);
+                part.status = done ? DW_TASK_STATUS_COMPLETED : DW_TASK_STATUS_DOWNLOADING;
+                part.reason = DW_REASON_NONE;
+                part.progress = (part.size > 0)
+                                    ? static_cast<double>(part.done) * 100.0 / static_cast<double>(part.size)
+                                    : -1.0;
+                rd.parts.push_back(part);
+                continue;
+            }
+            const size_t eq = line.find('=');
+            if (eq == std::string_view::npos) continue;
+            const std::string_view key = line.substr(0, eq);
+            const std::string_view val = line.substr(eq + 1);
+            if (key == "total_size") { int64_t v = 0; if (sv_to_int(val, v)) rd.total_size = v; }
+            else if (key == "support_range") { int64_t v = 0; if (sv_to_int(val, v)) rd.support_range = static_cast<int32_t>(v); }
+            else if (key == "etag") rd.etag.assign(val);
+            else if (key == "last_modified") rd.last_modified.assign(val);
+            else if (key == "path") rd.full_file_path.assign(val);
+        }
+        rd.ok = header_ok && !rd.parts.empty();
+        return rd;
+    }
+
+    void emit_resume(dl_task_ctx *tCtx) {
+        if (!tCtx) return;
+        const std::string blob = serialize_resume(tCtx);
+        if (blob.empty()) return;
+        dw::post_resume_data(tCtx->url.c_str(), DW_PROTOCOL_HTTP,
+                             reinterpret_cast<const uint8_t *>(blob.data()), blob.size());
+    }
+
+    // worker 线程按门槛异步上报 resume：仅支持续传、且总已下载相比上次有推进时触发。
+    // last_emit_done 由 worker 线程独占推进（去重），全程不持 TaskManager mtx_；
+    // 计算 total_done 时短持 speed_mtx，emit_resume 在锁外调用（其内部再取 speed_mtx 序列化）。
+    void maybe_emit_resume(dl_task_ctx *tCtx) {
+        if (!tCtx || !tCtx->support_range) return;
+        {
+            std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
+            int64_t total_done = 0;
+            for (const auto &part: tCtx->parts) total_done += part.done;
+            if (total_done <= tCtx->last_emit_done) return;
+            tCtx->last_emit_done = total_done;
+        }
+        emit_resume(tCtx);
     }
 
     /* =====================================================================
@@ -762,6 +898,8 @@ namespace internal {
 
             int active = 0;
             for (auto &pc: tCtx->part_ctx) {
+                // 续传回灌时已完成的分片无需重新请求（避免 200 重下/重写）。
+                if (tCtx->parts[pc.index].status == DW_TASK_STATUS_COMPLETED) continue;
                 if (add_part(&pc)) ++active;
             }
 
@@ -802,6 +940,9 @@ namespace internal {
                         --active;
                     }
                 }
+
+                // worker 线程节流上报 resume：一个 poll 周期至多一次，仅在总已下载推进时真正 emit。
+                maybe_emit_resume(tCtx);
             }
         } catch (const std::exception &e) {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "run_parts_multi exception: %s", e.what());
@@ -825,7 +966,8 @@ namespace internal {
         // 线程退出即置位（在所有终态推送之后），确保 sweep 只在推送完成后回收上下文，规避 use-after-free
         struct DoneGuard { dl_task_ctx *t; ~DoneGuard() { t->thread_done.store(1); } } done_guard{tCtx};
         try {
-        {
+        // 续传任务（probing=0）已由 add_task 回灌分片与元数据，跳过探测直接进入分片下载。
+        if (tCtx->probing) {
             dl_part_ctx probe_ctx{};
             probe_ctx.task = tCtx;
             probe_ctx.index = 0;
@@ -857,58 +999,50 @@ namespace internal {
         }
 
         if (tCtx->status == DW_TASK_STATUS_ERROR) {
-            push_progress(tCtx);
             return;
         }
 
-        if (tCtx->cancel_req.load() || tCtx->pause_req.load()) return;
+        if (tCtx->cancel_req.load()) return;
+        if (tCtx->pause_req.load()) {
+            // 暂停早退（分片下载尚未开始）：worker 线程退出前固化一次续传断点。
+            maybe_emit_resume(tCtx);
+            return;
+        }
 
         run_parts_multi(tCtx);
 
+        bool all_done = false;
         {
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             aggregate_status(tCtx);
+            all_done = (tCtx->status == DW_TASK_STATUS_COMPLETED);
         }
-        push_progress(tCtx);
+        if (all_done) {
+            // 文件已在最终位置（开始即定名，无移出环节）：关闭写句柄，异步 emit 一次
+            // resume 固化最终断点（worker 线程，不持 mtx_）。
+            if (tCtx->fd >= 0) {
+                dw_file_close(tCtx->fd);
+                tCtx->fd = -1;
+            }
+            emit_resume(tCtx);
+        }
+        // 暂停退出（分片下载中被打断）：worker 结束前固化一次续传断点，ctx 随后由 sweep 回收。
+        else if (tCtx->pause_req.load() && !tCtx->cancel_req.load()) maybe_emit_resume(tCtx);
         } catch (const std::exception &e) {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func exception: %s", e.what());
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_ERROR;
             tCtx->message = "任务线程异常终止";
-            push_progress(tCtx);
         } catch (...) {
             DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func unknown exception");
             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
             tCtx->status = DW_TASK_STATUS_ERROR;
             tCtx->reason = DW_REASON_ERROR;
             tCtx->message = "任务线程异常终止";
-            push_progress(tCtx);
         }
-    }
-
-    void monitor_thread_func() {
-        try {
-        while (!g_exit_flag.load()) {
-            std::vector<dl_task_ctx *> snap;
-            {
-                std::lock_guard<std::mutex> lk(g_map_mtx);
-                snap.reserve(g_tasks.size());
-                for (auto &val: g_tasks | std::views::values) {
-                    snap.push_back(val.get());
-                }
-            }
-            for (auto *tCtx: snap) {
-                if (g_exit_flag.load()) break;
-                push_progress(tCtx);
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        }
-        } catch (const std::exception &e) {
-            DW_LOG_SYS(DW_LOG_ERROR, "monitor_thread_func exception: %s", e.what());
-        } catch (...) {
-            DW_LOG_SYS(DW_LOG_ERROR, "monitor_thread_func unknown exception");
-        }
+        // 拉模型：终态不再主动推送状态，由 TaskManager 采集循环经 query_progress 感知；
+        // resume 已在推进 / 终态处由 worker 线程经 post_resume_data 异步上报。
     }
 
     void start_task(dl_task_ctx *tCtx) {

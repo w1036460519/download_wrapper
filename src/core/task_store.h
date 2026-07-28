@@ -50,6 +50,10 @@ public:
     bool load_by_info_hash(const std::string& info_hash, TaskRecord& out);
     /// 按自增 id 载入全字段（含分片续传态）；供低频控制操作。命中返回 true。
     bool load_by_id(int64_t id, TaskRecord& out);
+    /// 查询同 save_path 下（排除 exclude_id 自身）已占用的名称集合：
+    /// 合并 name / filename 两列非空值，供唯一名判重（库即持久预留，跨重启有效）。
+    std::vector<std::string> load_names_by_save_path(const std::string& save_path,
+                                                     int64_t exclude_id);
     /// 新增任务：纯 INSERT，回填自增主键到 r.id。仅 add 未命中去重时调用。
     void insert(TaskRecord& r);
     /// 更新既有任务：按 id 原地 UPDATE 全字段（要求 r.id 有效）。add 之外的操作统一走此路径。
@@ -60,16 +64,39 @@ public:
     void save_resume(int64_t id, const uint8_t* data, size_t size);
     /// 读取断点续传数据（key 为自增 id）；不存在返回空 vector。
     std::vector<uint8_t> load_resume(int64_t id);
+    /// 仅清除某任务的断点续传数据（key 为自增 id）；用于错误任务重下前丢弃残留存档。
+    void clear_resume(int64_t id);
 
     // ---- 任务文件信息 ----
 
-    /// 批量保存文件信息（upsert，事务包裹；key 为自增 id）。
+    /// 全量重写任务节点树（先删后插，事务包裹；key 为自增 id）。
     void save_task_files(int64_t id,
                          const std::vector<dw_file_info_t>& files);
-    /// 加载任务的文件列表（按 file_index 升序；key 为自增 id）；不存在返回空 vector。
+    /// 探测任务是否已有文件节点记录（存在即已判重定名的凭证）。
+    bool has_task_files(int64_t id);
+    /// 加载任务节点树（按 created_at 升序；key 为自增 id）；不存在返回空 vector。
     std::vector<dw_file_info_t> load_task_files(int64_t id);
-    /// 删除任务关联的全部文件记录（key 为自增 id）。
+    /// 删除任务关联的全部节点记录（key 为自增 id）。
     void delete_task_files(int64_t id);
+    /// 任务级 0→2 传播：将全部文件节点置为完成正常（不触碰已删除态）。
+    void mark_task_files_completed(int64_t id);
+
+    // ---- 边下边播缓存 ----
+
+    /// 写入 / 覆盖文件播放进度（毫秒）；upsert，key 为 (task_id, file_index)。
+    void set_play_position(int64_t id, int32_t file_index, int64_t position_ms);
+    /// 读取文件播放进度（毫秒）；无记录返回 0。
+    int64_t get_play_position(int64_t id, int32_t file_index);
+
+    // ---- 已下载区间快照 ----
+
+    /// 覆盖写入某文件的已下载连续区间快照（事务：先删该 file_index 旧区间再批量写；空即清空）。
+    void save_segments(int64_t id, int32_t file_index,
+                       const std::vector<dw_byte_range_t>& segments);
+    /// 读取某文件的已下载区间快照（按 seg_start 升序）；不存在返回空 vector。
+    std::vector<dw_byte_range_t> load_segments(int64_t id, int32_t file_index);
+    /// 清除某任务的全部区间快照（error 重下用）。
+    void clear_segments(int64_t id);
 
 private:
     sqlite3* db_ = nullptr;
