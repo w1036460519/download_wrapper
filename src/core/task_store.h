@@ -72,8 +72,6 @@ public:
     /// 全量重写任务节点树（先删后插，事务包裹；key 为自增 id）。
     void save_task_files(int64_t id,
                          const std::vector<dw_file_info_t>& files);
-    /// 探测任务是否已有文件节点记录（存在即已判重定名的凭证）。
-    bool has_task_files(int64_t id);
     /// 加载任务节点树（按 created_at 升序；key 为自增 id）；不存在返回空 vector。
     std::vector<dw_file_info_t> load_task_files(int64_t id);
     /// 删除任务关联的全部节点记录（key 为自增 id）。

@@ -40,6 +40,13 @@ namespace dw::utils {
  * @return 解析出的整型数组。
  */
     std::vector<int32_t> split_ints(const std::string &s) noexcept;
+
+    /**
+ * 提取文件名扩展名（不含点），基于 std::filesystem::path::extension()。
+ * @param name 单段文件名（非路径）。
+ * @return 扩展名（"a.tar.gz" 返回 "gz"）；无扩展名、dotfile（".hidden"）或尾点（"name."）返回空串。
+ */
+    std::string file_extension(const std::string &name);
 }
 
 #endif /* DW_UTILS_STRING_UTIL_H */

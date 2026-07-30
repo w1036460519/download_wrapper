@@ -25,7 +25,7 @@ struct TaskRecord {
     dw_protocol_t protocol = DW_PROTOCOL_HTTP;
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
-    std::string              save_path;     // 最终目录（引擎下载到临时目录，完成后移出到此）
+    std::string              save_path;     // 保存目录（开始即定名直落最终位置，无临时目录）
     std::string              filename;
     std::string              url;           // HTTP 身份 + 下载地址
     std::string              magnet_link;   // BT
@@ -56,7 +56,7 @@ struct TaskRecord {
 
     // 运行态遥测（不持久化）：A 线程每次采集写入，转发回调直接投影；
     // 任务离开活跃态转 PAUSED/QUEUED 时归零，避免合成帧残留旧值。
-    std::string output_path;                    // 引擎回报的当前物理目录（下载期=临时目录，移出后=最终目录）；空则回退 save_path
+    std::string output_path;                    // 引擎回报的当前物理目录（即最终 save_path，无临时目录）；空则回退 save_path
     double      download_rate = 0.0;            // 下载速率（B/s）
     double      upload_rate   = 0.0;            // 上传速率（B/s）；HTTP 恒为 0
     dw_reason_t reason        = DW_REASON_NONE; // 采集到的原因码；仅终态 ERROR 有意义

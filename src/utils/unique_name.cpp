@@ -32,17 +32,9 @@ std::string resolve_unique_name(const std::string& dir,
         return name;
     }
 
-    // 拆分 stem / ext：仅当 '.' 不在首位时视为扩展名（".hidden" 整体当 stem）。
-    std::string stem = name;
-    std::string ext;
-    if (const size_t dot = name.find_last_of('.');
-        dot != std::string::npos && dot > 0) {
-        stem = name.substr(0, dot);
-        ext  = name.substr(dot); // 含 '.'
-    }
-
+    // 整名尾部加序号（唯一名用作包层目录名，不拆 stem/ext，带点名也不会插错位置）。
     for (int n = 1; n <= 9999; ++n) {
-        const std::string candidate = stem + "(" + std::to_string(n) + ")" + ext;
+        const std::string candidate = name + "(" + std::to_string(n) + ")";
         if (!name_taken(base_dir, candidate, taken_names)) {
             return candidate;
         }
@@ -51,7 +43,7 @@ std::string resolve_unique_name(const std::string& dir,
     // 兜底：毫秒时间戳后缀，几乎不可能再冲突。
     const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    return stem + "_" + std::to_string(ts) + ext;
+    return name + "_" + std::to_string(ts);
 }
 
 } // namespace dw::utils

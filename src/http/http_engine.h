@@ -55,10 +55,18 @@ public:
                        dw_submit_result_t* out_result) override;
 
     /**
-     * 删除单个 HTTP 下载任务。
+     * 删除单个 HTTP 下载任务：仅置取消 + 删除标志立即返回，资源回收由 sweep
+     * 执行，不涉及落盘文件（文件删除归 TaskManager）。
+     * 返回 0=已接管释放；1=未持有该任务（无运行时资源）；-1=错误。
      */
     int32_t delete_task(const char*         id,
                         dw_submit_result_t* out_result) override;
+
+    /**
+     * 查询任务运行时资源是否已释放：ctx 已不在任务表（sweep 已析构，线程 join、
+     * 分片文件句柄全关）即视为已释放；引擎未初始化 / 未持有该任务同样视为已释放。
+     */
+    bool task_released(const char* id) override;
 
     /**
      * 查询单个 HTTP 任务的进度快照（拉模型）。
@@ -76,8 +84,9 @@ public:
                                                  int32_t     file_index) override;
 
     /**
-     * 周期性维护策略：回收已达终态（COMPLETED/ERROR）任务的上下文（join 线程 + 释放 curl/文件句柄）。
-     * 由上层调度循环定时调用；下载中任务保留，暂停态由 pause_task 即时回收。
+     * 周期性维护策略：回收线程已退出（终态 / 暂停 / 删除中）任务的上下文
+     *（join 线程 + 释放 curl/文件句柄），不涉及落盘文件。
+     * 由上层调度循环定时调用；下载中任务保留。
      */
     void sweep() override;
 

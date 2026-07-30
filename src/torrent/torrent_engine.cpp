@@ -2,17 +2,20 @@
  * @file torrent_engine.cpp
  * @brief BT/Torrent 下载引擎实现（基于 libtorrent）。
  *
- * 架构（拉模型）：
+ * 架构（快照拉模型）：
  *   - 单例 lt::session 管理所有 BT 任务；
- *   - TaskManager 调度线程周期性经 query_progress 主动拉取 handle.status() 组装进度，引擎不再推送；
- *   - alert 轮询线程仅处理生命周期事件：完成时请求保存续传、错误记录日志、
- *     save_resume_data_alert 经 dw::post_resume_data 输出续传数据（由 torrent 事件控制）；
+ *   - A 线程每拍经 post_updates 触发 post_torrent_updates + 携变更门槛的续传检查点；
+ *     alert 线程消费 state_update_alert 写入进度快照，query_progress 纯读快照；
+ *   - alert 轮询线程另处理生命周期事件：完成时请求保存续传、阻断性错误
+ *     （torrent_error / file_error）直写快照置终态、save_resume_data_alert 经
+ *     dw::post_resume_data 输出续传数据；
  *   - 只订阅 error / 完成 / 续传相关 alert，不处理 peer / piece / block 等细粒度事件。
  */
 
 #include "torrent/torrent_engine.h"
 
 #include "internal/downloader_internal.h"
+#include "utils/string_util.h"
 #include "utils/time_util.h"
 
 #include <libtorrent/session.hpp>
@@ -41,6 +44,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace lt = libtorrent;
@@ -69,18 +73,18 @@ namespace dw {
         std::mutex g_status_mtx;
         std::unordered_map<std::string, EngineProgress> g_status_snapshot;
 
-        // ===== 定名改名进行时计数 =====
-        // 改名触发权归 TaskManager 调度（RESOLVING 校验拍经 finalize_naming 被动发起），
-        // 引擎仅跟踪进行中的 rename_file 计数：
-        // g_pending_renames：key → 待完成的 rename_file 计数，file_renamed_alert
-        //   逐一递减，归零后补存 resume（renamed_files 跨重启保持）。
-        std::mutex g_rename_mtx;
-        std::unordered_map<std::string, int> g_pending_renames;
+        // ===== 定名包层迁移进行时集合 =====
+        // 判重决策归 TaskManager（调度在 RESOLVING 校验拍定名后经 move_storage 发起），
+        // 引擎仅提供 save_path 迁移能力并跟踪进行中的迁移：
+        // g_pending_moves：迁移中任务 key 集合，storage_moved_alert /
+        //   storage_moved_failed_alert 收敛时移除；naming_ready 门禁据此计算。
+        std::mutex g_move_mtx;
+        std::unordered_set<std::string> g_pending_moves;
 
-        // 遗忘某任务的改名状态（删除 / sweep 回收时调用）。
-        void rename_state_cleanup(const std::string &key) {
-            std::lock_guard<std::mutex> lk(g_rename_mtx);
-            g_pending_renames.erase(key);
+        // 遗忘某任务的迁移状态（删除 / sweep 回收时调用）。
+        void move_state_cleanup(const std::string &key) {
+            std::lock_guard<std::mutex> lk(g_move_mtx);
+            g_pending_moves.erase(key);
         }
 
         // 当前 Unix 毫秒时间戳（统一由 dw::utils::now_unix_ms 提供）
@@ -137,13 +141,16 @@ namespace dw {
             ep.message       = s.errc ? s.errc.message() : std::string{};
             ep.upload_rate   = static_cast<double>(s.upload_payload_rate);
             ep.metadata_ready = s.has_metadata;
-            // naming_ready 不在此填：改名完成不触发 state_update（快照可能陈旧），
-            // 由 query_progress 出口按 g_pending_renames 现算。
+            // naming_ready 不在此填：迁移完成不触发 state_update（快照可能陈旧），
+            // 由 query_progress 出口按 g_pending_moves 现算。
             return ep;
         }
 
         // 请求保存断点续传数据（异步，结果经 save_resume_data_alert 返回）。
-        // force=true 时忽略 only_if_modified，强制保存一次（用于完成移出后固化最终 save_path）。
+        // force=true 时无条件保存一次（用于完成移出后固化最终 save_path）；否则携
+        // 变更门槛标志：下载推进 / 配置变更（含改名）/ 暂停态变化 / 元数据变化才产生
+        // alert，去重下沉 libtorrent，支撑每拍无节流调用；刻意排除 if_counters_changed
+        //（活跃计时器每秒都在变，纳入会退化为每拍必存）。
         void request_save_resume(const lt::torrent_handle &h, bool force = false) {
             if (!h.is_valid()) return;
             // 元数据未获取完成前不保存 resume：磁力此时仅有 infohash，
@@ -155,7 +162,12 @@ namespace dw {
             }
             try {
                 lt::resume_data_flags_t flags = lt::torrent_handle::save_info_dict;
-                if (!force) flags |= lt::torrent_handle::only_if_modified;
+                if (!force) {
+                    flags |= lt::torrent_handle::if_download_progress
+                          | lt::torrent_handle::if_config_changed
+                          | lt::torrent_handle::if_state_changed
+                          | lt::torrent_handle::if_metadata_changed;
+                }
                 h.save_resume_data(flags);
             } catch (const std::exception &e) {
                 const std::string rsk = info_hash_hex(h);
@@ -163,13 +175,12 @@ namespace dw {
             }
         }
 
-        // 前向声明：节点树落库辅助定义在下方（供 finalize_naming 调用）。
-        // unique_root 非空时构树把路径首段替换为该名（刚发起 rename，file_storage 尚未反映）。
-        void post_file_tree(const lt::torrent_handle &h, const std::string &unique_root);
+        // 前向声明：节点树落库辅助定义在下方（alert 事件点调用）。
+        void post_file_tree(const lt::torrent_handle &h);
 
-        // 处理单个 alert：拉模型下仅关注生命周期与续传事件，进度由 query_progress 主动拉取。
-        // 定名 / 构树不在 alert 侧自动触发：改名与文件表落库统一由 TaskManager
-        // 调度在 RESOLVING 校验拍经 finalize_naming 被动发起。
+        // 处理单个 alert：快照模型下关注生命周期、阻断性错误与续传事件，进度由
+        // state_update 快照承载。文件树由引擎在事件点主动推送落表（添加成功 /
+        // 元数据就绪 / 改名收敛），判重定名决策仍归 TaskManager 调度。
         void handle_alert(const lt::alert *a) {
             if (!a) return;
 
@@ -179,21 +190,77 @@ namespace dw {
                 std::lock_guard<std::mutex> lk(g_status_mtx);
                 for (const lt::torrent_status &s: su->status) {
                     const std::string key = info_hash_hex(s.handle);
-                    if (!key.empty()) g_status_snapshot[key] = make_progress(s);
+                    if (key.empty()) continue;
+                    EngineProgress ep = make_progress(s);
+                    // 错误归因防降级：阻断性 alert 直写的归因（如存储错误）比
+                    // make_progress 恒 NETWORK 更准确，errc 持续期间保留首个归因。
+                    if (ep.status == DW_TASK_STATUS_ERROR) {
+                        const auto it = g_status_snapshot.find(key);
+                        if (it != g_status_snapshot.end() &&
+                            it->second.status == DW_TASK_STATUS_ERROR) {
+                            ep.reason = it->second.reason;
+                            ep.message = it->second.message;
+                        }
+                    }
+                    g_status_snapshot[key] = std::move(ep);
                 }
                 return;
             }
 
+            // 任务添加成功（.torrent / 磁力 / 续传恢复统一入口）：已有元数据则立即
+            // 推送文件树落表；磁力此刻无元数据，post_file_tree 内部自然跳过，
+            // 待 metadata_received 到达后推送。
+            if (const auto *at = lt::alert_cast<lt::add_torrent_alert>(a)) {
+                if (!at->error) post_file_tree(at->handle);
+                return;
+            }
+            // 磁力元数据就绪：推送文件树落表（先删后存，存在即覆盖）。
+            if (const auto *mr = lt::alert_cast<lt::metadata_received_alert>(a)) {
+                post_file_tree(mr->handle);
+                return;
+            }
             // 下载完成：请求保存一次续传数据（文件已在最终位置，做种原地继续，无移出环节）。
             if (const auto *tf = lt::alert_cast<lt::torrent_finished_alert>(a)) {
                 request_save_resume(tf->handle);
                 return;
             }
-            // 任务错误：仅记录日志（终态由采集循环经 query_progress 感知）。
+            // 任务错误（阻断性：转入 error state 时自动推送）：直写快照置终态，
+            // 采集拍立即感知，不必等下一轮 post_torrent_updates 快照刷新。
+            // 已是终态时不覆盖归因（file_error 可能先到，其存储归因更准确）。
             if (const auto *te = lt::alert_cast<lt::torrent_error_alert>(a)) {
                 const std::string key = info_hash_hex(te->handle);
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 任务错误 info_hash=%s msg=%s",
                             key.c_str(), te->error.message().c_str());
+                if (!key.empty()) {
+                    std::lock_guard<std::mutex> lk(g_status_mtx);
+                    auto &ep = g_status_snapshot[key];
+                    if (ep.status != DW_TASK_STATUS_ERROR) {
+                        ep.valid = true;
+                        ep.protocol = DW_PROTOCOL_TORRENT;
+                        ep.status = DW_TASK_STATUS_ERROR;
+                        ep.reason = DW_REASON_NETWORK;
+                        ep.message = te->error.message();
+                    }
+                }
+                return;
+            }
+            // 存储读写失败（阻断性：libtorrent 自动暂停任务并转入 error state）：
+            // 以存储归因直写快照，随后到达的 torrent_error / state_update 不再降级覆盖。
+            if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
+                const std::string key = info_hash_hex(fe->handle);
+                DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 存储错误 file=%s msg=%s",
+                            fe->filename(), fe->error.message().c_str());
+                if (!key.empty()) {
+                    std::lock_guard<std::mutex> lk(g_status_mtx);
+                    auto &ep = g_status_snapshot[key];
+                    ep.valid = true;
+                    ep.protocol = DW_PROTOCOL_TORRENT;
+                    ep.status = DW_TASK_STATUS_ERROR;
+                    ep.reason = DW_REASON_ERROR;
+                    ep.message = (fe->error.value() == ENOSPC)
+                                     ? "存储空间不足"
+                                     : "存储异常，无法保存文件";
+                }
                 return;
             }
             // 断点续传数据就绪：输出给上层持久化
@@ -213,40 +280,26 @@ namespace dw {
                 }
                 return;
             }
-            // 元数据就绪改名：单个文件重命名成功——计数归零后补存一次 resume
-            //（renamed_files 进 resume_data，跨重启保持唯一名）。
-            if (const auto *fr = lt::alert_cast<lt::file_renamed_alert>(a)) {
-                const std::string key = info_hash_hex(fr->handle);
+            // 定名包层迁移完成：handle 内部 save_path 已指向包层目录，补存一次
+            // resume（write_resume_data 携带新 save_path，跨重启保持）。包层不改
+            // 文件内部相对路径，文件树无需重推。
+            if (const auto *sm = lt::alert_cast<lt::storage_moved_alert>(a)) {
+                const std::string key = info_hash_hex(sm->handle);
                 if (key.empty()) return;
-                bool all_done = false;
-                {
-                    std::lock_guard<std::mutex> lk(g_rename_mtx);
-                    const auto it = g_pending_renames.find(key);
-                    if (it == g_pending_renames.end()) return;
-                    if (--it->second <= 0) {
-                        g_pending_renames.erase(it);
-                        all_done = true;
-                    }
-                }
-                if (all_done) {
-                    request_save_resume(fr->handle, true);
-                    DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[OK] 元数据就绪改名全部完成");
-                }
+                move_state_cleanup(key);
+                request_save_resume(sm->handle, true);
+                DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[OK] 包层迁移完成: -> '%s'",
+                            sm->storage_path());
                 return;
             }
-            // 改名失败：该时点文件未落盘（纯映射改名），仅限索引非法等极端情形，记录日志。
-            if (const auto *frf = lt::alert_cast<lt::file_rename_failed_alert>(a)) {
-                const std::string key = info_hash_hex(frf->handle);
+            // 迁移失败：零字节落盘时段仅创建目标目录可涉磁盘（mkdir 失败等极端
+            // 情形），记录后移除 pending 放行（naming_ready 解除，调度按现路径继续）。
+            if (const auto *smf = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
+                const std::string key = info_hash_hex(smf->handle);
                 if (key.empty()) return;
-                DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] rename_file 失败: %s",
-                            frf->error.message().c_str());
-                {
-                    std::lock_guard<std::mutex> lk(g_rename_mtx);
-                    const auto it = g_pending_renames.find(key);
-                    if (it != g_pending_renames.end() && --it->second <= 0) {
-                        g_pending_renames.erase(it);
-                    }
-                }
+                DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] move_storage 失败: %s",
+                            smf->error.message().c_str());
+                move_state_cleanup(key);
                 return;
             }
             // 其余 alert（含 save_resume_data_failed 等）忽略
@@ -320,12 +373,11 @@ namespace dw {
         // 依据 torrent_info 的文件相对路径构建显式节点树（文件夹 + 文件）。
         // 每个文件路径按 '/'、'\\' 拆分：末段为文件，前置各段为文件夹（去重复用）；
         // prefix 为父路径累积（含尾部分隔符，根层空串）；文件夹 size 聚合后代文件字节。
-        // unique_root 非空时把路径首段（根名）替换为该名（刚发起 rename_file 时
-        // file_storage 尚未反映改名；resume 任务的 renamed_files 已在 add 时应用，传空即可）。
+        // 调用时机为 alert 事件点（添加成功 / 元数据就绪 / 改名收敛），file_storage
+        // 反映当下命名；改名收敛后重推即覆盖旧名记录（落表为先删后存）。
         // 返回的各节点字符串字段由 std::malloc 分配，调用方负责释放。
         std::vector<dw_file_info_t> build_node_tree(
-                const std::shared_ptr<const lt::torrent_info> &ti,
-                const std::string &unique_root) {
+                const std::shared_ptr<const lt::torrent_info> &ti) {
             std::vector<dw_file_info_t> nodes;
             const lt::file_storage &fs = ti->files();
             const int file_count = fs.num_files();
@@ -358,8 +410,6 @@ namespace dw {
                     start = sep + 1;
                 }
                 if (comps.empty()) continue;
-                // 定名替换：首段（多文件即根目录名，单文件即文件名）换为唯一根名。
-                if (!unique_root.empty()) comps[0] = unique_root;
 
                 // 逐级创建 / 复用文件夹节点，prefix 随层级累积。
                 int64_t parent_id = -1;
@@ -379,7 +429,6 @@ namespace dw {
                         dir.created_at = now;
                         dir.name = dup(comps[d]);
                         dir.prefix = dup(prefix);
-                        dir.temp_dir = nullptr;   // 无临时目录（字段仅为 C ABI 兼容保留）
                         dir.ext = nullptr;
                         nodes.push_back(dir);
                         dir_index[cum] = nodes.size() - 1;
@@ -403,10 +452,8 @@ namespace dw {
                 file.created_at = now;
                 file.name = dup(fname);
                 file.prefix = dup(prefix);
-                file.temp_dir = nullptr;   // 无临时目录（字段仅为 C ABI 兼容保留）
-                const size_t dot = fname.find_last_of('.');
-                file.ext = (dot != std::string::npos && dot + 1 < fname.size())
-                               ? dup(fname.substr(dot + 1)) : nullptr;
+                const std::string ext = dw::utils::file_extension(fname);
+                file.ext = ext.empty() ? nullptr : dup(ext);
                 nodes.push_back(file);
 
                 // 聚合文件大小到全部祖先文件夹（沿 parent_id 上溯）。
@@ -427,23 +474,22 @@ namespace dw {
             return nodes;
         }
 
-        // 元数据就绪：构建节点树并经内部通道落库。释放构建期分配的字符串。
-        // unique_root 非空时构树把路径首段替换为该名（见 build_node_tree 说明）。
-        void post_file_tree(const lt::torrent_handle &h, const std::string &unique_root) {
+        // 事件点推送：构建节点树并经内部通道落库（无元数据时自然跳过）。
+        // 释放构建期分配的字符串。
+        void post_file_tree(const lt::torrent_handle &h) {
             if (!h.is_valid()) return;
             const std::string key = info_hash_hex(h);
             if (key.empty()) return;
             std::shared_ptr<const lt::torrent_info> ti;
             try { ti = h.torrent_file(); } catch (...) { return; }
             if (!ti) return;
-            std::vector<dw_file_info_t> nodes = build_node_tree(ti, unique_root);
+            std::vector<dw_file_info_t> nodes = build_node_tree(ti);
             if (nodes.empty()) return;
             post_task_files(key.c_str(), DW_PROTOCOL_TORRENT,
                             nodes.data(), static_cast<int32_t>(nodes.size()));
             for (auto &nd: nodes) {
                 std::free(nd.name);
                 std::free(nd.prefix);
-                std::free(nd.temp_dir);
                 std::free(nd.ext);
             }
         }
@@ -597,9 +643,9 @@ namespace dw {
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 解析 resume_data 失败: %s", e.what());
             }
         }
-        // resume_data 自带 save_path 与 renamed_files（定名改名结果），续传天然复用；
-        // 新任务直接落最终目录：根名唯一性由 TaskManager 调度在 RESOLVING 校验拍
-        // 经 finalize_naming 统一判重定名。
+        // resume_data 自带 save_path（含定名包层迁移后的目录），续传天然复用；
+        // 新任务直接落最终目录：根名判重由 TaskManager 调度在 RESOLVING 校验拍
+        // 完成（重名时引擎经 move_storage 把 save_path 迁至包层目录）。
         const bool from_resume = source_ok;
         if (!from_resume) {
             atp.save_path = params->save_path;
@@ -711,8 +757,11 @@ namespace dw {
             return -1;
         }
         const std::string key(task_id);
-        lt::torrent_handle handle = find_handle(key);
+        const lt::torrent_handle handle = find_handle(key);
         if (handle.is_valid()) {
+            // 统一删除模型（与 HTTP 对齐）：此处仅移出 session 释放运行时资源，
+            // 存储句柄由 disk-io 线程异步关闭；落盘文件删除由 TaskManager 经
+            // task_released 确认移除完成后按配置执行。
             try {
                 if (g_session) {
                     g_session->remove_torrent(handle);
@@ -721,19 +770,30 @@ namespace dw {
                 set_result(out_result, task_id, DW_REASON_ERROR, e.what());
                 return -1;
             }
-            rename_state_cleanup(key);   // 遗忘待定名 / 待改名计数状态
+            move_state_cleanup(key);   // 遗忘进行中的包层迁移状态
             { std::lock_guard<std::mutex> lk(g_status_mtx); g_status_snapshot.erase(key); }
-            DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[CLEANUP] delete_task 成功");
             set_result(out_result, task_id, DW_REASON_NONE, nullptr);
+            DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[CLEANUP] delete_task 已移出会话");
             return 0;
         }
-        DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] delete_task 任务不存在");
-        set_result(out_result, task_id, DW_REASON_ERROR, "任务不存在");
-        return -1;
+        // 任务不在会话（未准入 / 分享率回收后）：无运行时资源。
+        DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[EVENT] delete_task 任务不在会话");
+        set_result(out_result, task_id, DW_REASON_NONE, nullptr);
+        return 1;
+    }
+
+    bool TorrentEngine::task_released(const char *task_id) {
+        if (!task_id || !task_id[0]) return true;
+        // session 已销毁 / 未初始化：全部存储句柄已关闭，视为已释放。
+        if (!initialized_ || !g_session) return true;
+        // remove_torrent 后 handle 在 libtorrent 内部任务（disk-io 等）释放引用
+        // 前仍有效；find_handle 失效即代表移除收敛、文件句柄已关闭。
+        return !find_handle(std::string(task_id)).is_valid();
     }
 
     void TorrentEngine::sweep() {
         if (!initialized_ || !g_session) return;
+
         if (g_seed_ratio_limit < 0.0) return;
         const auto handles = g_session->get_torrents();
         for (const auto &handle: handles) {
@@ -747,7 +807,7 @@ namespace dw {
                 const std::string key = info_hash_hex(handle);
                 try {
                     g_session->remove_torrent(handle);
-                    rename_state_cleanup(key);   // 遗忘待定名 / 待改名计数状态
+                    move_state_cleanup(key);   // 遗忘进行中的包层迁移状态
                     { std::lock_guard<std::mutex> lk(g_status_mtx); g_status_snapshot.erase(key); }
                     DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[CLEANUP] 分享率达标释放做种上下文 key=%s", key.c_str());
                 } catch (const std::exception &e) {
@@ -758,69 +818,45 @@ namespace dw {
         }
     }
 
-    int32_t TorrentEngine::finalize_naming(const char *task_id) {
-        if (!task_id || !task_id[0]) return -1;
+    int32_t TorrentEngine::move_storage(const char *task_id, const char *new_save_path) {
+        if (!task_id || !task_id[0] || !new_save_path || !new_save_path[0]) return -1;
         const std::string key(task_id);
         {
-            // 上一轮发起的改名尚未全部完成（file_renamed_alert 计数未归零）：下拍再查。
-            std::lock_guard<std::mutex> lk(g_rename_mtx);
-            if (g_pending_renames.count(key) > 0) return 1;
+            // 上一轮迁移尚未收敛（storage_moved_alert 未回）：视作进行中，不叠加。
+            std::lock_guard<std::mutex> lk(g_move_mtx);
+            if (g_pending_moves.count(key) > 0) return 1;
         }
         const lt::torrent_handle h = find_handle(key);
         if (!h.is_valid()) return -1;
-        lt::torrent_status s;
-        try { s = h.status(); } catch (...) { return -1; }
-        if (!s.has_metadata) return -1;
-        std::shared_ptr<const lt::torrent_info> ti;
-        try { ti = h.torrent_file(); } catch (...) { return -1; }
-        if (!ti) return -1;
-        const lt::file_storage &fs = ti->files();
-        const int n = fs.num_files();
-        if (n <= 0) return -1;
 
-        // 根名 = 首个文件路径的首段（多文件即根目录名，单文件即文件名）。
-        // file_storage 已反映历史改名结果，改名完成后的下一拍以新根名判重自然收敛。
-        const std::string first = fs.file_path(lt::file_index_t{0});
-        const size_t sep0 = first.find_first_of("/\\");
-        const std::string root = (sep0 == std::string::npos) ? first : first.substr(0, sep0);
-        if (root.empty()) return -1;
+        // 已一致则空操作（去尾分隔符后比较，容忍书写差异），供调度幂等重入校验。
+        const auto trim_sep = [](std::string s) {
+            while (s.size() > 1 && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+            return s;
+        };
+        try {
+            const std::string cur =
+                    h.status(lt::torrent_handle::query_save_path).save_path;
+            if (trim_sep(cur) == trim_sep(new_save_path)) return 0;
+        } catch (...) { return -1; }
 
-        const std::string unique = request_unique_name(
-                key.c_str(), DW_PROTOCOL_TORRENT, s.save_path.c_str(), root.c_str());
-        if (!unique.empty() && unique != root) {
-            // 根名冲突：逐文件把路径首段改为唯一根名（多文件即重命名根目录，单文件即
-            // 重命名该文件）。此刻 default_dont_download 零字节落盘，rename_file 为纯
-            // 映射改名（mmap_storage 旧文件不存在时零 IO）；file_renamed_alert 计数
-            // 归零后补存 resume（renamed_files 跨重启保持），本轮返回进行中。
-            {
-                std::lock_guard<std::mutex> lk(g_rename_mtx);
-                g_pending_renames[key] = n;
-            }
-            try {
-                for (int i = 0; i < n; ++i) {
-                    const lt::file_index_t idx{i};
-                    const std::string old_path = fs.file_path(idx);
-                    const size_t sep = old_path.find_first_of("/\\");
-                    const std::string rest = (sep == std::string::npos)
-                                                 ? std::string{}
-                                                 : old_path.substr(sep);
-                    h.rename_file(idx, unique + rest);
-                }
-            } catch (const std::exception &e) {
-                DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 定名改名发起失败: %s", e.what());
-                std::lock_guard<std::mutex> lk(g_rename_mtx);
-                g_pending_renames.erase(key);
-                return -1;
-            }
-            DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[EVENT] 定名改名发起: '%s' -> '%s'",
-                        root.c_str(), unique.c_str());
-            return 1;
+        // 零字节落盘时段（default_dont_download）move_storage 仅创建目标目录并改
+        // 内部 save_path，无数据搬移；storage_moved_alert 收敛后移除 pending 并补存
+        // resume（新 save_path 跨重启保持）。
+        {
+            std::lock_guard<std::mutex> lk(g_move_mtx);
+            g_pending_moves.insert(key);
         }
-
-        // 根名无需改动：定名收敛，构建节点树落文件表（存在记录即已判重凭证，
-        // 此后校验拍据此跳过定名环节）。
-        post_file_tree(h, {});
-        return 0;
+        try {
+            h.move_storage(std::string(new_save_path));
+        } catch (const std::exception &e) {
+            DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 包层迁移发起失败: %s", e.what());
+            std::lock_guard<std::mutex> lk(g_move_mtx);
+            g_pending_moves.erase(key);
+            return -1;
+        }
+        DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[EVENT] 包层迁移发起: -> '%s'", new_save_path);
+        return 1;
     }
 
     bool TorrentEngine::query_progress(const char *task_id, EngineProgress &out) {
@@ -834,26 +870,24 @@ namespace dw {
         const auto it = g_status_snapshot.find(task_id);
         if (it == g_status_snapshot.end() || !it->second.valid) return false;
         out = it->second;
-        // naming_ready 现算：rename 完成不产生 state_update（快照该位可能陈旧），
-        // g_pending_renames 不含 key 即无进行中改名（含从未发起改名的任务）。
-        // 锁序 g_status_mtx → g_rename_mtx 单向，无反向获取路径，不构成死锁。
+        // naming_ready 现算：move_storage 收敛不产生 state_update（快照该位可能陈旧），
+        // g_pending_moves 不含 key 即无进行中迁移（含从未发起迁移的任务）。
+        // 锁序 g_status_mtx → g_move_mtx 单向，无反向获取路径，不构成死锁。
         {
-            std::lock_guard<std::mutex> rk(g_rename_mtx);
-            out.naming_ready = g_pending_renames.count(task_id) == 0;
+            std::lock_guard<std::mutex> rk(g_move_mtx);
+            out.naming_ready = g_pending_moves.count(task_id) == 0;
         }
         return true;
     }
 
     void TorrentEngine::post_updates() {
-        // 请求一次全量状态更新；结果经 state_update_alert 异步回到 alert 线程写入快照。
+        // 节拍统一推送入口：
+        //   1) post_torrent_updates：结果经 state_update_alert 异步回 alert 线程写入快照；
+        //   2) 续传检查点：对有元数据任务请求 save_resume_data（携变更门槛，无变化
+        //      不产生 alert），结果经 save_resume_data_alert → post_resume_data 输出。
+        // 去重下沉 libtorrent，上层无需再做低频节流。
         if (!g_session) return;
         try { g_session->post_torrent_updates(); } catch (...) {}
-    }
-
-    void TorrentEngine::request_resume_checkpoint() {
-        // 低频续传检查点：对会话内有元数据的任务请求 save_resume_data，
-        // 结果经 save_resume_data_alert → post_resume_data 输出（由 TaskManager 暂存内存）。
-        if (!g_session) return;
         std::vector<lt::torrent_handle> handles;
         try { handles = g_session->get_torrents(); } catch (...) { return; }
         for (const auto &h: handles) {

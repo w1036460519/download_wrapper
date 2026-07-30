@@ -125,44 +125,9 @@ typedef void (*dw_log_cb)(dw_log_level_t  level,
                           int32_t         line,
                           int64_t         timestamp_unix_ms);
 
-/**
- * 断点续传数据回调。
- *
- * 当引擎生成 / 更新任务的断点续传数据时触发（如暂停、周期保存等时机）。
- * data 指向 resume_data 字节缓冲、size 为长度，二者仅在本次回调周期内有效，
- * 调用方如需持久化必须立即深拷贝。
- * 目前仅 BT（libtorrent）任务会触发；HTTP 任务不产生 resume_data。
- */
-typedef void (*dw_resume_data_cb)(int64_t        id,
-                                  dw_protocol_t  protocol,
-                                  const uint8_t* data,
-                                  size_t         size);
-
 /* ================================================================== */
 /*                          结构体定义                                */
 /* ================================================================== */
-
-/* ------------------------------------------------------------------ */
-/*  dw_part_state_t — 分片状态（HTTP 分片下载，BT 不使用）            */
-/* ------------------------------------------------------------------ */
-
-/**
- * 单个分片状态。
- *
- * 运行状态复用 dw_task_status_t 与 dw_reason_t。
- * BT 任务无分片，dw_progress_t.part_count = 0、part_states = NULL。
- */
-typedef struct dw_part_state {
-    int32_t          index;    /**< 分片序号（0 起）。 */
-    int64_t          start;    /**< 分片在目标文件中的起始字节（含）。 */
-    int64_t          end;      /**< 分片结束字节（含）。 */
-    int64_t          size;     /**< 分片总字节 = end - start + 1。 */
-    int64_t          done;     /**< 本分片已下载字节。 */
-    double           progress; /**< 本分片进度 0.0-1.0；size=0 时为 -1。 */
-    double           download_rate; /**< 分片实时速率（B/s）。 */
-    dw_task_status_t status;   /**< 分片运行状态。 */
-    dw_reason_t      reason;   /**< 仅 status==ERROR 时有效。 */
-} dw_part_state_t;
 
 /* ------------------------------------------------------------------ */
 /*  dw_file_info_t — BT 文件信息                                     */
@@ -176,7 +141,7 @@ typedef struct dw_part_state {
  *      仅 index / name（相对路径）/ size 有效，节点字段为 0 / NULL；
  *   2) 落库后的显式节点树（dw_load_task_files）：文件夹与文件均建节点，
  *      调用方按 parent_id 组树，name 为纯节点名（非完整路径）。
- * name / prefix / temp_dir / ext 均由库分配，统一经 dw_file_list_free 释放。
+ * name / prefix / ext 均由库分配，统一经 dw_file_list_free 释放。
  * HTTP 任务不使用。
  */
 typedef struct dw_file_info {
@@ -187,7 +152,6 @@ typedef struct dw_file_info {
     int64_t  parent_id;  /**< 父节点 node_id；根节点为 -1。 */
     int32_t  type;       /**< 节点类型：0=文件夹，1=文件。 */
     char*    prefix;     /**< 父路径累积（根层空串，含尾部分隔符），免递归拼路径；可为 NULL。 */
-    char*    temp_dir;   /**< @deprecated 恒为 NULL（临时目录机制已移除）；仅为 FFI 结构布局兼容保留。 */
     char*    ext;        /**< 后缀（不含点，如 mkv）；文件夹为 NULL。 */
     int32_t  status;     /**< 文件状态：0=下载中，1=磁盘已删除，2=完成正常；文件夹恒 0。 */
     int64_t  created_at; /**< 建节点时间戳（毫秒），仅用于目录内排序。 */
@@ -200,7 +164,7 @@ typedef struct dw_file_info {
 /**
  * 文件内已下载字节区间（已合并连续段）。
  *
- * end 采用"含"约定，与 dw_part_state_t 对齐（不引入第二套区间语义）。
+ * end 采用"含"约定，与 HTTP 分片区间语义一致（不引入第二套区间语义）。
  * 由 dw_get_file_ranges 分配数组，dw_byte_range_free 统一释放。
  */
 typedef struct dw_byte_range {
@@ -228,7 +192,6 @@ typedef struct dw_progress {
 
     const char*      url;              /**< 下载 URL：HTTP 任务的识别键与展示；BT 为空串。 */
     const char*      info_hash;        /**< 种子 info_hash：BT 任务的识别键与展示；HTTP 为空串。 */
-    const char*      trace_id;         /**< 日志追踪 ID；BT 可为空字符串。 */
     dw_protocol_t    protocol;         /**< 协议类型。 */
     const char*      name;             /**< 任务显示名称。 */
     const char*      output_path;      /**< 保存目录绝对路径（不含文件名）。 */
@@ -347,7 +310,6 @@ typedef struct dw_config {
     int32_t     max_retries;                 /**< 单分片最大重试次数。 */
     int32_t     default_parts;               /**< 默认分片数。 */
     int64_t     min_size_for_split;          /**< 触发分片的最小文件（字节）。 */
-    int32_t     max_concurrent_connections;  /**< 最大并发连接数。 */
 
     /* ===== BT 配置（libtorrent） ===== */
 
@@ -355,8 +317,6 @@ typedef struct dw_config {
     int32_t     max_concurrent_downloads;    /**< 全局最大并发下载数（队列限流，HTTP+BT 共用）；<=0 时库内取默认值 3。 */
     int32_t     download_rate_limit;         /**< 下载限速（B/s）；0=不限。 */
     int32_t     upload_rate_limit;           /**< 上传限速（B/s）；0=不限。 */
-    const char* session_state_path;          /**< session 状态保存目录。 */
-    const char* dht_routers;                 /**< DHT 引导节点。 */
 
     /* ===== 通用配置 ===== */
 
@@ -460,14 +420,6 @@ DW_API void dw_set_progress_callback(dw_progress_cb cb);
  */
 DW_API void dw_set_log_callback(dw_log_cb cb);
 
-/**
- * 设置断点续传数据回调。
- *
- * 引擎生成 resume_data 时通过此回调输出，供上层持久化。
- * cb 为 NULL 表示清除回调。
- */
-DW_API void dw_set_resume_data_callback(dw_resume_data_cb cb);
-
 /* ================================================================== */
 /*                            任务接口                                */
 /* ================================================================== */
@@ -511,13 +463,16 @@ DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
 /**
  * 删除单个任务。
  *
- * @param protocol    协议类型。
- * @param id          任务自增 id，库内按 id 回读定位。
- * @param out_result  同步返回结果指针，不可为 NULL。
- * @return            0=成功，-1=失败（参数非法或内部错误）。
+ * @param protocol      协议类型。
+ * @param id            任务自增 id，库内按 id 回读定位。
+ * @param delete_files  非 0=同步删除落盘文件（引擎确认资源释放后异步执行，
+ *                      仅尝试一次，成败不影响任务删除本身）；0=仅删任务记录。
+ * @param out_result    同步返回结果指针，不可为 NULL。
+ * @return              0=成功，-1=失败（参数非法或内部错误）。
  */
 DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
                               int64_t             id,
+                              int32_t             delete_files,
                               dw_submit_result_t* out_result);
 
 /* ================================================================== */
@@ -746,20 +701,6 @@ DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority);
 /* ================================================================== */
 /*                        任务文件持久化                              */
 /* ================================================================== */
-
-/**
- * 保存任务的文件信息到数据库（批量 upsert）。
- *
- * 用于元数据就绪后持久化文件列表，确保引擎句柄释放后仍可查看。
- *
- * @param id     任务自增 id；task_files 表按 id 直接关联。
- * @param files  文件信息数组。
- * @param count  数组长度。
- * @return       0=成功，-1=失败。
- */
-DW_API int32_t dw_save_task_files(int64_t id,
-                                   const dw_file_info_t* files,
-                                   int32_t count);
 
 /**
  * 从数据库加载任务的文件信息（无需引擎运行）。

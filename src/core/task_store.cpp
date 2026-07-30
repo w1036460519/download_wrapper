@@ -495,17 +495,6 @@ namespace dw {
         sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
     }
 
-    bool TaskStore::has_task_files(int64_t id) {
-        // 仅探测存在性（判重定名凭证检查），无需 COUNT / 整树加载。
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM task_files WHERE task_id=? LIMIT 1;",
-                               -1, &st, nullptr) != SQLITE_OK) return false;
-        sqlite3_bind_int64(st, 1, id);
-        const bool exists = sqlite3_step(st) == SQLITE_ROW;
-        sqlite3_finalize(st);
-        return exists;
-    }
-
     std::vector<dw_file_info_t> TaskStore::load_task_files(int64_t id) {
         std::vector<dw_file_info_t> out;
         // 按 created_at 升序返回（同目录内按建节点次序），调用方再按 parent_id 组树。
@@ -525,7 +514,6 @@ namespace dw {
             f.index = sqlite3_column_int(st, 2);
             f.type = sqlite3_column_int(st, 3);
             f.prefix = dup_col_text(st, 4);
-            f.temp_dir = nullptr;   // deprecated：已无 .tmp 隔离，C ABI 字段保留但恒为 NULL
             f.name = dup_col_text(st, 5);
             f.ext = dup_col_text(st, 6);
             f.size = sqlite3_column_int64(st, 7);

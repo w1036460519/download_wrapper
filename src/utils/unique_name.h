@@ -18,10 +18,10 @@ namespace dw::utils {
  *   1. dir/name 在磁盘上已存在（文件或目录）；
  *   2. name 存在于 taken_names（通常来自 tasks 表同 save_path 的 name/filename 占用集）。
  *
- * 冲突时按 n=1..9999 依次尝试：
- *   - 有扩展名：stem(n).ext（如 movie(1).mkv）；
- *   - 无扩展名：name(n)（目录或无后缀文件）。
- * 全部占用时兜底返回 stem_{毫秒时间戳}[.ext]。
+ * 冲突时按 n=1..9999 依次尝试整名尾部加序号：name(n)（如 movie.mkv(1)）。
+ * 唯一名用作包层目录名（save_path/name(n)/原名…），不拆分扩展名，
+ * 因此对带点目录名（如 Ubuntu.22.04-LTS）也不会插错序号位置。
+ * 全部占用时兜底返回 name_{毫秒时间戳}。
  *
  * @param dir         目标目录（用于磁盘存在性判断）。
  * @param name        期望名称（basename，不含路径分隔符）。

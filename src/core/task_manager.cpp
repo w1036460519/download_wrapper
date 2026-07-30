@@ -13,7 +13,6 @@
 
 #include "internal/downloader_internal.h"
 #include "internal/engine_interface.h"
-#include "http/http_engine_internal.h" // extract_filename_from_url（RESOLVING 校验拍定名）
 #include "utils/time_util.h"
 #include "utils/unique_name.h"
 
@@ -73,7 +72,6 @@ namespace dw {
                                  ? cfg.status_callback_interval_ms
                                  : 1000;
         maintenance_interval_ms_ = flush_interval_ms_ * 2;
-        resume_checkpoint_interval_ms_ = flush_interval_ms_ * 5;
 
         const std::string dir = cfg.work_dir && cfg.work_dir[0] ? cfg.work_dir : ".";
         const std::string story_path = dir + "/leopard_tasks.db";
@@ -121,6 +119,9 @@ namespace dw {
             maintenance_.join();
         }
 
+        // 停机兜底：强制处理残余待删项（跳过释放确认，尽力删除一次）。
+        process_pending_deletes(true);
+
         std::lock_guard<std::mutex> lock(mtx_);
         flush_dirty_locked();
         store_.close();
@@ -153,6 +154,13 @@ namespace dw {
         {
             std::lock_guard<std::mutex> lock(mtx_);
             const std::string key = raw_key;
+
+            // 同 key 重新添加：撤销尚未执行的待删文件意图，防旧删除项在新任务
+            // 释放后误删其落盘产物。
+            if (pending_deletes_.erase(key) > 0) {
+                DW_LOGF(DW_LOG_INFO, "",
+                        "[EVENT] 重新添加撤销待删文件意图 key=%s", key.c_str());
+            }
 
             if (const int64_t id = id_of_engine_key(proto, key); id != 0) {
                 // 活跃任务：直接引用内存中的现有对象，错误态清理后重新入队
@@ -188,7 +196,10 @@ namespace dw {
                 if (proto == DW_PROTOCOL_TORRENT) task_record.info_hash = key;
                 else task_record.url = key;
                 task_record.save_path = params->save_path ? params->save_path : "";
-                task_record.filename = params->filename ? params->filename : "";
+                // filename 为定名凭证（非空即已判重定名）：HTTP 可携用户指定名参与
+                // 引擎定名链；BT 恒由 RESOLVING 判重定名产生，add 不预填防凭证污染。
+                task_record.filename = (proto == DW_PROTOCOL_HTTP && params->filename)
+                                           ? params->filename : "";
                 task_record.magnet_link = params->magnet_link ? params->magnet_link : "";
                 task_record.torrent_file = params->torrent_file ? params->torrent_file : "";
                 if (params->trackers && params->tracker_count > 0) {
@@ -311,15 +322,19 @@ namespace dw {
     }
 
     int32_t TaskManager::remove(const dw_protocol_t proto, const int64_t id,
-                                dw_submit_result_t *out) {
+                                const int32_t delete_files, dw_submit_result_t *out) {
         if (!out) return -1;
 
         std::string key;
+        std::string save_path, filename, name; // 登记待删文件项所需的落盘路径要素
         {
             std::lock_guard<std::mutex> lock(mtx_);
             if (const auto it = tasks_.find(id);
                 it != tasks_.end()) {
                 key = engine_key(it->second);
+                save_path = it->second.save_path;
+                filename = it->second.filename;
+                name = it->second.name;
                 unregister_task(id);
             } else {
                 TaskRecord task_record;
@@ -329,10 +344,24 @@ namespace dw {
                     return -1;
                 }
                 key = engine_key(task_record);
+                save_path = task_record.save_path;
+                filename = task_record.filename;
+                name = task_record.name;
             }
             store_.remove(id);
+            if (delete_files != 0 && !filename.empty()) {
+                // filename 为定名凭证：为空即从未产出落盘文件，无需删除。
+                // 包层任务（name != filename）删整个包层目录，否则删首层条目。
+                // 登记待删项，由 B 线程在引擎确认资源释放（task_released）后删除。
+                const std::string &entry =
+                        (!name.empty() && name != filename) ? name : filename;
+                pending_deletes_[key] = PendingFileDelete{
+                        proto, (std::filesystem::path(save_path) / entry).string()};
+            }
         }
 
+        // 引擎仅释放运行时资源（0=已接管释放，1=未持有即已释放）；文件删除统一由
+        // B 线程按上方登记项处理，此处无需按返回值分支。
         dw_submit_result_t r{};
         if (IDownloadEngine *eng = engine_of(proto)) eng->delete_task(key.c_str(), &r);
         dw_submit_result_release(&r);
@@ -562,15 +591,31 @@ namespace dw {
     std::string TaskManager::resolve_and_record_name_locked(TaskRecord &rec,
                                                             const std::string &dir,
                                                             const std::string &name) {
+        // 幂等重入：同一原名已定名（持久预留跨重启有效），直接沿用既有唯一名，
+        // 避免自身包层目录/半成品文件被当作冲突源导致序号漂移或二次包层。
+        if (!rec.filename.empty() && rec.filename == name && !rec.name.empty()) {
+            return rec.name;
+        }
         // 占用名集 = tasks 表同 save_path 其他任务的 name/filename（磁盘存在性由工具内部判定）。
         std::unordered_set<std::string> taken;
         for (const auto &n: store_.load_names_by_save_path(dir, rec.id)) taken.insert(n);
         const std::string unique = utils::resolve_unique_name(dir, name, taken);
+        // 包层方案：冲突时不改文件本名，落盘位置包一层唯一目录 save_path/unique/原名…。
+        // name = 唯一显示名（冲突时即包层目录名），filename = 磁盘第一层真实条目名（原名），
+        // 二者不等即包层标记；filename 非空兼作定名凭证。
         rec.name = unique;
-        rec.filename = unique;
-        store_.update(rec); // 落库即完成持久预留（跨重启有效）
+        rec.filename = name;
+        store_.update(rec); // 落库即完成持久预留（跨重启有效）。
+        // 文件表由引擎在事件点经 post_task_files 自主推送，此处不再代写。
         if (unique != name) {
-            DW_LOGF(DW_LOG_INFO, "", "[EVENT] 唯一名定名: '%s' -> '%s' (dir=%s id=%lld)",
+            // 立即创建包层目录磁盘占位（name_taken 的 exists 判定即命中），消除并发判重窗口。
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(dir) / unique, ec);
+            if (ec) {
+                DW_LOGF(DW_LOG_ERROR, "", "[ERROR] 包层目录创建失败: %s/%s (%s)",
+                        dir.c_str(), unique.c_str(), ec.message().c_str());
+            }
+            DW_LOGF(DW_LOG_INFO, "", "[EVENT] 重名包层定名: '%s' -> '%s/' (dir=%s id=%lld)",
                     name.c_str(), unique.c_str(), dir.c_str(),
                     static_cast<long long>(rec.id));
         }
@@ -639,8 +684,8 @@ namespace dw {
         while (running_.load()) {
             std::vector<TaskRecord> fwd_records;
             std::vector<ResolveAction> resolve_actions;
-            std::vector<RenameAction> rename_actions;
             dw_progress_cb cb = nullptr;
+            bool wake_schedule = false;
 
             {
                 std::unique_lock<std::mutex> lock(mtx_);
@@ -649,37 +694,56 @@ namespace dw {
                 if (!running_.load()) break;
 
                 // 采集数据
-                collect_progress_locked(fwd_records, resolve_actions, rename_actions);
+                collect_progress_locked(fwd_records, resolve_actions);
                 cb = progress_cb_;
+                // 采集拍产生终态（COMPLETED/ERROR）即置 schedule_needed_，记录到本地，
+                // 锁外与 slot_released 合并 notify 立即唤醒 B 线程调度，不等维护周期超时。
+                wake_schedule = schedule_needed_;
             } // ← 作用域退出，自动释放 mtx_
 
-            // 触发引擎推送（锁外，绝不持 mtx_）：统一轮询各引擎钩子。post_updates 让 Torrent
-            // 引擎线程刷新进度快照；request_resume_checkpoint 低频触发 BT 续传检查点。
-            // 两者产生的回调经引擎线程回来，与 A 持 mtx_ 的采集天然错开，无自死锁路径。
-            // HTTP 钩子为默认空实现（状态 / resume 由 worker 线程自推）。
-            const int64_t now_ms = now_unix_ms();
-            const bool checkpoint_due =
-                    now_ms - last_resume_checkpoint_ms_ >= resume_checkpoint_interval_ms_;
-            if (checkpoint_due) last_resume_checkpoint_ms_ = now_ms;
+            // 触发引擎推送（锁外，绝不持 mtx_）：post_updates 让 Torrent 引擎刷新进度快照
+            // 并携变更门槛请求续传检查点（无变化不产生 alert，去重下沉 libtorrent，
+            // 上层无需低频节流）。产生的回调经引擎线程回来，与 A 持 mtx_ 的采集天然
+            // 错开，无自死锁路径。HTTP 钩子为默认空实现（状态 / resume 由 worker 线程自推）。
             for (IDownloadEngine *eng: {http_, torrent_}) {
-                if (!eng) continue;
-                eng->post_updates();
-                if (checkpoint_due) eng->request_resume_checkpoint();
+                if (eng) eng->post_updates();
             }
 
             // RESOLVING 校验执行（锁外引擎调用，回锁校验后定态；期间可能已被暂停/删除，
             // 仅 RESOLVING 才迁移）：
-            //   BT：无凭证先 finalize_naming（根名判重；重名发起引擎改名返回 1，下拍再查；
-            //       rc==0 已同步构树落文件表）→ apply_file_selection 定型开下 → DOWNLOADING；
-            //   HTTP：定名已在采集拍锁内完成，此处入引擎（携续传存档）→ 成功迁 DOWNLOADING，
-            //       失败迁 ERROR 释放名额。
+            //   BT：无凭证（filename 空）时判重定名——根名取采集回填的元数据原名
+            //       → resolve_and_record_name 判重落库（回写 filename 即凭证）→ 重名则
+            //       move_storage 把引擎 save_path 调整到包层目录（naming_ready 门禁保证
+            //       收敛前不再收集）；一致则 apply_file_selection 定型开下 → DOWNLOADING；
+            //       文件表由引擎在事件点自主推送，调度不参与；
+            //   HTTP：定名已在引擎 finalize_probing 完成，此处入引擎（携续传存档）→
+            //       成功迁 DOWNLOADING，失败迁 ERROR 释放名额。
             bool slot_released = false;
             for (const auto &act: resolve_actions) {
                 if (act.rec.protocol == DW_PROTOCOL_TORRENT) {
                     if (!torrent_) continue;
                     const std::string &key = act.rec.info_hash;
-                    if (!act.naming_done && torrent_->finalize_naming(key.c_str()) != 0) {
-                        continue; // 改名进行中 / 元数据未就绪，保持 RESOLVING 下拍再查
+                    if (!act.naming_done) {
+                        // 根名取采集回填的元数据原名（重入幂等）；未携回时下拍再查。
+                        const std::string &root = act.rec.name;
+                        if (root.empty()) continue;
+                        // resolve_and_record_name 自带锁，锁外调用安全（与引擎上调同模式）。
+                        const std::string unique = resolve_and_record_name(
+                                key.c_str(), DW_PROTOCOL_TORRENT, act.rec.save_path, root);
+                        if (unique != root) {
+                            // 重名包层：文件本名不动，引擎 save_path 迁至包层目录
+                            //（零字节落盘时段仅建目录改路径，异步收敛后 naming_ready 放行）。
+                            const std::string effective =
+                                    (std::filesystem::path(act.rec.save_path) / unique).string();
+                            torrent_->move_storage(key.c_str(), effective.c_str());
+                            continue;
+                        }
+                    } else if (!act.rec.name.empty() && act.rec.name != act.rec.filename) {
+                        // 崩溃窗口防御：包层任务重入时校验引擎 save_path 已指向包层目录，
+                        // 不符则补发迁移（引擎内已一致返回 0 空操作）。
+                        const std::string effective =
+                                (std::filesystem::path(act.rec.save_path) / act.rec.name).string();
+                        if (torrent_->move_storage(key.c_str(), effective.c_str()) != 0) continue;
                     }
                     if (torrent_->apply_file_selection(
                             key.c_str(),
@@ -717,36 +781,7 @@ namespace dw {
                 }
             }
 
-            // HTTP 完成拍改名执行（锁外 fs::rename，失败保持原名不影响完成态；
-            // 成功回锁落新名并重写文件表凭证——任务可能已被 B 线程终态逐出，回落库直改）。
-            for (const auto &act: rename_actions) {
-                std::error_code ec;
-                std::filesystem::rename(std::filesystem::path(act.dir) / act.old_name,
-                                        std::filesystem::path(act.dir) / act.new_name, ec);
-                if (ec) {
-                    DW_LOGF(DW_LOG_ERROR, "", "[ERROR] 完成拍改名失败 id=%lld '%s'->'%s': %s",
-                            static_cast<long long>(act.id), act.old_name.c_str(),
-                            act.new_name.c_str(), ec.message().c_str());
-                    continue;
-                }
-                std::lock_guard<std::mutex> lock(mtx_);
-                if (const auto it = tasks_.find(act.id); it != tasks_.end()) {
-                    it->second.name = act.new_name;
-                    it->second.filename = act.new_name;
-                    it->second.dirty = true;
-                    save_http_file_entry_locked(act.id, act.new_name,
-                                                it->second.total_size, 2);
-                } else if (TaskRecord rec; store_.load_by_id(act.id, rec)) {
-                    rec.name = act.new_name;
-                    rec.filename = act.new_name;
-                    store_.update(rec);
-                    save_http_file_entry_locked(act.id, act.new_name, rec.total_size, 2);
-                }
-                DW_LOGF(DW_LOG_INFO, "", "[OK] 完成拍改名 id=%lld '%s'->'%s'",
-                        static_cast<long long>(act.id), act.old_name.c_str(),
-                        act.new_name.c_str());
-            }
-            if (slot_released) cv_.notify_all();
+            if (slot_released || wake_schedule) cv_.notify_all();
 
             // 锁外转发（周期节奏）：只读锁内已拷出的本地副本（已含遥测），避免与上层回调重入交叉。
             for (const auto &rec: fwd_records) {
@@ -756,8 +791,7 @@ namespace dw {
     }
 
     void TaskManager::collect_progress_locked(std::vector<TaskRecord> &fwd_records,
-                                              std::vector<ResolveAction> &resolve_actions,
-                                              std::vector<RenameAction> &rename_actions) {
+                                              std::vector<ResolveAction> &resolve_actions) {
         for (auto &task_record: tasks_ | std::views::values) {
             // 引擎无 ctx 的合成态（QUEUED/PAUSED）：直接从记录投影合成一帧，一次性去重；
             // 回调唯一出口收归 A 线程，pause()/run_schedule（B 线程）仅置态，不再直接发射。
@@ -772,24 +806,11 @@ namespace dw {
                 continue;
             const std::string key = engine_key(task_record);
 
-            // HTTP RESOLVING 校验拍：任务尚未入引擎（无 ctx 可查），定名判重锁内完成，
-            // 引擎启动由 scheduler_loop 锁外执行。文件表有记录即已判重定名（恢复/重试），
-            // 直接放行续传；URL 推断不出名则跳过定名，交引擎 probing 经
-            // request_unique_name 上调兜底，完成拍补写文件表凭证。
+            // HTTP RESOLVING 校验拍：直接收集启动动作交 scheduler_loop 锁外入引擎。
+            // 定名下放引擎 finalize_probing 单点（首个响应到达时优先级链取名，
+            // 经 request_unique_name 上调判重定名并落库+写文件表凭证）。
             if (task_record.status == DW_TASK_STATUS_RESOLVING &&
                 task_record.protocol == DW_PROTOCOL_HTTP) {
-                if (!store_.has_task_files(task_record.id)) {
-                    const std::string base = !task_record.filename.empty()
-                                                 ? task_record.filename
-                                                 : http_engine::internal::extract_filename_from_url(
-                                                     task_record.url);
-                    if (!base.empty()) {
-                        const std::string unique = resolve_and_record_name_locked(
-                            task_record, task_record.save_path, base);
-                        save_http_file_entry_locked(task_record.id, unique,
-                                                    task_record.total_size, 0);
-                    }
-                }
                 resolve_actions.push_back({task_record, true, store_.load_resume(task_record.id)});
                 continue;
             }
@@ -802,11 +823,14 @@ namespace dw {
             task_record.progress = ep.progress;
             task_record.total_size = ep.total_size;
             task_record.total_done = ep.total_done;
-            // 定名守卫：filename 非空即已经唯一名定名（校验拍定名或引擎上调定名），
-            // 不再用 ep.name 覆盖，防止引擎回报的元数据原名把唯一名冲掉。
+            // 显示名回填守卫：filename（定名凭证）非空即已判重定名，不再用 ep.name
+            // 覆盖；BT 仅回填显示名 name（元数据原名，兼作判重根名来源），凭证恒由
+            // resolve_and_record_name 写入，防引擎回报原名污染凭证。
             if (!ep.name.empty() && task_record.filename.empty()) {
                 task_record.name = ep.name;
-                task_record.filename = ep.name;
+                if (task_record.protocol == DW_PROTOCOL_HTTP) {
+                    task_record.filename = ep.name;
+                }
             }
             if (!ep.output_path.empty()) {
                 task_record.output_path = ep.output_path;
@@ -830,43 +854,20 @@ namespace dw {
             if (ep.status == DW_TASK_STATUS_COMPLETED || ep.status == DW_TASK_STATUS_ERROR) {
                 task_record.status = ep.status;
                 schedule_needed_ = true;
-                // HTTP 完成拍（DOWNLOADING→COMPLETED 收敛，仅此一拍）：
-                //   1) 无文件表凭证（无名 probing 定名路径）→ 补写单条文件节点；
-                //   2) 服务器建议名与定名不一致 → 锁内判重出唯一名，收集改名动作
-                //      （fs::rename 由 scheduler_loop 锁外执行，失败保持原名不影响完成态）。
-                if (ep.status == DW_TASK_STATUS_COMPLETED &&
-                    task_record.protocol == DW_PROTOCOL_HTTP) {
-                    if (!store_.has_task_files(task_record.id)) {
-                        save_http_file_entry_locked(task_record.id, task_record.filename,
-                                                    task_record.total_size, 2);
-                    }
-                    if (!ep.server_name.empty() && !task_record.filename.empty() &&
-                        ep.server_name != task_record.filename) {
-                        std::unordered_set<std::string> taken;
-                        for (const auto &n: store_.load_names_by_save_path(
-                                 task_record.save_path, task_record.id))
-                            taken.insert(n);
-                        const std::string unique = utils::resolve_unique_name(
-                            task_record.save_path, ep.server_name, taken);
-                        if (unique != task_record.filename) {
-                            rename_actions.push_back({
-                                task_record.id, task_record.save_path,
-                                task_record.filename, unique
-                            });
-                        }
-                    }
-                }
+                // 文件表完成态传播（0→2）统一由 B 线程 maintenance_persist_locked
+                // 在终态移出时经 mark_task_files_completed 处理，两协议同路径。
             }
 
-            // BT RESOLVING 校验拍：元数据就绪且无进行中改名后收集校验动作，
-            // finalize_naming（判重定名）/ apply_file_selection（定型开下）由
-            // scheduler_loop 锁外执行，回锁校验后迁 DOWNLOADING。
-            // 置于终态判断之后：本拍已迁终态（如引擎报错）的任务不再收集。
+            // BT RESOLVING 校验拍：元数据就绪且无进行中迁移后收集校验动作，
+            // 判重定名（根名取采集回填的元数据原名 → resolve_and_record_name →
+            // 重名则 move_storage 迁包层目录）与 apply_file_selection（定型开下）由
+            // scheduler_loop 锁外编排执行，回锁校验后迁 DOWNLOADING。凭证即 filename
+            // 非空，不再查库。置于终态判断之后：本拍已迁终态（如引擎报错）的任务不再收集。
             if (task_record.status == DW_TASK_STATUS_RESOLVING &&
                 task_record.protocol == DW_PROTOCOL_TORRENT &&
                 ep.metadata_ready && ep.naming_ready) {
                 resolve_actions.push_back({
-                    task_record, store_.has_task_files(task_record.id), {}
+                    task_record, !task_record.filename.empty(), {}
                 });
             }
 
@@ -891,6 +892,40 @@ namespace dw {
             }
             if (http_) http_->sweep();
             if (torrent_) torrent_->sweep();
+            process_pending_deletes();
+        }
+    }
+
+    void TaskManager::process_pending_deletes(const bool force) {
+        // 锁内快照待删项，释放确认与文件删除均在锁外执行（引擎调用 / 磁盘 IO 不占 mtx_）。
+        std::vector<std::pair<std::string, PendingFileDelete>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (pending_deletes_.empty()) return;
+            snapshot.assign(pending_deletes_.begin(), pending_deletes_.end());
+        }
+
+        for (auto &[key, item]: snapshot) {
+            if (!force) {
+                IDownloadEngine *eng = engine_of(item.proto);
+                if (eng && !eng->task_released(key.c_str())) continue; // 资源未释放，下拍再查
+            }
+            {
+                // 回锁出队；erase==0 说明该项已被同 key 重新添加撤销，跳过删除。
+                std::lock_guard<std::mutex> lock(mtx_);
+                if (pending_deletes_.erase(key) == 0) continue;
+            }
+            // 仅尝试一次，成败均不重试（POSIX 下占用文件 unlink 立即成功，
+            // inode 随最后一个 fd 关闭回收；目标不存在时 remove_all 幂等无错）。
+            std::error_code ec;
+            std::filesystem::remove_all(item.path, ec);
+            if (ec) {
+                DW_LOGF(DW_LOG_ERROR, "", "[ERROR] 删除落盘产物失败 path=%s err=%s",
+                        item.path.c_str(), ec.message().c_str());
+            } else {
+                DW_LOGF(DW_LOG_INFO, "", "[CLEANUP] 删除落盘产物完成 path=%s",
+                        item.path.c_str());
+            }
         }
     }
 
@@ -942,7 +977,6 @@ namespace dw {
         p.id = rec.id;
         p.url = rec.url.c_str(); // HTTP 展示 / 识别；BT 为空串
         p.info_hash = rec.info_hash.c_str(); // BT 展示 / 识别；HTTP 为空串
-        p.trace_id = "";
         p.protocol = rec.protocol;
         p.name = rec.name.c_str();
         // output_path 指向文件所在目录：引擎回报了则用之，否则回退 save_path（无 .tmp 隔离，两者一致）。
@@ -1083,49 +1117,22 @@ namespace dw {
 
     // ---- 任务文件持久化 ----
 
-    void TaskManager::save_files(const int64_t id,
-                                 const std::vector<dw_file_info_t> &files) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        store_.save_task_files(id, files);
-    }
-
-    void TaskManager::save_http_file_entry_locked(const int64_t id, const std::string &filename,
-                                                  const int64_t total_size, const int32_t status) {
-        if (filename.empty()) return;
-        // HTTP 单文件模型：单条根层文件节点（index=0）。save_task_files 全量重建 +
-        // SQLITE_TRANSIENT 拷贝绑定，此处借用调用方字符串生命周期无需堆拷。
-        dw_file_info_t f{};
-        f.index = 0;
-        f.type = 1;
-        f.node_id = 1;
-        f.parent_id = -1;
-        f.prefix = const_cast<char *>("");
-        f.temp_dir = nullptr;
-        f.name = const_cast<char *>(filename.c_str());
-        const size_t dot = filename.find_last_of('.');
-        const std::string ext = (dot != std::string::npos && dot + 1 < filename.size())
-                                    ? filename.substr(dot + 1)
-                                    : std::string();
-        f.ext = ext.empty() ? nullptr : const_cast<char *>(ext.c_str());
-        f.size = total_size > 0 ? total_size : 0;
-        f.status = status;
-        f.created_at = now_unix_ms();
-        store_.save_task_files(id, {f});
-    }
-
     std::vector<dw_file_info_t> TaskManager::load_files(const int64_t id) {
         std::lock_guard<std::mutex> lock(mtx_);
         std::vector<dw_file_info_t> files = store_.load_task_files(id);
         if (files.empty()) return files;
         // 惰性删除检测：仅对完成态(2)文件 stat 物理路径，缺失则标记为已删除(1)。
-        // 物理路径 = save_path + prefix + name（无 .tmp 隔离，下载期即最终位置）。
-        std::string save_path;
+        // 物理路径 = 有效落盘目录 + prefix + name（无 .tmp 隔离，下载期即最终位置）；
+        // 包层任务（name != filename）有效落盘目录 = save_path/name。
         TaskRecord task_record;
-        if (store_.load_by_id(id, task_record)) save_path = task_record.save_path;
-        if (save_path.empty()) return files;
+        if (!store_.load_by_id(id, task_record) || task_record.save_path.empty()) return files;
+        std::filesystem::path base(task_record.save_path);
+        if (!task_record.name.empty() && task_record.name != task_record.filename) {
+            base /= task_record.name;
+        }
         for (auto &f: files) {
             if (f.type != 1 || f.status != 2) continue;
-            std::filesystem::path p(save_path);
+            std::filesystem::path p(base);
             if (f.prefix && f.prefix[0]) p /= f.prefix;
             if (f.name) p /= f.name;
             std::error_code ec;

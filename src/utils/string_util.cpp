@@ -5,6 +5,7 @@
 #include "utils/string_util.h"
 
 #include <charconv>
+#include <filesystem>
 #include <sstream>
 
 namespace dw::utils {
@@ -56,6 +57,12 @@ namespace dw::utils {
             ++cur;
         }
         return out;
+    }
+
+    std::string file_extension(const std::string& name) {
+        // path::extension() 含首点（".gz"）；"."/".."/dotfile（".hidden"）/无点时返回空。
+        const std::string ext = std::filesystem::path(name).extension().string();
+        return ext.size() > 1 ? ext.substr(1) : std::string();
     }
 
 }

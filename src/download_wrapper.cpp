@@ -82,14 +82,9 @@ void post_resume_data(const char*    engine_key,
     if (!g_downloader || !engine_key) {
         return;
     }
-    // resume_data 由库内 SQLite 持久化；同时保留对外回调以兼容已注册的调用方。
-    int64_t id = 0;
+    // resume_data 由库内 SQLite 持久化：内部用引擎键（HTTP=url，BT=info_hash）定位。
     if (g_downloader->task_manager) {
-        // 内部用引擎键（HTTP=url，BT=info_hash）定位；返回命中记录的自增 id 供对外回调。
-        id = g_downloader->task_manager->on_resume_data(engine_key, protocol, data, size);
-    }
-    if (g_downloader->resume_data_cb && id != 0) {
-        g_downloader->resume_data_cb(id, protocol, data, size);
+        g_downloader->task_manager->on_resume_data(engine_key, protocol, data, size);
     }
 }
 
@@ -264,15 +259,6 @@ DW_API void dw_set_log_callback(dw_log_cb cb) {
     dw::g_downloader->log_cb = cb;
 }
 
-DW_API void dw_set_resume_data_callback(dw_resume_data_cb cb) {
-    if (!dw::g_downloader) {
-        DW_LOG(DW_LOG_DEBUG, "跳过: 全局单例不存在", "");
-        return;
-    }
-    std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-    dw::g_downloader->resume_data_cb = cb;
-}
-
 /* ------------------------------------------------------------------ */
 /*  任务接口                                                          */
 /* ------------------------------------------------------------------ */
@@ -353,6 +339,7 @@ DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
 
 DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
                               int64_t             id,
+                              int32_t             delete_files,
                               dw_submit_result_t* out_result) {
     auto* d = dw::global_downloader();
     if (!d || !d->initialized.load() || !out_result) {
@@ -372,7 +359,7 @@ DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未知协议 protocol=%d", protocol);
         return -1;
     }
-    return d->task_manager->remove(protocol, id, out_result);
+    return d->task_manager->remove(protocol, id, delete_files, out_result);
 }
 
 /* ------------------------------------------------------------------ */
@@ -687,23 +674,6 @@ DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority) {
 /*  任务文件持久化                                                    */
 /* ------------------------------------------------------------------ */
 
-DW_API int32_t dw_save_task_files(int64_t id,
-                                   const dw_file_info_t* files,
-                                   int32_t count) {
-    auto* d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !d->task_manager ||
-        !files || count <= 0) {
-        DW_LOGF(DW_LOG_ERROR, "",
-            "失败: 参数非法 d=%p init=%d id=%lld files=%p count=%d",
-            d, d ? d->initialized.load() : 0, (long long)id, files, count);
-        return -1;
-    }
-    // task_files 表按自增 id 直接关联，无需回读引擎键；转换为 vector 后批量写入。
-    std::vector<dw_file_info_t> file_vec(files, files + count);
-    d->task_manager->save_files(id, file_vec);
-    return 0;
-}
-
 DW_API int32_t dw_load_task_files(int64_t id,
                                    dw_file_info_t** out_files,
                                    int32_t* out_count) {
@@ -732,8 +702,7 @@ DW_API int32_t dw_load_task_files(int64_t id,
     if (!arr) {
         // 分配失败：释放已持有的堆字符串，避免泄露。
         for (auto& f : file_vec) {
-            std::free(f.name); std::free(f.prefix);
-            std::free(f.temp_dir); std::free(f.ext);
+            std::free(f.name); std::free(f.prefix); std::free(f.ext);
         }
         *out_files = nullptr;
         *out_count = 0;
@@ -769,11 +738,9 @@ DW_API void dw_file_list_free(dw_file_info_t* files, int32_t count) {
     for (int32_t i = 0; i < count; ++i) {
         std::free(files[i].name);
         std::free(files[i].prefix);
-        std::free(files[i].temp_dir);
         std::free(files[i].ext);
         files[i].name = nullptr;
         files[i].prefix = nullptr;
-        files[i].temp_dir = nullptr;
         files[i].ext = nullptr;
     }
     std::free(files);

@@ -54,9 +54,6 @@ struct EngineProgress {
     double           upload_rate  = 0.0;
     bool             metadata_ready = false; // BT 元数据是否就绪（torrent_status::has_metadata）；HTTP 不使用
     bool             naming_ready   = false; // BT 无进行中改名（rename_file 计数为零）；query_progress 出口现算，HTTP 不使用
-
-    // HTTP 扩展字段
-    std::string      server_name;   // Content-Disposition 原始建议名（未判重）；完成拍与定名不一致时触发补偿改名，BT 不使用
 };
 
 /**
@@ -74,7 +71,6 @@ struct dw_downloader {
 
     dw_progress_cb progress_cb = nullptr;
     dw_log_cb      log_cb      = nullptr;
-    dw_resume_data_cb resume_data_cb = nullptr;
 
     dw_config_t    config{};
 };
@@ -96,9 +92,9 @@ void log_message(dw_log_level_t level,
                  int32_t        line = 0);
 
 /**
- * 内部断点续传数据推送，调用 resume_data_cb（若已注册）。
+ * 内部断点续传数据推送：转交 TaskManager 深拷贝暂存，由维护线程落库。
  *
- * data / size 仅在调用期间有效，回调内如需持有须深拷贝。
+ * data / size 仅在调用期间有效。
  */
 void post_resume_data(const char*    engine_key,
                       dw_protocol_t  protocol,
@@ -119,8 +115,9 @@ void post_task_files(const char*           engine_key,
  * 内部唯一名上调：引擎在元数据就绪 / 探测出名时请求定名。
  *
  * 内部转 TaskManager::resolve_and_record_name：持锁取占用名集合 → 解唯一名 →
- * 回写任务 name/filename 并立即落库（持久预留）。返回定名后的 basename；
- * 任务未知时仅按磁盘存在性解唯一名返回（不落库）。
+ * 回写任务 name（唯一显示名）/filename（原名）并立即落库（持久预留）。
+ * 返回唯一显示名：与入参 name 不等即重名包层，引擎应将落盘目录追加一层该
+ * 返回值目录（文件本名不变）；任务未知时仅按磁盘存在性解唯一名返回（不落库）。
  */
 std::string request_unique_name(const char*   engine_key,
                                 dw_protocol_t protocol,
@@ -131,10 +128,17 @@ std::string request_unique_name(const char*   engine_key,
  * 格式化日志输出（内部）。
  *
  * func / line 由 DW_LOGF 宏自动捕获；fmt 后接可变参。
+ * DW_PRINTF_FMT 令 GCC/Clang 编译期校验格式串与实参类型匹配（MSVC 下为空）。
  */
+#if defined(__GNUC__) || defined(__clang__)
+#define DW_PRINTF_FMT(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
+#else
+#define DW_PRINTF_FMT(fmt_idx, arg_idx)
+#endif
+
 void emit_logf(dw_log_level_t level, const char* trace_id,
                const char* func, int32_t line,
-               const char* fmt, ...);
+               const char* fmt, ...) DW_PRINTF_FMT(5, 6);
 
 /// 从 task_id 计算 trace_id（hash 截取 8 位十六进制），无需跨层透传。
 inline std::string make_trace(const char* task_id) {

@@ -8,7 +8,8 @@
  *     引擎仅持有当前活跃任务的运行时句柄；
  *   - 进度拉模型：调度线程按固定周期经 query_progress 主动拉取各引擎进度，
  *     应用到记录后统一转发上层；断点续传经 on_resume_data 汇入持久化（触发权下沉引擎：
- *     HTTP 在 query_progress 被采集时自触发，BT 由 save_resume_data_alert 事件驱动）；
+ *     HTTP 由 worker 线程随进度推进自推，BT 由 save_resume_data_alert 事件驱动，
+ *     检查点随 post_updates 每拍携变更门槛请求，无变化不产生 alert）；
  *   - 并发准入：活跃任务数 < max_concurrent_downloads 才准入下载，其余置 QUEUED；
  *   - 调度纯事件驱动：状态跃迁释放许可 / 新增 / 恢复 / 调整优先级时唤醒调度线程，
  *     调度线程另按固定周期刷写脏进度到库（持久化与调度职责分离）；
@@ -67,7 +68,11 @@ namespace dw {
 
         int32_t resume(dw_protocol_t proto, int64_t id, dw_submit_result_t *out);
 
-        int32_t remove(dw_protocol_t proto, int64_t id, dw_submit_result_t *out);
+        /// 删除任务：移除记录 / 注销内存 / 引擎释放运行时资源；delete_files 非 0 时
+        /// 登记待删文件项，由 B 线程在引擎确认资源释放（task_released）后删除落盘
+        /// 产物（仅尝试一次，成败均不影响任务删除本身）。
+        int32_t remove(dw_protocol_t proto, int64_t id, int32_t delete_files,
+                       dw_submit_result_t *out);
 
         int32_t set_priority(int64_t id, int32_t priority);
 
@@ -107,9 +112,10 @@ namespace dw {
                            const dw_file_info_t *files, int32_t count);
 
         // ---- 唯一名定名（add 内部与引擎 request_unique_name 上调共用） ----
-        /// 持 mtx_ 取占用名集（磁盘 ∪ tasks 表同 save_path）→ 解唯一名 → 回写任务
-        /// name/filename 并立即落库（持久预留）。返回定名后的 basename；
-        /// 任务未知时仅解唯一名返回不落库。
+        /// 持 mtx_ 取占用名集（tasks 表同 save_path 其他任务的 name/filename）→ 解唯一名
+        /// （候选先查任务占用、未占用再查磁盘存在，冲突则整名尾部自增 (n)）→ 回写
+        /// name=唯一显示名（重名时即包层目录名并即刻建目录占位）、filename=原名
+        /// 并立即落库（持久预留）。返回唯一显示名；任务未知时仅解唯一名返回不落库。
         std::string resolve_and_record_name(const char *engine_key, dw_protocol_t proto,
                                             const std::string &dir, const std::string &name);
 
@@ -122,9 +128,6 @@ namespace dw {
 
         // ---- 任务文件持久化 ----
 
-        /// 保存任务的文件信息到数据库（key 为自增 id）。
-        void save_files(int64_t id, const std::vector<dw_file_info_t> &files);
-
         /// 从数据库加载任务的文件列表（key 为自增 id）。
         std::vector<dw_file_info_t> load_files(int64_t id);
 
@@ -133,32 +136,31 @@ namespace dw {
         // 通过后回锁迁 DOWNLOADING（未通过保持 RESOLVING 下拍再查）。
         struct ResolveAction {
             TaskRecord rec; // 锁内记录快照（HTTP 已含定名后 filename，供 start_engine_task）
-            bool naming_done; // 文件表已有记录（判重定名凭证）：BT 跳过 finalize_naming
+            bool naming_done; // 定名凭证（filename 非空即已判重定名）：BT 跳过判重定名编排
             std::vector<uint8_t> resume; // HTTP 续传存档（BT 引擎侧 add 时已装载，恒空）
         };
 
-        // HTTP 完成拍改名动作：服务器建议名与定名不一致，判重后锁外 fs::rename，
-        // 回锁按结果落库（成功用新名，失败保持原名）并补写文件表凭证。
-        struct RenameAction {
-            int64_t id;
-            std::string dir; // 文件所在目录（save_path）
-            std::string old_name; // 当前定名
-            std::string new_name; // 服务器建议名判重后的唯一名
-        };
-
+        // A 线程采集（持 mtx_，单段）：遍历下载中/解析中任务，query_progress 纯读可持锁直接调用；
+        // 回填内存进度/元数据/遥测、暂存续传至 pending_resume、置终态权威态，并收集待转发记录（已含遥测）；
+        // 另收集 RESOLVING 校验动作，由 scheduler_loop 锁外执行。
+        // 落库 / 区间快照 / 注销均延后到 B 线程。
+        void collect_progress_locked(std::vector<TaskRecord> &fwd_records,
+                                     std::vector<ResolveAction> &resolve_actions);
         // A 线程（轻量）：周期采集。仅 query（纯读）+ 改内存 + 转发回调，不落库 / 不快照 / 不移除 / 不 sweep。
         void scheduler_loop();
 
-        // A 线程采集（持 mtx_，单段）：遍历下载中/解析中任务，query_progress 纯读可持锁直接调用；
-        // 回填内存进度/元数据/遥测、暂存续传至 pending_resume、置终态权威态，并收集待转发记录（已含遥测）；
-        // 另收集 RESOLVING 校验动作与 HTTP 完成拍改名动作，由 scheduler_loop 锁外执行。
-        // 落库 / 区间快照 / 注销均延后到 B 线程。
-        void collect_progress_locked(std::vector<TaskRecord> &fwd_records,
-                                     std::vector<ResolveAction> &resolve_actions,
-                                     std::vector<RenameAction> &rename_actions);
-
         // B 线程（重载）：较长节拍或被 schedule 唤醒，持锁完成持久化 / 区间快照 / 终态注销 / 准入，随后锁外 sweep。
         void maintenance_loop();
+
+        // 待删文件项：remove(delete_files=1) 登记，B 线程在引擎确认资源释放后删除。
+        struct PendingFileDelete {
+            dw_protocol_t proto; // 释放确认走对应引擎的 task_released
+            std::string   path;  // 待删根路径（save_path/filename），单文件与目录树均适用
+        };
+
+        // B 线程锁外调用：对每个待删项确认引擎资源已释放后 remove_all（仅尝试一次，
+        // 成败均出队）；force=true 跳过释放确认（停机兜底尽力删除）。
+        void process_pending_deletes(bool force = false);
 
         // B 线程持锁持久化：为下载中 / 终态任务落区间快照（引擎 ctx 尚在），刷写脏进度与暂存续传，最后注销终态任务。
         void maintenance_persist_locked();
@@ -184,15 +186,13 @@ namespace dw {
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
         IDownloadEngine *engine_of(dw_protocol_t proto) const;
 
-        // 定名落库（假定已持 mtx_）：取占用名集 → 解唯一名 → 回写 rec.name/filename 并 update。
+        // 定名落库（假定已持 mtx_）：取占用名集 → 解唯一名 → 回写 rec.name（唯一显示名，
+        // 重名时即包层目录名）与 rec.filename（磁盘第一层真实条目名 = 原名）并 update；
+        // name != filename 即包层标记，有效落盘目录 = save_path/name。
+        // filename 非空即定名凭证；文件表由引擎在事件点经 post_task_files 自主推送。
         std::string resolve_and_record_name_locked(TaskRecord &rec,
                                                    const std::string &dir,
                                                    const std::string &name);
-
-        // HTTP 单文件任务的文件表凭证（假定已持 mtx_）：写单条文件节点（index=0，根层）。
-        // 存在记录即已判重定名，RESOLVING 校验拍据此跳过定名环节。
-        void save_http_file_entry_locked(int64_t id, const std::string &filename,
-                                         int64_t total_size, int32_t status);
 
         // 内存索引维护（tasks_ 以自增 id 为键，另维护两张自然键反查表，增删三者严格同步防悬置）
         void register_task(TaskRecord task_record); // 登记：写 tasks_ 并按协议登记 url→id / info_hash→id
@@ -213,6 +213,7 @@ namespace dw {
         std::map<int64_t, TaskRecord> tasks_; // 注册表：自增 id → 记录（仅常驻活跃/排队任务）
         std::unordered_map<std::string, int64_t> url_index_; // HTTP 自然键反查：url → id
         std::unordered_map<std::string, int64_t> info_hash_index_; // BT 自然键反查：info_hash → id
+        std::unordered_map<std::string, PendingFileDelete> pending_deletes_; // 待删文件：engine key → 项（mtx_ 保护）
 
         TaskStore store_; // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
         std::thread worker_; // A 线程：轻量采集 + 回调
@@ -223,8 +224,6 @@ namespace dw {
         int32_t max_concurrent_ = 3;
         int32_t flush_interval_ms_ = 1000; // 数据采集/回调节拍
         int32_t maintenance_interval_ms_ = 2000; // 内存数据持久化节拍
-        int64_t resume_checkpoint_interval_ms_ = 5000;  // 恢复数据采集节拍
-        int64_t last_resume_checkpoint_ms_ = 0;
 
         IDownloadEngine *http_ = nullptr;
         IDownloadEngine *torrent_ = nullptr;

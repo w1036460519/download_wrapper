@@ -56,10 +56,19 @@ public:
                        dw_submit_result_t* out_result) override;
 
     /**
-     * 删除单个 BT 下载任务。
+     * 删除单个 BT 下载任务：仅移出 session 释放运行时资源（存储句柄由 disk-io
+     * 线程异步关闭），不涉及落盘文件；文件删除由 TaskManager 在 task_released
+     * 确认后按配置执行。
+     * 返回 0=已接管释放；1=未持有该任务（无运行时资源）；-1=错误。
      */
     int32_t delete_task(const char*         task_id,
                         dw_submit_result_t* out_result) override;
+
+    /**
+     * 查询任务运行时资源是否已释放：session 完成移除（find_handle 失效）即视为
+     * 存储句柄已关闭；引擎未初始化 / 未持有该任务同样视为已释放。
+     */
+    bool task_released(const char* task_id) override;
 
     /**
      * 解析磁力链接获取 info_hash。
@@ -109,16 +118,12 @@ public:
     bool query_progress(const char* task_id, EngineProgress& out) override;
 
     /**
-     * 触发一次全量状态更新（post_torrent_updates），结果经 state_update_alert 异步写入快照。
-     * 由 A 线程（采集节拍）调用；session 线程安全，无需持 TaskManager 锁。
+     * 节拍统一推送入口（由 A 线程采集节拍调用；session 线程安全，无需持 TaskManager 锁）：
+     *   1) post_torrent_updates：结果经 state_update_alert 异步写入快照；
+     *   2) 续传检查点：对有元数据任务携变更门槛请求 save_resume_data（无变化
+     *      不产生 alert），结果经 save_resume_data_alert → post_resume_data 输出。
      */
     void post_updates() override;
-
-    /**
-     * 触发一次续传检查点：对会话内有元数据的任务请求 save_resume_data。
-     * 由 A 线程低频节流调用；结果经 save_resume_data_alert → post_resume_data 输出。
-     */
-    void request_resume_checkpoint() override;
 
     /**
      * 查询单文件已下载字节区间（边下边播）。
@@ -157,12 +162,14 @@ public:
                                  int32_t        count) override;
 
     /**
-     * 定名收敛（RESOLVING 校验拍，TaskManager 锁外调用）。
-     * 以 file_storage 当前根名经 request_unique_name 上调判重：冲突则逐文件发起
-     * rename_file 改首段并登记计数（返回进行中）；无需改名则构建节点树落文件表。
-     * @return 0=定名完成（文件表已落库），1=改名进行中（下拍再查），-1=错误/元数据未就绪。
+     * 包层迁移能力（TaskManager 重名定名决策后锁外调用）。
+     * 把 handle 的 save_path 迁至 new_save_path（零字节落盘时段仅建目录改路径，
+     * 无数据搬移）；storage_moved_alert 收敛后补存 resume（新 save_path 跨重启
+     * 保持），进行中时 naming_ready 为 false，收敛后恢复。
+     * @return 0=save_path 已一致（空操作），1=已发起异步迁移（含进行中重入），
+     *         -1=失败（任务不存在等）。
      */
-    int32_t finalize_naming(const char* task_id) override;
+    int32_t move_storage(const char* task_id, const char* new_save_path) override;
 
     /**
      * 周期性维护策略：回收已达做种分享率阈值的任务（remove_torrent 释放上下文）。
