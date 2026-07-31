@@ -8,6 +8,7 @@
 #include "internal/downloader_internal.h"
 #include "utils/time_util.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 
