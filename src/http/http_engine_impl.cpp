@@ -24,6 +24,7 @@
 #include <libtorrent/error_code.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 

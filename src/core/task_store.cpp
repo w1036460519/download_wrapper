@@ -14,6 +14,9 @@
 
 #include <sqlite3.h>
 
+#include <cstdlib>
+#include <cstring>
+
 namespace dw {
     using utils::now_unix_ms;
     using utils::join_lines;
