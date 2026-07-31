@@ -2,12 +2,13 @@
  * @file torrent_engine.cpp
  * @brief BT/Torrent 下载引擎实现（基于 libtorrent）。
  *
- * 架构（快照拉模型）：
+ * 架构（推模型）：
  *   - 单例 lt::session 管理所有 BT 任务；
  *   - A 线程每拍经 post_updates 触发 post_torrent_updates + 携变更门槛的续传检查点；
- *     alert 线程消费 state_update_alert 写入进度快照，query_progress 纯读快照；
+ *     alert 线程消费 state_update_alert 后经 post_progress 推入 TaskManager 内存，
+ *     A 线程下一拍直接从 TaskRecord 字段采集进度；
  *   - alert 轮询线程另处理生命周期事件：完成时请求保存续传、阻断性错误
- *     （torrent_error / file_error）直写快照置终态、save_resume_data_alert 经
+ *     （torrent_error / file_error）直接推入终态、save_resume_data_alert 经
  *     dw::post_resume_data 输出续传数据；
  *   - 只订阅 error / 完成 / 续传相关 alert，不处理 peer / piece / block 等细粒度事件。
  */
@@ -25,7 +26,6 @@
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/file_storage.hpp>
-#include <libtorrent/storage_defs.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -35,8 +35,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdarg>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -44,7 +42,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace lt = libtorrent;
@@ -55,7 +52,7 @@ namespace dw {
     /* ===================================================================== */
     /*                        文件内全局状态与辅助                            */
     /* ===================================================================== */
-    namespace torrent_engine {
+    namespace {
         // 单例 session
         std::unique_ptr<lt::session> g_session;
         // alert 轮询线程
@@ -66,26 +63,6 @@ namespace dw {
         // BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文。
         // 默认 3.0（下载:上传=1:3）；init 从 cfg->seed_ratio_limit 读取（0=默认，<0=永久做种）。
         double g_seed_ratio_limit = 3.0;
-
-        // ===== 引擎进度快照（推送模型） =====
-        // 由 alert 线程消费 state_update_alert 持续更新，query_progress 纯读。
-        // key=info_hash hex。仅持 g_status_mtx，绝不触碰 TaskManager mtx_、不落库。
-        std::mutex g_status_mtx;
-        std::unordered_map<std::string, EngineProgress> g_status_snapshot;
-
-        // ===== 定名包层迁移进行时集合 =====
-        // 判重决策归 TaskManager（调度在 RESOLVING 校验拍定名后经 move_storage 发起），
-        // 引擎仅提供 save_path 迁移能力并跟踪进行中的迁移：
-        // g_pending_moves：迁移中任务 key 集合，storage_moved_alert /
-        //   storage_moved_failed_alert 收敛时移除；naming_ready 门禁据此计算。
-        std::mutex g_move_mtx;
-        std::unordered_set<std::string> g_pending_moves;
-
-        // 遗忘某任务的迁移状态（删除 / sweep 回收时调用）。
-        void move_state_cleanup(const std::string &key) {
-            std::lock_guard<std::mutex> lk(g_move_mtx);
-            g_pending_moves.erase(key);
-        }
 
         // 当前 Unix 毫秒时间戳（统一由 dw::utils::now_unix_ms 提供）
 
@@ -124,9 +101,10 @@ namespace dw {
             return DW_TASK_STATUS_DOWNLOADING;
         }
 
-        // 由 torrent_status 组装 EngineProgress：供 alert 线程消费 state_update_alert 写入
-        // 引擎内进度快照；query_progress 纯读该快照，不再同步调用 handle.status()。
-        EngineProgress make_progress(const lt::torrent_status &s) {
+        // 由 torrent_status 组装 EngineProgress 并经 post_progress 推入 TaskManager 内存。
+        // alert 线程消费 state_update_alert 时批量调用；naming_ready 默认 0（不更新
+        // TaskRecord），仅 storage_moved_alert 显式设 2。
+        EngineProgress make_progress(const lt::torrent_status &s, const std::string &key) {
             EngineProgress ep;
             ep.valid         = true;
             ep.protocol      = DW_PROTOCOL_TORRENT;
@@ -136,13 +114,18 @@ namespace dw {
             ep.progress      = static_cast<double>(s.progress);
             ep.download_rate = static_cast<double>(s.download_payload_rate);
             ep.name          = s.name;
-            ep.output_path   = s.save_path;   // 物理目录（即最终 save_path，无临时目录）
             ep.reason        = s.errc ? DW_REASON_NETWORK : DW_REASON_NONE;
             ep.message       = s.errc ? s.errc.message() : std::string{};
             ep.upload_rate   = static_cast<double>(s.upload_payload_rate);
             ep.metadata_ready = s.has_metadata;
-            // naming_ready 不在此填：迁移完成不触发 state_update（快照可能陈旧），
-            // 由 query_progress 出口按 g_pending_moves 现算。
+            // 占位形态判据：多文件 torrent 的 name 是根目录名（占位须建目录），单文件
+            // name 即文件名（占位须建空文件）。post_torrent_updates 默认
+            // status_flags_t::all() 已填充 torrent_file，无需额外同步查询。
+            if (s.has_metadata) {
+                if (const auto ti = s.torrent_file.lock()) {
+                    ep.multi_file = ti->num_files() > 1;
+                }
+            }
             return ep;
         }
 
@@ -155,11 +138,16 @@ namespace dw {
             if (!h.is_valid()) return;
             // 元数据未获取完成前不保存 resume：磁力此时仅有 infohash，
             // 落库无实际续传价值，跳过以免无意义写入 / 覆盖有效续传。
+            lt::torrent_status st;
             try {
-                if (!h.status().has_metadata) return;
+                st = h.status();
+                if (!st.has_metadata) return;
             } catch (...) {
                 return;
             }
+            // 仅下载态保存 resume：resume 存在即代表已过定名阶段，
+            // 供调度侧判断恢复时是否跳过 naming 检查。
+            if (map_status(st) != DW_TASK_STATUS_DOWNLOADING) return;
             try {
                 lt::resume_data_flags_t flags = lt::torrent_handle::save_info_dict;
                 if (!force) {
@@ -178,31 +166,20 @@ namespace dw {
         // 前向声明：节点树落库辅助定义在下方（alert 事件点调用）。
         void post_file_tree(const lt::torrent_handle &h);
 
-        // 处理单个 alert：快照模型下关注生命周期、阻断性错误与续传事件，进度由
-        // state_update 快照承载。文件树由引擎在事件点主动推送落表（添加成功 /
+        // 处理单个 alert：推模型下关注生命周期、阻断性错误与续传事件，进度由
+        // state_update_alert 推入 TaskManager 内存。文件树由引擎在事件点主动推送落表（添加成功 /
         // 元数据就绪 / 改名收敛），判重定名决策仍归 TaskManager 调度。
         void handle_alert(const lt::alert *a) {
             if (!a) return;
 
-            // 进度快照更新：A 线程触发 post_torrent_updates 后，批量 torrent_status 经此写入
-            // 引擎内快照（仅持 g_status_mtx，不碰 TaskManager mtx_、不落库），query_progress 纯读。
+            // 进度推送：A 线程触发 post_torrent_updates 后，批量 torrent_status 经此推入
+            // TaskManager 内存（持 mtx_ 极短赋值），A 线程下一拍直接读 TaskRecord 字段。
             if (const auto *su = lt::alert_cast<lt::state_update_alert>(a)) {
-                std::lock_guard<std::mutex> lk(g_status_mtx);
                 for (const lt::torrent_status &s: su->status) {
                     const std::string key = info_hash_hex(s.handle);
                     if (key.empty()) continue;
-                    EngineProgress ep = make_progress(s);
-                    // 错误归因防降级：阻断性 alert 直写的归因（如存储错误）比
-                    // make_progress 恒 NETWORK 更准确，errc 持续期间保留首个归因。
-                    if (ep.status == DW_TASK_STATUS_ERROR) {
-                        const auto it = g_status_snapshot.find(key);
-                        if (it != g_status_snapshot.end() &&
-                            it->second.status == DW_TASK_STATUS_ERROR) {
-                            ep.reason = it->second.reason;
-                            ep.message = it->second.message;
-                        }
-                    }
-                    g_status_snapshot[key] = std::move(ep);
+                    EngineProgress ep = make_progress(s, key);
+                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
                 }
                 return;
             }
@@ -224,35 +201,31 @@ namespace dw {
                 request_save_resume(tf->handle);
                 return;
             }
-            // 任务错误（阻断性：转入 error state 时自动推送）：直写快照置终态，
-            // 采集拍立即感知，不必等下一轮 post_torrent_updates 快照刷新。
-            // 已是终态时不覆盖归因（file_error 可能先到，其存储归因更准确）。
+            // 任务错误（阻断性：转入 error state 时自动推送）：直接推入终态，
+            // A 线程下一拍立即感知，不必等下一轮 post_torrent_updates 刷新。
             if (const auto *te = lt::alert_cast<lt::torrent_error_alert>(a)) {
                 const std::string key = info_hash_hex(te->handle);
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 任务错误 info_hash=%s msg=%s",
                             key.c_str(), te->error.message().c_str());
                 if (!key.empty()) {
-                    std::lock_guard<std::mutex> lk(g_status_mtx);
-                    auto &ep = g_status_snapshot[key];
-                    if (ep.status != DW_TASK_STATUS_ERROR) {
-                        ep.valid = true;
-                        ep.protocol = DW_PROTOCOL_TORRENT;
-                        ep.status = DW_TASK_STATUS_ERROR;
-                        ep.reason = DW_REASON_NETWORK;
-                        ep.message = te->error.message();
-                    }
+                    EngineProgress ep;
+                    ep.valid = true;
+                    ep.protocol = DW_PROTOCOL_TORRENT;
+                    ep.status = DW_TASK_STATUS_ERROR;
+                    ep.reason = DW_REASON_NETWORK;
+                    ep.message = te->error.message();
+                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
                 }
                 return;
             }
             // 存储读写失败（阻断性：libtorrent 自动暂停任务并转入 error state）：
-            // 以存储归因直写快照，随后到达的 torrent_error / state_update 不再降级覆盖。
+            // 以存储归因直接推入终态。
             if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
                 const std::string key = info_hash_hex(fe->handle);
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 存储错误 file=%s msg=%s",
                             fe->filename(), fe->error.message().c_str());
                 if (!key.empty()) {
-                    std::lock_guard<std::mutex> lk(g_status_mtx);
-                    auto &ep = g_status_snapshot[key];
+                    EngineProgress ep;
                     ep.valid = true;
                     ep.protocol = DW_PROTOCOL_TORRENT;
                     ep.status = DW_TASK_STATUS_ERROR;
@@ -260,6 +233,7 @@ namespace dw {
                     ep.message = (fe->error.value() == ENOSPC)
                                      ? "存储空间不足"
                                      : "存储异常，无法保存文件";
+                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
                 }
                 return;
             }
@@ -280,26 +254,39 @@ namespace dw {
                 }
                 return;
             }
-            // 定名包层迁移完成：handle 内部 save_path 已指向包层目录，补存一次
-            // resume（write_resume_data 携带新 save_path，跨重启保持）。包层不改
+            // 定名包层迁移完成：handle 内部 save_path 已指向包层目录。包层不改
             // 文件内部相对路径，文件树无需重推。
+            // 补推一帧 naming_ready=2，A 线程立即观测迁移收敛、放行后续调度。
             if (const auto *sm = lt::alert_cast<lt::storage_moved_alert>(a)) {
                 const std::string key = info_hash_hex(sm->handle);
                 if (key.empty()) return;
-                move_state_cleanup(key);
-                request_save_resume(sm->handle, true);
+                try {
+                    EngineProgress ep = make_progress(sm->handle.status(), key);
+                    ep.naming_ready = 2; // 显式标记迁移完成
+                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
+                } catch (...) {}
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[OK] 包层迁移完成: -> '%s'",
                             sm->storage_path());
                 return;
             }
-            // 迁移失败：零字节落盘时段仅创建目标目录可涉磁盘（mkdir 失败等极端
-            // 情形），记录后移除 pending 放行（naming_ready 解除，调度按现路径继续）。
+            // 迁移失败：零字节落盘时段仅创建目标目录可涉磁盘（mkdir 失败等极端情形）。
+            // 不可放行继续下载——包层名已落库为凭证，而 handle 内部 save_path 仍是原路径，
+            // 放行会令记录路径与实际落盘路径分叉，且与占用该名字的任务直接相撞。
+            // 故推入 ERROR 终态，交由用户重试。
             if (const auto *smf = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
                 const std::string key = info_hash_hex(smf->handle);
                 if (key.empty()) return;
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] move_storage 失败: %s",
                             smf->error.message().c_str());
-                move_state_cleanup(key);
+                {
+                    EngineProgress ep;
+                    ep.valid = true;
+                    ep.protocol = DW_PROTOCOL_TORRENT;
+                    ep.status = DW_TASK_STATUS_ERROR;
+                    ep.reason = DW_REASON_ERROR;
+                    ep.message = "保存路径设置失败";
+                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
+                }
                 return;
             }
             // 其余 alert（含 save_resume_data_failed 等）忽略
@@ -311,7 +298,7 @@ namespace dw {
                 try {
                     if (g_session) {
                         // post_torrent_updates 由 A 线程按节拍触发；本线程仅等待并处理
-                        // 会话 alert：state_update（写进度快照）、生命周期与续传 alert。
+                        // 会话 alert：state_update（推入进度）、生命周期与续传 alert。
                         g_session->wait_for_alert(std::chrono::milliseconds(g_interval_ms));
                         std::vector<lt::alert *> alerts;
                         g_session->pop_alerts(&alerts);
@@ -337,8 +324,8 @@ namespace dw {
                 return g_session->find_torrent(h);
             }
             const auto handles = g_session->get_torrents();
-            for (const auto &h: handles) {
-                if (info_hash_hex(h) == info_hash) return h;
+            for (const auto &th: handles) {
+                if (info_hash_hex(th) == info_hash) return th;
             }
             return {};
         }
@@ -436,8 +423,9 @@ namespace dw {
                     } else {
                         parent_id = nodes[it->second].node_id;
                     }
-                    cum += "/";
-                    prefix += comps[d] + "/";
+                    cum += '/';
+                    prefix += comps[d];
+                    prefix += '/';
                 }
 
                 // 文件节点
@@ -513,9 +501,7 @@ namespace dw {
                             "[ERROR] set_result code=%d msg=%s", code, msg ? msg : "");
             }
         }
-    } // namespace torrent_engine
-
-    using namespace torrent_engine;
+    } // namespace（匿名）
 
     /* ===================================================================== */
     /*                        TorrentEngine 成员实现                          */
@@ -770,8 +756,6 @@ namespace dw {
                 set_result(out_result, task_id, DW_REASON_ERROR, e.what());
                 return -1;
             }
-            move_state_cleanup(key);   // 遗忘进行中的包层迁移状态
-            { std::lock_guard<std::mutex> lk(g_status_mtx); g_status_snapshot.erase(key); }
             set_result(out_result, task_id, DW_REASON_NONE, nullptr);
             DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[CLEANUP] delete_task 已移出会话");
             return 0;
@@ -807,8 +791,6 @@ namespace dw {
                 const std::string key = info_hash_hex(handle);
                 try {
                     g_session->remove_torrent(handle);
-                    move_state_cleanup(key);   // 遗忘进行中的包层迁移状态
-                    { std::lock_guard<std::mutex> lk(g_status_mtx); g_status_snapshot.erase(key); }
                     DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[CLEANUP] 分享率达标释放做种上下文 key=%s", key.c_str());
                 } catch (const std::exception &e) {
                     DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] sweep remove_torrent 失败 key=%s msg=%s",
@@ -821,11 +803,6 @@ namespace dw {
     int32_t TorrentEngine::move_storage(const char *task_id, const char *new_save_path) {
         if (!task_id || !task_id[0] || !new_save_path || !new_save_path[0]) return -1;
         const std::string key(task_id);
-        {
-            // 上一轮迁移尚未收敛（storage_moved_alert 未回）：视作进行中，不叠加。
-            std::lock_guard<std::mutex> lk(g_move_mtx);
-            if (g_pending_moves.count(key) > 0) return 1;
-        }
         const lt::torrent_handle h = find_handle(key);
         if (!h.is_valid()) return -1;
 
@@ -841,51 +818,24 @@ namespace dw {
         } catch (...) { return -1; }
 
         // 零字节落盘时段（default_dont_download）move_storage 仅创建目标目录并改
-        // 内部 save_path，无数据搬移；storage_moved_alert 收敛后移除 pending 并补存
-        // resume（新 save_path 跨重启保持）。
-        {
-            std::lock_guard<std::mutex> lk(g_move_mtx);
-            g_pending_moves.insert(key);
-        }
+        // 内部 save_path，无数据搬移；storage_moved_alert 异步收敛后经 post_progress
+        // 推入 naming_ready=2 通知调度侧放行。
         try {
             h.move_storage(std::string(new_save_path));
         } catch (const std::exception &e) {
             DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 包层迁移发起失败: %s", e.what());
-            std::lock_guard<std::mutex> lk(g_move_mtx);
-            g_pending_moves.erase(key);
             return -1;
         }
         DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[EVENT] 包层迁移发起: -> '%s'", new_save_path);
         return 1;
     }
 
-    bool TorrentEngine::query_progress(const char *task_id, EngineProgress &out) {
-        out = {};
-        out.protocol = DW_PROTOCOL_TORRENT;
-        if (!task_id || !task_id[0]) return false;
-        // 纯读引擎内进度快照（由 alert 线程消费 state_update_alert 持续更新）：不再同步
-        // 调用 handle.status()，消除 A 线程持 mtx_ 时逐任务同步跨库调用的开销。
-        // 首个 state_update_alert 到达前快照缺失，返回 false 由采集循环自然跳过。
-        std::lock_guard<std::mutex> lk(g_status_mtx);
-        const auto it = g_status_snapshot.find(task_id);
-        if (it == g_status_snapshot.end() || !it->second.valid) return false;
-        out = it->second;
-        // naming_ready 现算：move_storage 收敛不产生 state_update（快照该位可能陈旧），
-        // g_pending_moves 不含 key 即无进行中迁移（含从未发起迁移的任务）。
-        // 锁序 g_status_mtx → g_move_mtx 单向，无反向获取路径，不构成死锁。
-        {
-            std::lock_guard<std::mutex> rk(g_move_mtx);
-            out.naming_ready = g_pending_moves.count(task_id) == 0;
-        }
-        return true;
-    }
-
     void TorrentEngine::post_updates() {
-        // 节拍统一推送入口：
-        //   1) post_torrent_updates：结果经 state_update_alert 异步回 alert 线程写入快照；
+        // 节拍入口（A 线程调用）：
+        //   1) post_torrent_updates：触发引擎收集变更任务状态，结果经 state_update_alert
+        //      异步回 alert 线程，由 handle_alert 调 post_progress 推入 TaskManager 内存；
         //   2) 续传检查点：对有元数据任务请求 save_resume_data（携变更门槛，无变化
         //      不产生 alert），结果经 save_resume_data_alert → post_resume_data 输出。
-        // 去重下沉 libtorrent，上层无需再做低频节流。
         if (!g_session) return;
         try { g_session->post_torrent_updates(); } catch (...) {}
         std::vector<lt::torrent_handle> handles;

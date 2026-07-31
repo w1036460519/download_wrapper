@@ -3,9 +3,11 @@
  * @brief 下载引擎统一接口：TaskManager 经此抽象分发，屏蔽协议实现差异。
  *
  * 设计要点：
- *   - 纯虚方法为各引擎必须实现的任务生命周期与查询能力；
- *   - post_updates 为带默认空实现的节拍钩子：Torrent 引擎覆写（进度快照刷新 +
- *     续传检查点一并触发，去重下沉 libtorrent），HTTP 引擎无需实现；
+ *   - 纯虚方法为各引擎必须实现的任务生命周期能力；
+ *   - 进度推送由引擎主动调 post_progress 写入 TaskManager 内存（推模型），
+ *     A 线程下一拍直接从 TaskRecord 字段采集，无 query_progress 拉取；
+ *   - post_updates 为带默认空实现的节拍钩子：Torrent 引擎覆写（触发
+ *     post_torrent_updates 刷新 + 续传检查点），HTTP 引擎无需实现；
  *   - 协议专属能力（如 BT 的文件列表 / 优先级 / 磁力解析）留在具体引擎类，
  *     由 download_wrapper.cpp 经具体指针调用，不污染本接口。
  */
@@ -16,12 +18,9 @@
 #include "download_wrapper/download_wrapper.h"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace dw {
-
-struct EngineProgress;  // 定义见 internal/downloader_internal.h
 
 /**
  * 下载引擎抽象接口（HttpEngine / TorrentEngine 实现）。
@@ -57,9 +56,6 @@ public:
     /// 打开期间禁止删除）。
     virtual bool task_released(const char* id) = 0;
 
-    /// 查询单个任务的进度快照（拉模型）。任务存在于引擎时置 out.valid=true 并返回 true。
-    virtual bool query_progress(const char* key, EngineProgress& out) = 0;
-
     /// 查询文件已下载字节区间（边下边播）。HTTP 单文件模型忽略 file_index。
     virtual std::vector<dw_byte_range_t> get_file_ranges(const char* id,
                                                          int32_t     file_index) = 0;
@@ -69,8 +65,8 @@ public:
 
     // ---- 可选钩子（默认空实现，Torrent 覆写） ----
 
-    /// 触发引擎推送一轮更新（BT：post_torrent_updates 刷新进度快照 + 携变更门槛
-    /// 请求续传检查点，无变化不产生 resume alert；HTTP 由 worker 自推，无需实现）。
+    /// 节拍入口（A 线程调用）：BT 覆写（触发 post_torrent_updates 刷新 + 续传检查点），
+    /// HTTP 引擎由 worker 自推进度，无需实现。
     virtual void post_updates() {}
 
     /// 应用文件选择意图（RESOLVING 就绪出口调用）：显式定型全量文件优先级并解除待选保护。
@@ -81,7 +77,7 @@ public:
                                          int32_t        /*count*/) { return 0; }
 
     /// 包层迁移能力（BT 覆写）：把 handle 的 save_path 迁至 new_save_path，
-    /// 异步收敛（进行中时 EngineProgress.naming_ready 为 false，收敛后恢复）；
+    /// 异步收敛（storage_moved_alert 到达后推 naming_ready=2 通知调度放行）；
     /// 包层不改文件内部相对路径，文件树无需重推。
     /// 判重决策归 TaskManager（重名时目标为 save_path/唯一包层目录）。
     /// @return 0=已一致空操作，1=已发起异步迁移，-1=失败（任务不存在等）。

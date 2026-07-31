@@ -21,6 +21,14 @@ find_package(unofficial-sqlite3 CONFIG REQUIRED)
 # libtorrent 提供 CMake config 包，优先使用 find_package
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
 
+if(WIN32)
+    # NOMINMAX：阻止 windows.h 定义 min/max 宏（经 curl 头传入），否则会撕碎
+    # libtorrent aux_/aligned_union.hpp 中的 max 模板导致 MSVC 语法错误；
+    # WIN32_LEAN_AND_MEAN：裁剪 windows.h，减少宏污染与编译时间；
+    # _WIN32_WINNT=0x0601：目标 Windows 7+，消除 Boost/ASIO 的版本推断警告。
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
+endif()
+
 if(APPLE)
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")

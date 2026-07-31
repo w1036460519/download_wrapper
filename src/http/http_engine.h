@@ -10,12 +10,9 @@
 #include "internal/engine_interface.h"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace dw {
-
-struct EngineProgress;  // 定义见 internal/downloader_internal.h
 
 /**
  * HTTP 下载引擎（IDownloadEngine 实现）。
@@ -67,13 +64,6 @@ public:
      * 分片文件句柄全关）即视为已释放；引擎未初始化 / 未持有该任务同样视为已释放。
      */
     bool task_released(const char* id) override;
-
-    /**
-     * 查询单个 HTTP 任务的进度快照（拉模型）。
-     * 同步从运行时上下文拼装 out；任务存在于引擎时置 out.valid=true 并返回 true。
-     * @param key HTTP 任务键（即 url）。
-     */
-    bool query_progress(const char* key, EngineProgress& out) override;
 
     /**
      * 查询单文件已下载字节区间（边下边播；HTTP 单文件模型，忽略 file_index）。

@@ -14,8 +14,6 @@
 
 #include <sqlite3.h>
 
-#include <cstdio>
-
 namespace dw {
     using utils::now_unix_ms;
     using utils::join_lines;
@@ -63,6 +61,7 @@ namespace dw {
             r.etag = col_text(st, 17);
             r.last_modified = col_text(st, 18);
             r.created_at = sqlite3_column_int64(st, 19);
+            r.wrap_dir = col_text(st, 20);
         }
     } // namespace
 
@@ -112,7 +111,8 @@ namespace dw {
                 "  support_range INTEGER,"
                 "  etag TEXT,"
                 "  last_modified TEXT,"
-                "  created_at INTEGER"
+                "  created_at INTEGER,"
+                "  wrap_dir TEXT"
                 ");"
                 // 去重查询加速：add 时按协议查 url / info_hash（非唯一索引）。
                 "CREATE INDEX IF NOT EXISTS idx_tasks_info_hash ON tasks(info_hash);"
@@ -160,6 +160,18 @@ namespace dw {
                 "CREATE INDEX IF NOT EXISTS idx_file_segments_task"
                 "  ON file_segments(task_id);";
         sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
+
+        // 旧库补列（新库建表已含该列，重复 ALTER 报错忽略即幂等）。
+        sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN wrap_dir TEXT;",
+                     nullptr, nullptr, nullptr);
+        // 旧包层方案数据迁移：name 曾存包层目录名（name != filename 即包层），
+        // 迁至 wrap_dir 并让 name 回归原名（= filename）。未包层行不受影响。
+        sqlite3_exec(db_,
+                     "UPDATE tasks SET wrap_dir = name, name = filename"
+                     "  WHERE filename IS NOT NULL AND filename != ''"
+                     "    AND name != filename"
+                     "    AND (wrap_dir IS NULL OR wrap_dir = '');",
+                     nullptr, nullptr, nullptr);
     }
 
     std::vector<TaskRecord> TaskStore::load_active() {
@@ -170,7 +182,7 @@ namespace dw {
                 "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
                 "       torrent_file, trackers, file_indexes, priority,"
                 "       status, progress, total_size, total_done, support_range, etag,"
-                "       last_modified, created_at FROM tasks"
+                "       last_modified, created_at, wrap_dir FROM tasks"
                 "  WHERE status IN (0,4,5,6);";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
@@ -191,7 +203,7 @@ namespace dw {
                 "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
                 "       torrent_file, trackers, file_indexes, priority,"
                 "       status, progress, total_size, total_done, support_range, etag,"
-                "       last_modified, created_at FROM tasks"
+                "       last_modified, created_at, wrap_dir FROM tasks"
                 "  ORDER BY created_at DESC, id DESC;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
@@ -214,7 +226,7 @@ namespace dw {
                     "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
                     "       torrent_file, trackers, file_indexes, priority,"
                     "       status, progress, total_size, total_done, support_range, etag,"
-                    "       last_modified, created_at FROM tasks WHERE protocol=? AND ";
+                    "       last_modified, created_at, wrap_dir FROM tasks WHERE protocol=? AND ";
             sql += col;
             sql += "=? LIMIT 1;";
             sqlite3_stmt *st = nullptr;
@@ -246,7 +258,7 @@ namespace dw {
                 "SELECT id, info_hash, protocol, name, save_path, filename, url, magnet_link,"
                 "       torrent_file, trackers, file_indexes, priority,"
                 "       status, progress, total_size, total_done, support_range, etag,"
-                "       last_modified, created_at"
+                "       last_modified, created_at, wrap_dir"
                 " FROM tasks WHERE id=?;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
@@ -260,32 +272,14 @@ namespace dw {
         return found;
     }
 
-    std::vector<std::string> TaskStore::load_names_by_save_path(const std::string &save_path,
-                                                                 const int64_t exclude_id) {
-        // 同 save_path 下其他任务的 name / filename 合并返回（非空值），供唯一名判重。
-        std::vector<std::string> out;
-        const char *sql =
-                "SELECT name, filename FROM tasks WHERE save_path=? AND id!=?;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        sqlite3_bind_text(st, 1, save_path.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 2, exclude_id);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            if (std::string name = col_text(st, 0); !name.empty()) out.push_back(std::move(name));
-            if (std::string filename = col_text(st, 1); !filename.empty()) out.push_back(std::move(filename));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
     void TaskStore::insert(TaskRecord &r) {
         // 新增任务：纯 INSERT，回填自增主键。去重已由调用方（add）预先按 url / info_hash 判定。
         const char *sql =
                 "INSERT INTO tasks (info_hash, protocol, name, save_path,"
                 " filename, url, magnet_link, torrent_file, trackers, file_indexes,"
                 " priority, status, progress, total_size, total_done,"
-                " support_range, etag, last_modified, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " support_range, etag, last_modified, created_at, wrap_dir)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " RETURNING id;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
@@ -312,6 +306,7 @@ namespace dw {
         sqlite3_bind_text(st, 17, r.etag.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 18, r.last_modified.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 19, r.created_at);
+        sqlite3_bind_text(st, 20, r.wrap_dir.c_str(), -1, SQLITE_TRANSIENT);
 
         // INSERT ... RETURNING id：直接从结果行读回自增主键，不依赖连接级
         // last_insert_rowid，规避未来共享连接 / 嵌套写入场景下的取值歧义。
@@ -327,7 +322,7 @@ namespace dw {
                 "UPDATE tasks SET info_hash=?, protocol=?, name=?, save_path=?,"
                 " filename=?, url=?, magnet_link=?, torrent_file=?, trackers=?, file_indexes=?,"
                 " priority=?, status=?, progress=?, total_size=?, total_done=?,"
-                " support_range=?, etag=?, last_modified=?, created_at=?"
+                " support_range=?, etag=?, last_modified=?, created_at=?, wrap_dir=?"
                 " WHERE id=?;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
@@ -354,7 +349,8 @@ namespace dw {
         sqlite3_bind_text(st, 17, r.etag.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 18, r.last_modified.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 19, r.created_at);
-        sqlite3_bind_int64(st, 20, r.id);
+        sqlite3_bind_text(st, 20, r.wrap_dir.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 21, r.id);
 
         sqlite3_step(st);
         sqlite3_finalize(st);

@@ -194,7 +194,8 @@ typedef struct dw_progress {
     const char*      info_hash;        /**< 种子 info_hash：BT 任务的识别键与展示；HTTP 为空串。 */
     dw_protocol_t    protocol;         /**< 协议类型。 */
     const char*      name;             /**< 任务显示名称。 */
-    const char*      output_path;      /**< 保存目录绝对路径（不含文件名）。 */
+    const char*      output_path;      /**< 权威保存目录 save_path（不含包层与文件名）；
+                                                有效落盘目录 = output_path[/wrap_dir]。 */
     const char*      filename;         /**< 目标文件名（不含目录）。 */
     int64_t          total_size;       /**< 总大小（字节）；-1=未知。 */
     int64_t          total_done;       /**< 已完成字节；-1=未知。 */
@@ -221,6 +222,11 @@ typedef struct dw_progress {
 
     int64_t          id;               /**< 任务自增 id：上层交互主键，由库内回填；
                                             url / info_hash 为引擎内部识别键与展示数据。 */
+
+    /* ===== 重名包层（追加，保持既有字段偏移） ===== */
+
+    const char*      wrap_dir;         /**< 重名包层目录名（原名(n)）；未冲突为空串。
+                                            物理路径 = output_path/wrap_dir/filename。 */
 } dw_progress_t;
 
 /* ------------------------------------------------------------------ */
@@ -238,7 +244,9 @@ typedef struct dw_task_params {
     /* ===== 通用字段 ===== */
 
     const char*    save_path;        /**< 保存目录（必填）。 */
-    const char*    filename;         /**< 目标文件名（HTTP 必填）。 */
+    const char*    filename;         /**< 已定名的目标文件名：库内派发引擎时回填的定名结果。
+                                          dw_add_task 忽略此字段——文件名一律由库内判重定名
+                                          产生（外部指定名不被接受），经进度回调回报。 */
     const uint8_t* resume_data;      /**< 断点续传数据（可为 NULL）。 */
     size_t         resume_data_size; /**< resume_data 字节长度。 */
 
@@ -354,6 +362,8 @@ typedef struct dw_task_snapshot {
     int32_t          priority;     /**< 队列优先级。 */
     int64_t          created_at;   /**< 创建时间（Unix 毫秒）。 */
     int64_t          id;           /**< 任务自增 id（上层交互主键）。 */
+    char*            wrap_dir;     /**< 重名包层目录名（原名(n)）；未冲突为空串。
+                                        物理路径 = save_path/wrap_dir/name。 */
 } dw_task_snapshot_t;
 
 /* ================================================================== */
@@ -426,6 +436,9 @@ DW_API void dw_set_log_callback(dw_log_cb cb);
 
 /**
  * 添加单个下载任务。
+ *
+ * 文件名不接受外部指定（params.filename 被忽略）：库内以磁盘为唯一真相源判重定名，
+ * 结果经进度回调的 filename / wrap_dir 回报。
  *
  * @param protocol    协议类型。
  * @param params      任务参数指针，不可为 NULL。

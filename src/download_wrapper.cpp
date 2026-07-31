@@ -14,7 +14,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -101,15 +100,27 @@ void post_task_files(const char*           engine_key,
     }
 }
 
+void post_progress(const char*          engine_key,
+                   dw_protocol_t        protocol,
+                   const EngineProgress& ep) {
+    if (!g_downloader || !engine_key) return;
+    if (g_downloader->task_manager) {
+        g_downloader->task_manager->on_progress(engine_key, protocol, ep);
+    }
+}
+
 std::string request_unique_name(const char*   engine_key,
                                 dw_protocol_t protocol,
                                 const char*   dir,
                                 const char*   name) {
     if (!engine_key || !dir || !name) return name ? name : "";
-    // 定名上调：TaskManager 持锁取占用名集 → 解唯一名 → 回写任务并落库（持久预留）。
+    // 定名上调：TaskManager 持锁抢占唯一名并物化磁盘占位 → 回写任务并落库（持久预留）。
     // alert 线程上调锁 mtx_ 与现有 on_task_files 同模式，无死锁。
+    // multi_file 恒 false：本通道当前仅 HTTP 引擎使用，其落盘为单文件模型（占位为文件）；
+    // 若后续接入多文件协议，须由调用方按内容结构传入真实值，否则占位形态错配。
     if (g_downloader && g_downloader->task_manager) {
-        return g_downloader->task_manager->resolve_and_record_name(engine_key, protocol, dir, name);
+        return g_downloader->task_manager->resolve_and_record_name(engine_key, protocol, dir, name,
+                                                                  false);
     }
     return name;
 }
@@ -374,7 +385,7 @@ DW_API char* dw_magnet_to_info_hash(const char* magnet_link) {
             d, d ? d->initialized.load() : 0, magnet_link);
         return nullptr;
     }
-    return d->torrent_engine->magnet_to_info_hash(magnet_link);
+    return dw::TorrentEngine::magnet_to_info_hash(magnet_link);
 }
 
 DW_API char* dw_torrent_file_to_info_hash(const char* torrent_file_path) {
@@ -385,7 +396,7 @@ DW_API char* dw_torrent_file_to_info_hash(const char* torrent_file_path) {
             d, d ? d->initialized.load() : 0, torrent_file_path);
         return nullptr;
     }
-    return d->torrent_engine->torrent_file_to_info_hash(torrent_file_path);
+    return dw::TorrentEngine::torrent_file_to_info_hash(torrent_file_path);
 }
 
 DW_API char* dw_info_hash_to_magnet(int64_t id) {
@@ -402,7 +413,7 @@ DW_API char* dw_info_hash_to_magnet(int64_t id) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
         return nullptr;
     }
-    return d->torrent_engine->info_hash_to_magnet(info_hash.c_str());
+    return dw::TorrentEngine::info_hash_to_magnet(info_hash.c_str());
 }
 
 DW_API int dw_set_file_priority(int64_t id,
@@ -420,7 +431,7 @@ DW_API int dw_set_file_priority(int64_t id,
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
         return 0;
     }
-    return d->torrent_engine->set_file_priority(info_hash.c_str(), file_index, priority);
+    return dw::TorrentEngine::set_file_priority(info_hash.c_str(), file_index, priority);
 }
 
 DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
@@ -435,7 +446,7 @@ DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
             d, d ? d->initialized.load() : 0, torrent_file_path);
         return -1;
     }
-    return d->torrent_engine->parse_torrent_file(torrent_file_path,
+    return dw::TorrentEngine::parse_torrent_file(torrent_file_path,
                                                   out_info_hash,
                                                   out_files,
                                                   out_count);
@@ -458,7 +469,7 @@ DW_API int32_t dw_get_file_list(int64_t          id,
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
         return -1;
     }
-    return d->torrent_engine->get_file_list(info_hash.c_str(), out_files, out_count);
+    return dw::TorrentEngine::get_file_list(info_hash.c_str(), out_files, out_count);
 }
 
 /* ------------------------------------------------------------------ */
@@ -551,7 +562,7 @@ DW_API int32_t dw_set_file_priorities(int64_t             id,
         out_result->code = DW_REASON_NONE;
         return 0;
     }
-    const int ok = d->torrent_engine->set_file_priorities(
+    const int ok = dw::TorrentEngine::set_file_priorities(
         key.c_str(), file_indexes, priorities, count);
     out_result->code = ok ? DW_REASON_NONE : DW_REASON_ERROR;
     return ok ? 0 : -1;
@@ -600,7 +611,7 @@ DW_API int32_t dw_set_playing_file(int64_t             id,
         out_result->code = DW_REASON_NONE;
         return 0;
     }
-    const int ok = d->torrent_engine->set_playing_file(key.c_str(), file_index, byte_offset);
+    const int ok = dw::TorrentEngine::set_playing_file(key.c_str(), file_index, byte_offset);
     out_result->code = ok ? DW_REASON_NONE : DW_REASON_ERROR;
     return ok ? 0 : -1;
 }
@@ -756,6 +767,7 @@ DW_API void dw_task_list_free(dw_task_snapshot_t* tasks, int32_t count) {
         std::free(tasks[i].name);
         std::free(tasks[i].save_path);
         std::free(tasks[i].filename);
+        std::free(tasks[i].wrap_dir);
     }
     std::free(tasks);
 }

@@ -6,8 +6,8 @@
  *   - 注册表仅常驻排队 / 活跃任务（DOWNLOADING/QUEUED），
  *     暂停 / 完成 / 错误任务落库后从内存移除，按需经 add/resume/list 回读；
  *     引擎仅持有当前活跃任务的运行时句柄；
- *   - 进度拉模型：调度线程按固定周期经 query_progress 主动拉取各引擎进度，
- *     应用到记录后统一转发上层；断点续传经 on_resume_data 汇入持久化（触发权下沉引擎：
+ *   - 进度推模型：各引擎线程经 on_progress 将进度写入 TaskRecord 内存（持 mtx_ < 1us），
+ *     A 线程按固定周期遍历读取并转发上层；断点续传经 on_resume_data 汇入持久化（触发权下沉引擎：
  *     HTTP 由 worker 线程随进度推进自推，BT 由 save_resume_data_alert 事件驱动，
  *     检查点随 post_updates 每拍携变更门槛请求，无变化不产生 alert）；
  *   - 并发准入：活跃任务数 < max_concurrent_downloads 才准入下载，其余置 QUEUED；
@@ -35,6 +35,7 @@
 
 namespace dw {
     class IDownloadEngine;
+    struct EngineProgress;
 
     /**
      * 任务中枢单例（由 dw_downloader 持有）。
@@ -111,13 +112,20 @@ namespace dw {
         void on_task_files(const char *engine_key, dw_protocol_t proto,
                            const dw_file_info_t *files, int32_t count);
 
+        // ---- 回调拦截（post_progress 调用） ----
+        /// 引擎进度推送：写入 TaskRecord 内存字段（持 mtx_ 极短时间），A 线程节拍读取。
+        /// 任务不在内存中时静默丢弃（进度为瞬态无需落库）。
+        void on_progress(const char *engine_key, dw_protocol_t proto, const EngineProgress &ep);
+
         // ---- 唯一名定名（add 内部与引擎 request_unique_name 上调共用） ----
-        /// 持 mtx_ 取占用名集（tasks 表同 save_path 其他任务的 name/filename）→ 解唯一名
-        /// （候选先查任务占用、未占用再查磁盘存在，冲突则整名尾部自增 (n)）→ 回写
-        /// name=唯一显示名（重名时即包层目录名并即刻建目录占位）、filename=原名
-        /// 并立即落库（持久预留）。返回唯一显示名；任务未知时仅解唯一名返回不落库。
+        /// 持 mtx_ 抢占唯一名：以磁盘为唯一判重真相源（不查库），候选名未被占用即立即
+        /// 创建条目物化占位（"定名即持有"），冲突则整名尾部自增 (n) 作包层目录名。
+        /// 随后回写 name=filename=原名、wrap_dir=包层目录名（未冲突为空）并落库。
+        /// 返回第一层条目名（包层时=wrap_dir，否则=原名）；任务未知时仅抢名返回不落库。
+        /// @param multi_file 内容是否多文件，决定原名占位形态（true=目录）；HTTP 恒 false。
         std::string resolve_and_record_name(const char *engine_key, dw_protocol_t proto,
-                                            const std::string &dir, const std::string &name);
+                                            const std::string &dir, const std::string &name,
+                                            bool multi_file);
 
         // ---- 快照查询 ----
         int32_t list(dw_task_snapshot_t **out_tasks, int32_t *out_count);
@@ -137,25 +145,26 @@ namespace dw {
         struct ResolveAction {
             TaskRecord rec; // 锁内记录快照（HTTP 已含定名后 filename，供 start_engine_task）
             bool naming_done; // 定名凭证（filename 非空即已判重定名）：BT 跳过判重定名编排
+            bool multi_file; // BT 内容是否多文件：定名占位形态判据（true=根目录名建目录）
             std::vector<uint8_t> resume; // HTTP 续传存档（BT 引擎侧 add 时已装载，恒空）
         };
 
-        // A 线程采集（持 mtx_，单段）：遍历下载中/解析中任务，query_progress 纯读可持锁直接调用；
-        // 回填内存进度/元数据/遥测、暂存续传至 pending_resume、置终态权威态，并收集待转发记录（已含遥测）；
-        // 另收集 RESOLVING 校验动作，由 scheduler_loop 锁外执行。
+        // A 线程采集（持 mtx_，单段）：遍历下载中/解析中任务，直接读 TaskRecord 已被引擎推入
+        // 的进度字段；判终态 → 置 schedule_needed_ → 收集 RESOLVING 校验动作 → push 转发记录。
         // 落库 / 区间快照 / 注销均延后到 B 线程。
         void collect_progress_locked(std::vector<TaskRecord> &fwd_records,
                                      std::vector<ResolveAction> &resolve_actions);
-        // A 线程（轻量）：周期采集。仅 query（纯读）+ 改内存 + 转发回调，不落库 / 不快照 / 不移除 / 不 sweep。
+        // A 线程（轻量）：周期遍历内存 + 转发回调，不落库 / 不快照 / 不移除 / 不 sweep。
         void scheduler_loop();
 
         // B 线程（重载）：较长节拍或被 schedule 唤醒，持锁完成持久化 / 区间快照 / 终态注销 / 准入，随后锁外 sweep。
         void maintenance_loop();
 
-        // 待删文件项：remove(delete_files=1) 登记，B 线程在引擎确认资源释放后删除。
+        // 待删文件项：remove 登记，B 线程在引擎确认资源释放后删除。
         struct PendingFileDelete {
             dw_protocol_t proto; // 释放确认走对应引擎的 task_released
             std::string   path;  // 待删根路径（save_path/filename），单文件与目录树均适用
+            bool placeholder_only; // true=仅回收空占位（delete_files=0 时保留用户数据）
         };
 
         // B 线程锁外调用：对每个待删项确认引擎资源已释放后 remove_all（仅尝试一次，
@@ -186,13 +195,15 @@ namespace dw {
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
         IDownloadEngine *engine_of(dw_protocol_t proto) const;
 
-        // 定名落库（假定已持 mtx_）：取占用名集 → 解唯一名 → 回写 rec.name（唯一显示名，
-        // 重名时即包层目录名）与 rec.filename（磁盘第一层真实条目名 = 原名）并 update；
-        // name != filename 即包层标记，有效落盘目录 = save_path/name。
-        // filename 非空即定名凭证；文件表由引擎在事件点经 post_task_files 自主推送。
+        // 定名落库（假定已持 mtx_）：抢占唯一名并物化磁盘占位 → 回写 name=filename=原名、
+        // wrap_dir=包层目录名（原名(n)，未冲突为空）并 update；wrap_dir 非空即包层标记，
+        // 有效落盘目录 = save_path/wrap_dir，物理路径 = save_path/wrap_dir/name。
+        // filename 非空即定名凭证（重入时补齐占位物化）；文件表由引擎经 post_task_files 推送。
+        // 返回第一层条目名（包层时=wrap_dir，否则=原名），调用方据此与原名比较判包层。
         std::string resolve_and_record_name_locked(TaskRecord &rec,
                                                    const std::string &dir,
-                                                   const std::string &name);
+                                                   const std::string &name,
+                                                   bool multi_file);
 
         // 内存索引维护（tasks_ 以自增 id 为键，另维护两张自然键反查表，增删三者严格同步防悬置）
         void register_task(TaskRecord task_record); // 登记：写 tasks_ 并按协议登记 url→id / info_hash→id

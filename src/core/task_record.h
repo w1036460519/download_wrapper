@@ -26,7 +26,8 @@ struct TaskRecord {
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
     std::string              save_path;     // 保存目录（开始即定名直落最终位置，无临时目录）
-    std::string              filename;
+    std::string              filename;      // 原名快照，兼定名凭证（非空=已判重定名）；定名后与 name 同值
+    std::string              wrap_dir;      // 重名包层目录名（原名(n)）；未冲突为空。物理路径 = save_path/wrap_dir/name
     std::string              url;           // HTTP 身份 + 下载地址
     std::string              magnet_link;   // BT
     std::string              torrent_file;  // BT
@@ -54,13 +55,20 @@ struct TaskRecord {
     bool synth_notified = false;  // 引擎无 ctx 的合成态（QUEUED/PAUSED）已向上层合成过一帧回调；状态跃迁时复位
     std::string pending_resume;   // 引擎线程经 on_resume_data 暂存的待落库续传数据；B 线程持久化后清空（两引擎异步 resume 通道）
 
-    // 运行态遥测（不持久化）：A 线程每次采集写入，转发回调直接投影；
+    // 运行态遥测（不持久化）：引擎线程经 on_progress 推入，A 线程节拍读取并转发；
     // 任务离开活跃态转 PAUSED/QUEUED 时归零，避免合成帧残留旧值。
-    std::string output_path;                    // 引擎回报的当前物理目录（即最终 save_path，无临时目录）；空则回退 save_path
     double      download_rate = 0.0;            // 下载速率（B/s）
     double      upload_rate   = 0.0;            // 上传速率（B/s）；HTTP 恒为 0
     dw_reason_t reason        = DW_REASON_NONE; // 采集到的原因码；仅终态 ERROR 有意义
     std::string message;                        // 采集到的状态 / 错误文本
+
+    // BT 扩展遥测（引擎推入，A 线程校验拍判断用；不持久化）
+    bool bt_metadata_ready = false; // 元数据是否就绪（has_metadata）
+    int32_t bt_naming_ready = 0;    // 定名迁移状态：0=空闲 1=迁移进行中 2=迁移完成
+    bool bt_multi_file     = false; // 多文件 torrent（name 为根目录名）
+
+    // 引擎终态信号（推入侧写，A 线程消费后迁权威态；不持久化）
+    dw_task_status_t pending_engine_status = DW_TASK_STATUS_QUEUED; // QUEUED=无终态待消费
 };
 
 } // namespace dw

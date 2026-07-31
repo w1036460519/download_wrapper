@@ -22,10 +22,10 @@ class TorrentEngine;
 class TaskManager;
 
 /**
- * 引擎进度采集快照（拉模型）。
+ * 引擎进度快照（推模型载体）。
  *
- * TaskManager 周期性向引擎查询得到；自带值语义存储（std::string / std::vector），
- * 可安全跨引擎内部锁边界按值返回。TaskManager 据此落库并构造 dw_progress_t 转发上层。
+ * 引擎线程组装后经 post_progress 写入 TaskRecord 内存字段；A 线程节拍读取转发上层。
+ * 自带值语义存储（std::string / std::vector），可安全跨线程按值传递。
  * 仅承载进度数值与终态判定，调度权威态（QUEUED/PAUSED/DOWNLOADING 切换）由 TaskManager 独占。
  */
 struct EngineProgress {
@@ -41,7 +41,6 @@ struct EngineProgress {
 
     // 展示 / 元数据
     std::string      name;
-    std::string      output_path;   // 当前物理目录（即最终目录 save_path，开始即定名后无临时目录）
     int32_t          support_range = 0;
     std::string      etag;
     std::string      last_modified;
@@ -53,7 +52,8 @@ struct EngineProgress {
     // BT 扩展字段
     double           upload_rate  = 0.0;
     bool             metadata_ready = false; // BT 元数据是否就绪（torrent_status::has_metadata）；HTTP 不使用
-    bool             naming_ready   = false; // BT 无进行中改名（rename_file 计数为零）；query_progress 出口现算，HTTP 不使用
+    int32_t          naming_ready   = 0;     // 定名迁移信号：0=无信号(不更新 TaskRecord) 2=迁移完成；仅 storage_moved_alert 设置
+    bool             multi_file     = false; // BT 是否多文件（name 为根目录名）；定名占位形态判据，HTTP 恒单文件不使用
 };
 
 /**
@@ -112,12 +112,24 @@ void post_task_files(const char*           engine_key,
                      int32_t               count);
 
 /**
+ * 引擎进度推送：将最新进度写入 TaskRecord 内存字段。
+ *
+ * 引擎线程调用，持 TaskManager::mtx_ 极短时间（几个字段赋值）。
+ * 任务不在内存 map 时静默丢弃（进度为瞬态无需落库）。A 线程节拍读取并转发上层。
+ */
+void post_progress(const char*          engine_key,
+                   dw_protocol_t        protocol,
+                   const EngineProgress& ep);
+
+/**
  * 内部唯一名上调：引擎在元数据就绪 / 探测出名时请求定名。
  *
- * 内部转 TaskManager::resolve_and_record_name：持锁取占用名集合 → 解唯一名 →
- * 回写任务 name（唯一显示名）/filename（原名）并立即落库（持久预留）。
- * 返回唯一显示名：与入参 name 不等即重名包层，引擎应将落盘目录追加一层该
- * 返回值目录（文件本名不变）；任务未知时仅按磁盘存在性解唯一名返回（不落库）。
+ * 内部转 TaskManager::resolve_and_record_name：持锁以磁盘为唯一真相源抢占唯一名
+ *（候选未被占用即立即创建条目物化占位）→ 回写任务 name=filename=原名、
+ * wrap_dir=包层目录名（未冲突为空）并立即落库（持久预留）。返回第一层条目名：
+ * 与入参 name 不等即重名包层（返回值即 wrap_dir），引擎应将落盘目录追加一层该返回值
+ * 目录（文件本名不变）；任务未知时仅抢名返回（不落库）。
+ * 本通道占位形态恒为文件（HTTP 单文件模型），多文件协议不得经此路径定名。
  */
 std::string request_unique_name(const char*   engine_key,
                                 dw_protocol_t protocol,

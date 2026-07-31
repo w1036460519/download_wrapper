@@ -10,12 +10,9 @@
 #include "internal/engine_interface.h"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace dw {
-
-struct EngineProgress;  // 定义见 internal/downloader_internal.h
 
 /**
  * BT/Torrent 下载引擎（IDownloadEngine 实现）。
@@ -72,54 +69,50 @@ public:
 
     /**
      * 解析磁力链接获取 info_hash。
+     * 纯解析、不依赖引擎实例状态，故为 static。
      */
-    char* magnet_to_info_hash(const char* magnet_link);
+    static char* magnet_to_info_hash(const char* magnet_link);
 
     /**
      * 解析 .torrent 文件获取 info_hash。
+     * 纯解析、不依赖引擎实例状态，故为 static。
      */
-    char* torrent_file_to_info_hash(const char* torrent_file_path);
+    static char* torrent_file_to_info_hash(const char* torrent_file_path);
 
     /**
      * info_hash 转磁力链接。
+     * 仅操作文件级 session 全局、不依赖引擎实例状态，故为 static（下同）。
      */
-    char* info_hash_to_magnet(const char* task_id);
+    static char* info_hash_to_magnet(const char* task_id);
 
     /**
      * 设置文件下载优先级。
      */
-    int set_file_priority(const char* task_id,
-                          int32_t     file_index,
-                          int32_t     priority);
+    static int set_file_priority(const char* task_id,
+                                 int32_t     file_index,
+                                 int32_t     priority);
 
     /**
      * 本地解析 .torrent 文件，返回 info_hash 和文件列表。
      * 不依赖 session，不创建任务。
      */
-    int32_t parse_torrent_file(const char*      torrent_file_path,
-                               char**           out_info_hash,
-                               dw_file_info_t** out_files,
-                               int32_t*         out_count);
+    static int32_t parse_torrent_file(const char*      torrent_file_path,
+                                      char**           out_info_hash,
+                                      dw_file_info_t** out_files,
+                                      int32_t*         out_count);
 
     /**
      * 获取 session 中已存在任务的文件列表。
      * 任务元数据就绪后可用。
      */
-    int32_t get_file_list(const char*      task_id,
-                          dw_file_info_t** out_files,
-                          int32_t*         out_count);
+    static int32_t get_file_list(const char*      task_id,
+                                 dw_file_info_t** out_files,
+                                 int32_t*         out_count);
 
     /**
-     * 查询单个 BT 任务的进度快照（推送模型，纯读）。
-     * 读引擎内快照（由 alert 线程消费 state_update_alert 持续更新）；命中且有效时置
-     * out.valid=true 并返回 true，首个状态更新到达前返回 false。
-     * @param task_id BT 任务键（即 info_hash 十六进制串）。
-     */
-    bool query_progress(const char* task_id, EngineProgress& out) override;
-
-    /**
-     * 节拍统一推送入口（由 A 线程采集节拍调用；session 线程安全，无需持 TaskManager 锁）：
-     *   1) post_torrent_updates：结果经 state_update_alert 异步写入快照；
+     * 节拍入口（A 线程调用，session 线程安全，无需持 TaskManager 锁）：
+     *   1) post_torrent_updates：触发引擎收集变更任务状态，结果经 state_update_alert
+     *      异步回 alert 线程，由 handle_alert 调 post_progress 推入 TaskManager 内存；
      *   2) 续传检查点：对有元数据任务携变更门槛请求 save_resume_data（无变化
      *      不产生 alert），结果经 save_resume_data_alert → post_resume_data 输出。
      */
@@ -138,18 +131,18 @@ public:
      * file_index<0 表示停止提优（clear_piece_deadlines）。
      * @return 1=成功，0=失败。
      */
-    int set_playing_file(const char* task_id,
-                         int32_t     file_index,
-                         int64_t     byte_offset);
+    static int set_playing_file(const char* task_id,
+                                int32_t     file_index,
+                                int64_t     byte_offset);
 
     /**
      * 批量设置任务内多个文件的下载优先级（任务内文件级优先）。
      * @return 1=成功，0=失败。
      */
-    int set_file_priorities(const char*    task_id,
-                            const int32_t* file_indexes,
-                            const int32_t* priorities,
-                            int32_t        count);
+    static int set_file_priorities(const char*    task_id,
+                                   const int32_t* file_indexes,
+                                   const int32_t* priorities,
+                                   int32_t        count);
 
     /**
      * 应用文件选择意图（RESOLVING 就绪出口，TaskManager 经统一接口调用）。
@@ -164,9 +157,8 @@ public:
     /**
      * 包层迁移能力（TaskManager 重名定名决策后锁外调用）。
      * 把 handle 的 save_path 迁至 new_save_path（零字节落盘时段仅建目录改路径，
-     * 无数据搬移）；storage_moved_alert 收敛后补存 resume（新 save_path 跨重启
-     * 保持），进行中时 naming_ready 为 false，收敛后恢复。
-     * @return 0=save_path 已一致（空操作），1=已发起异步迁移（含进行中重入），
+     * 无数据搬移）；storage_moved_alert 收敛后推 naming_ready=2 通知调度放行。
+     * @return 0=save_path 已一致（空操作），1=已发起异步迁移，
      *         -1=失败（任务不存在等）。
      */
     int32_t move_storage(const char* task_id, const char* new_save_path) override;

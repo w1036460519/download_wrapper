@@ -23,11 +23,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -299,10 +297,11 @@ struct dl_task_ctx {
     std::atomic<int> cancel_req{0};
     std::atomic<int> delete_req{0}; // 删除请求：与 cancel_req 一并置位，sweep 回收 ctx（关句柄）后据此删除落盘文件
     std::atomic<int> thread_done{0}; // 任务线程是否已结束；sweep 据此安全回收
-    std::atomic<int> terminal_reported{0}; // 终态已被 query_progress 采集至少一次；sweep 仅在置位后回收，避免抢在采集前回收导致任务卡在下载中
+    std::atomic<int64_t> terminal_pushed_at_ms{0}; // 终态推入 TaskManager 的时间戳（ms）；sweep 据此延迟回收（保证 A 线程至少一拍观测到终态）
     int probing = 1;
     int is_resume = 0; // 恢复任务标志：携续传存档启动即置 1（不论存档是否有效）；finalize_probing 据此沿用历史凭证名（不再判重），首次下载走优先级链判重定名
     int64_t last_emit_done = -1; // 上次 emit resume_data 时的总已下载字节（续传上报去重基准：仅总量推进时才 emit）。
+    int64_t last_push_done = -1; // 上次推入 post_progress 时的总已下载字节（进度推送去重：仅推进超过门槛才推入）
     std::mutex speed_mtx;
     std::thread task_thread;
 };

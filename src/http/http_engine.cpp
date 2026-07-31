@@ -6,11 +6,10 @@
 #include "http/http_engine.h"
 #include "http/http_engine_internal.h"
 #include "internal/downloader_internal.h"
+#include "utils/time_util.h"
 
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <algorithm>
 
 namespace dw {
     namespace he = http_engine;
@@ -19,7 +18,6 @@ namespace dw {
     using he::internal::set_result;
     using he::internal::mkdir_recursive;
     using he::internal::start_task;
-    using he::internal::fill_progress;
     using he::internal::emit_resume;
 
     namespace {
@@ -368,43 +366,6 @@ namespace dw {
         return !he::g_tasks.contains(id);
     }
 
-    bool HttpEngine::query_progress(const char *key, EngineProgress &out) {
-        out = {};
-        out.protocol = DW_PROTOCOL_HTTP;
-        if (!key || !*key) return false;
-
-        // 纯读快照：本函数不触碰 TaskManager mtx_，也不产生任何 resume。
-        // HTTP 状态由 libcurl 回调持续写入 dl_task_ctx（推送模型），此处仅聚合读出；
-        // resume 已改为 worker 线程按门槛经 post_resume_data 异步上报（见 http_engine_impl.cpp），
-        // 不再随返回值携带 resume_blob。
-        std::lock_guard<std::mutex> lk(he::g_map_mtx);
-        const auto it = he::g_tasks.find(key);
-        if (it == he::g_tasks.end() || !it->second) return false;
-        dl_task_ctx *tCtx = it->second.get();
-        dw_progress_t snap;
-        fill_progress(tCtx, &snap); // 复用推送路径的组装逻辑（内部持 speed_mtx 聚合分片）
-        out.valid = true;
-        out.status = snap.task_status;
-        out.total_size = snap.total_size;
-        out.total_done = snap.total_done;
-        out.progress = snap.progress;
-        out.download_rate = snap.download_rate;
-        out.name = tCtx->filename;
-        out.output_path = tCtx->output_path; // 落盘目录（= save_path，无临时目录）
-        out.support_range = snap.support_range;
-        out.etag = tCtx->etag;
-        out.last_modified = tCtx->last_modified;
-        out.reason = snap.reason;
-        out.message = tCtx->message;
-        // 分片实时状态不再导出（app 已下线分片展示）；tCtx->parts 仅供引擎内部多连接与区间快照使用。
-        // 采集到终态即置位：sweep 仅在终态被采集至少一次后才回收 ctx，
-        // 避免抢在采集前回收导致 TaskManager 无法观测终态、任务卡在下载中。
-        if (out.status == DW_TASK_STATUS_COMPLETED || out.status == DW_TASK_STATUS_ERROR) {
-            tCtx->terminal_reported.store(1);
-        }
-        return true;
-    }
-
     std::vector<dw_byte_range_t> HttpEngine::get_file_ranges(const char *id, int32_t /*file_index*/) {
         // HTTP 单文件模型：file_index 忽略（签名与接口统一）。
         std::vector<dw_byte_range_t> ranges;
@@ -441,6 +402,7 @@ namespace dw {
     void HttpEngine::sweep() {
         if (!initialized_ || !he::g_running.load()) return;
         // HTTP 仅在下载中需要持有线程/curl handle；线程结束后统一在此回收上下文（含暂停态）。
+        const int64_t now_ms = dw::utils::now_unix_ms();
         std::vector<std::string> to_reclaim;
         {
             std::lock_guard<std::mutex> lk(he::g_map_mtx);
@@ -448,18 +410,20 @@ namespace dw {
                 if (!tCtx) continue;
                 if (tCtx->thread_done.load() != 1) continue; // 线程未结束不回收，规避 use-after-free
                 if (tCtx->delete_req.load() == 1) {
-                    // 删除中：TaskManager 已移除记录不再采集，无需 terminal_reported 守卫。
+                    // 删除中：TaskManager 已移除记录不再采集，无需等待终态观测。
                     to_reclaim.push_back(url);
                     continue;
                 }
                 if (const dw_task_status_t st = tCtx->status;
                     st == DW_TASK_STATUS_COMPLETED || st == DW_TASK_STATUS_ERROR) {
-                    // 拉模型：终态需已被采集循环（query_progress）观测至少一次后才回收，
-                    // 否则会抢在 TaskManager 处理终态前销毁 ctx，使任务永久卡在下载中。
-                    if (tCtx->terminal_reported.load() == 1) to_reclaim.push_back(url);
+                    // 推模型：终态已由 push_progress 推入 TaskManager 内存；延迟 4s 回收
+                    // 确保 A 线程至少采集一拍终态后再销毁 ctx（2 个 maintenance 周期）。
+                    const int64_t pushed_at = tCtx->terminal_pushed_at_ms.load();
+                    if (pushed_at > 0 && (now_ms - pushed_at) >= 4000) {
+                        to_reclaim.push_back(url);
+                    }
                 } else if (tCtx->pause_req.load() == 1) {
-                    // 暂停态：PAUSED 帧由 TaskManager 合成，无需 terminal_reported 守卫；
-                    // worker 已结束即可回收，内存记录随后由 B 在确认 ctx 回收后逐出。
+                    // 暂停态：PAUSED 帧由 TaskManager 合成，worker 已结束即可回收。
                     to_reclaim.push_back(url);
                 }
             }

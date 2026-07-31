@@ -50,10 +50,6 @@ public:
     bool load_by_info_hash(const std::string& info_hash, TaskRecord& out);
     /// 按自增 id 载入全字段（含分片续传态）；供低频控制操作。命中返回 true。
     bool load_by_id(int64_t id, TaskRecord& out);
-    /// 查询同 save_path 下（排除 exclude_id 自身）已占用的名称集合：
-    /// 合并 name / filename 两列非空值，供唯一名判重（库即持久预留，跨重启有效）。
-    std::vector<std::string> load_names_by_save_path(const std::string& save_path,
-                                                     int64_t exclude_id);
     /// 新增任务：纯 INSERT，回填自增主键到 r.id。仅 add 未命中去重时调用。
     void insert(TaskRecord& r);
     /// 更新既有任务：按 id 原地 UPDATE 全字段（要求 r.id 有效）。add 之外的操作统一走此路径。
