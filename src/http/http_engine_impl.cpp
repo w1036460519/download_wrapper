@@ -202,7 +202,7 @@ namespace dw {
                                                     total_size)
                                               : -1.0;
                 task_progress->download_rate = total_speed;
-                // remaining / eta 由 wrapper 层现算（EngineProgress 不承载 eta），此处不再计算 eta。
+                // remaining / eta 由 wrapper 层现算（STATUS_UPDATE 事件不承载 eta），此处不再计算 eta。
                 task_progress->task_status = tCtx->status;
                 task_progress->support_range = tCtx->support_range;
                 task_progress->etag = tCtx->etag.c_str();
@@ -684,16 +684,14 @@ namespace dw {
                     // 指针字段仅在调用期有效，库内深拷落库。
                     dw_file_info_t f{};
                     f.index = 0;
-                    f.node_id = 1;
-                    f.parent_id = -1;
-                    f.type = 1;
-                    f.prefix = const_cast<char *>("");
                     f.name = const_cast<char *>(tCtx->filename.c_str());
                     const std::string ext = dw::utils::file_extension(tCtx->filename);
                     f.ext = ext.empty() ? nullptr : const_cast<char *>(ext.c_str());
                     f.size = tCtx->total_size > 0 ? tCtx->total_size : 0;
+                    f.offset = 0; // HTTP 单文件模型，全局偏移恒为 0
                     f.status = 0;
-                    f.created_at = now_unix_ms();
+                    f.downloaded_bytes = 0;
+                    f.play_position_ms = 0;
                     dw::post_task_files(tCtx->url.c_str(), DW_PROTOCOL_HTTP, &f, 1);
                 }
                 tCtx->full_file_path =
@@ -908,23 +906,25 @@ namespace dw {
                     if (snap.total_done - tCtx->last_push_done < threshold) return;
                 }
                 tCtx->last_push_done = snap.total_done;
-                EngineProgress ep;
-                ep.valid = true;
-                ep.protocol = DW_PROTOCOL_HTTP;
-                ep.status = snap.task_status;
-                ep.total_size = snap.total_size;
-                ep.total_done = snap.total_done;
-                ep.progress = snap.progress;
-                ep.download_rate = snap.download_rate;
-                ep.name = tCtx->filename;
-                ep.support_range = snap.support_range;
-                ep.etag = tCtx->etag;
-                ep.last_modified = tCtx->last_modified;
-                ep.reason = snap.reason;
-                ep.message = tCtx->message;
-                dw::post_progress(tCtx->url.c_str(), DW_PROTOCOL_HTTP, ep);
+                EngineEvent ev;
+                ev.type = EngineEventType::STATUS_UPDATE;
+                ev.engine_key = tCtx->url;
+                ev.protocol = DW_PROTOCOL_HTTP;
+                ev.valid = true;
+                ev.status = snap.task_status;
+                ev.total_size = snap.total_size;
+                ev.total_done = snap.total_done;
+                ev.progress = snap.progress;
+                ev.download_rate = snap.download_rate;
+                ev.name = tCtx->filename;
+                ev.support_range = snap.support_range;
+                ev.etag = tCtx->etag;
+                ev.last_modified = tCtx->last_modified;
+                ev.reason = snap.reason;
+                ev.message = tCtx->message;
+                dw::post_engine_event(std::move(ev));
                 // 终态时记录推送时间戳（sweep 据此延迟回收）
-                if (ep.status == DW_TASK_STATUS_COMPLETED || ep.status == DW_TASK_STATUS_ERROR) {
+                if (snap.task_status == DW_TASK_STATUS_COMPLETED || snap.task_status == DW_TASK_STATUS_ERROR) {
                     tCtx->terminal_pushed_at_ms.store(now_unix_ms());
                 }
             }

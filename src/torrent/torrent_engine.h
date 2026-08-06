@@ -93,10 +93,11 @@ public:
                                  int32_t     priority);
 
     /**
-     * 本地解析 .torrent 文件，返回 info_hash 和文件列表。
+     * 本地解析 .torrent 文件，返回种子名称、info_hash 和文件列表。
      * 不依赖 session，不创建任务。
      */
     static int32_t parse_torrent_file(const char*      torrent_file_path,
+                                      char**           out_name,
                                       char**           out_info_hash,
                                       dw_file_info_t** out_files,
                                       int32_t*         out_count);
@@ -112,7 +113,7 @@ public:
     /**
      * 节拍入口（A 线程调用，session 线程安全，无需持 TaskManager 锁）：
      *   1) post_torrent_updates：触发引擎收集变更任务状态，结果经 state_update_alert
-     *      异步回 alert 线程，由 handle_alert 调 post_progress 推入 TaskManager 内存；
+     *      异步回 alert 线程，由 handle_alert 投递 STATUS_UPDATE 事件；
      *   2) 续传检查点：对有元数据任务携变更门槛请求 save_resume_data（无变化
      *      不产生 alert），结果经 save_resume_data_alert → post_resume_data 输出。
      */

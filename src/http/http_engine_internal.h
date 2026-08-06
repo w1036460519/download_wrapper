@@ -301,7 +301,7 @@ struct dl_task_ctx {
     int probing = 1;
     int is_resume = 0; // 恢复任务标志：携续传存档启动即置 1（不论存档是否有效）；finalize_probing 据此沿用历史凭证名（不再判重），首次下载走优先级链判重定名
     int64_t last_emit_done = -1; // 上次 emit resume_data 时的总已下载字节（续传上报去重基准：仅总量推进时才 emit）。
-    int64_t last_push_done = -1; // 上次推入 post_progress 时的总已下载字节（进度推送去重：仅推进超过门槛才推入）
+    int64_t last_push_done = -1; // 上次投递 STATUS_UPDATE 事件时的总已下载字节（进度推送去重：仅推进超过门槛才投递）
     std::mutex speed_mtx;
     std::thread task_thread;
 };

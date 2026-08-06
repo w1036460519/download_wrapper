@@ -19,6 +19,7 @@ find_package(Threads REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 # libtorrent 提供 CMake config 包，优先使用 find_package
+# Boost 头文件经 libtorrent 的 PUBLIC 依赖传递，无需显式 find_package
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
 
 if(WIN32)
@@ -49,6 +50,7 @@ set(DW_SOURCES
     src/http/http_engine.cpp
     src/http/http_engine_impl.cpp
     src/torrent/torrent_engine.cpp
+    src/playback/playback_proxy.cpp
     src/utils/string_util.cpp
     src/utils/time_util.cpp
     src/utils/unique_name.cpp

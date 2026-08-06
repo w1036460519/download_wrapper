@@ -4,8 +4,8 @@
  *
  * 设计要点：
  *   - 纯虚方法为各引擎必须实现的任务生命周期能力；
- *   - 进度推送由引擎主动调 post_progress 写入 TaskManager 内存（推模型），
- *     A 线程下一拍直接从 TaskRecord 字段采集，无 query_progress 拉取；
+ *   - 进度推送由引擎经 post_engine_event 投递 STATUS_UPDATE 事件（事件驱动），
+ *     B 线程消费后写入 TaskRecord 内存，A 线程下一拍直接从 TaskRecord 字段采集；
  *   - post_updates 为带默认空实现的节拍钩子：Torrent 引擎覆写（触发
  *     post_torrent_updates 刷新 + 续传检查点），HTTP 引擎无需实现；
  *   - 协议专属能力（如 BT 的文件列表 / 优先级 / 磁力解析）留在具体引擎类，

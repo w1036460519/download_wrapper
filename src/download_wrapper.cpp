@@ -14,6 +14,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -100,15 +102,6 @@ void post_task_files(const char*           engine_key,
     }
 }
 
-void post_progress(const char*          engine_key,
-                   dw_protocol_t        protocol,
-                   const EngineProgress& ep) {
-    if (!g_downloader || !engine_key) return;
-    if (g_downloader->task_manager) {
-        g_downloader->task_manager->on_progress(engine_key, protocol, ep);
-    }
-}
-
 std::string request_unique_name(const char*   engine_key,
                                 dw_protocol_t protocol,
                                 const char*   dir,
@@ -123,6 +116,11 @@ std::string request_unique_name(const char*   engine_key,
                                                                   false);
     }
     return name;
+}
+
+void post_engine_event(EngineEvent event) {
+    if (!g_downloader || !g_downloader->task_manager) return;
+    g_downloader->task_manager->on_engine_event(std::move(event));
 }
 
 } // namespace dw
@@ -435,18 +433,20 @@ DW_API int dw_set_file_priority(int64_t id,
 }
 
 DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
+                                     char**           out_name,
                                      char**           out_info_hash,
                                      dw_file_info_t** out_files,
                                      int32_t*         out_count) {
     auto* d = dw::global_downloader();
     if (!d || !d->initialized.load() || !torrent_file_path ||
-        !out_info_hash || !out_files || !out_count) {
+        !out_name || !out_info_hash || !out_files || !out_count) {
         DW_LOGF(DW_LOG_ERROR, "",
             "失败: 参数非法 d=%p init=%d path=%p",
             d, d ? d->initialized.load() : 0, torrent_file_path);
         return -1;
     }
     return dw::TorrentEngine::parse_torrent_file(torrent_file_path,
+                                                  out_name,
                                                   out_info_hash,
                                                   out_files,
                                                   out_count);
@@ -491,36 +491,47 @@ DW_API int32_t dw_get_file_ranges(int64_t           id,
     *out_ranges = nullptr;
     *out_count  = 0;
 
-    std::string key;
-    dw_protocol_t proto = DW_PROTOCOL_HTTP;
-    if (!d->task_manager->engine_ref_of(id, key, proto)) {
-        DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
-        return -1;
+    // ---- 1. 优先读内存缓存（B 线程周期从引擎拉取更新） ----
+    std::vector<dw_byte_range_t> vec = d->task_manager->get_cached_segments(id, file_index);
+
+    if (!vec.empty()) {
+        // 缓存命中，直接返回
+        const int32_t n = static_cast<int32_t>(vec.size());
+        auto* arr = static_cast<dw_byte_range_t*>(
+            std::calloc(static_cast<size_t>(n), sizeof(dw_byte_range_t)));
+        if (!arr) return -1;
+        for (int32_t i = 0; i < n; ++i) arr[i] = vec[static_cast<size_t>(i)];
+        *out_ranges = arr;
+        *out_count  = n;
+        return 0;
     }
 
-    // 接口统一双参签名：HTTP 单文件模型忽略 file_index。
-    std::vector<dw_byte_range_t> vec =
-        (proto == DW_PROTOCOL_TORRENT)
-            ? d->torrent_engine->get_file_ranges(key.c_str(), file_index)
-            : d->http_engine->get_file_ranges(key.c_str(), file_index);
-    if (vec.empty()) {
-        // 引擎实时无区间：任务可能未加载进引擎（暂停 / 跨重启空窗）。
-        // 回退读 file_segments 表的低频快照，支撑任务未加载时的播放兜底。
-        vec = d->task_manager->load_segments(id, file_index);
+    // ---- 2. 缓存为空：按任务状态决定行为 ----
+    const int32_t status = d->task_manager->get_task_status(id);
+    if (status < 0) {
+        // 任务不存在
+        return 2;
     }
+
+    const bool downloading = (status == DW_TASK_STATUS_DOWNLOADING ||
+                              status == DW_TASK_STATUS_RESOLVING ||
+                              status == DW_TASK_STATUS_PARSED);
+    if (downloading) {
+        // 下载中但缓存为空（引擎尚未产出数据 / 元数据未就绪）：
+        // 不回退 DB（DB 可能是过时快照），返回 1 让代理等待
+        return 1;
+    }
+
+    // ---- 3. 非下载中：回退 DB 快照（静态数据） ----
+    vec = d->task_manager->load_segments(id, file_index);
     if (vec.empty()) {
-        // 元数据未就绪 / 无已下区间且无快照：返回空结果（成功）。
-        return 0;
+        return 2; // 无数据且不会增长
     }
     const int32_t n = static_cast<int32_t>(vec.size());
     auto* arr = static_cast<dw_byte_range_t*>(
         std::calloc(static_cast<size_t>(n), sizeof(dw_byte_range_t)));
-    if (!arr) {
-        return -1;
-    }
-    for (int32_t i = 0; i < n; ++i) {
-        arr[i] = vec[static_cast<size_t>(i)];
-    }
+    if (!arr) return -1;
+    for (int32_t i = 0; i < n; ++i) arr[i] = vec[static_cast<size_t>(i)];
     *out_ranges = arr;
     *out_count  = n;
     return 0;
@@ -531,6 +542,73 @@ DW_API void dw_byte_range_free(dw_byte_range_t* ranges, int32_t count) {
     if (ranges) {
         std::free(ranges);
     }
+}
+
+DW_API int32_t dw_get_task_file_info(int64_t id,
+                                     int32_t file_index,
+                                     char**  out_path,
+                                     int64_t* out_size) {
+    auto* d = dw::global_downloader();
+    if (!d || !d->initialized.load() || !d->task_manager ||
+        !out_path || !out_size) {
+        DW_LOGF(DW_LOG_ERROR, "",
+            "失败: 参数非法 d=%p init=%d id=%lld",
+            d, d ? d->initialized.load() : 0, (long long)id);
+        return -1;
+    }
+    *out_path = nullptr;
+    *out_size = -1;
+
+    // 持锁快照任务记录（save_path / filename / protocol / total_size）
+    dw::TaskRecord rec;
+    {
+        std::lock_guard<std::mutex> lock(d->task_manager->get_mutex());
+        if (!d->task_manager->get_store().load_by_id(id, rec)) {
+            DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 id=%lld", (long long)id);
+            return -1;
+        }
+    }
+
+    // save_path 已含包层目录（冲突时直接追加）
+    std::filesystem::path base(rec.save_path);
+
+    std::string file_path;
+    int64_t file_size = -1;
+
+    if (rec.protocol == DW_PROTOCOL_TORRENT && file_index > 0) {
+        // BT 多文件：经 task_files 表按 file_index 查 name（name 已含完整相对路径）
+        auto files = d->task_manager->load_files(id);
+        for (const auto& f : files) {
+            if (f.index == file_index) {
+                if (f.name && f.name[0]) {
+                    file_path = (base / f.name).string();
+                    file_size = f.size;
+                }
+                break;
+            }
+        }
+    } else {
+        // HTTP 单文件 或 BT file_index=0 的兜底：save_path/filename
+        if (!rec.filename.empty()) {
+            file_path = (base / rec.filename).string();
+            file_size = rec.total_size;
+        }
+    }
+
+    if (file_path.empty()) {
+        DW_LOGF(DW_LOG_ERROR, "", "失败: 无法构建文件路径 id=%lld fi=%d", (long long)id, file_index);
+        return -1;
+    }
+
+    // 堆拷贝路径字符串
+    const size_t len = file_path.size();
+    char* path_copy = static_cast<char*>(std::malloc(len + 1));
+    if (!path_copy) return -1;
+    std::memcpy(path_copy, file_path.c_str(), len + 1);
+
+    *out_path = path_copy;
+    *out_size = file_size;
+    return 0;
 }
 
 DW_API int32_t dw_set_file_priorities(int64_t             id,
@@ -713,7 +791,7 @@ DW_API int32_t dw_load_task_files(int64_t id,
     if (!arr) {
         // 分配失败：释放已持有的堆字符串，避免泄露。
         for (auto& f : file_vec) {
-            std::free(f.name); std::free(f.prefix); std::free(f.ext);
+            std::free(f.name); std::free(f.ext);
         }
         *out_files = nullptr;
         *out_count = 0;
@@ -748,10 +826,8 @@ DW_API void dw_file_list_free(dw_file_info_t* files, int32_t count) {
     // 释放各节点由库分配的全部字符串字段。
     for (int32_t i = 0; i < count; ++i) {
         std::free(files[i].name);
-        std::free(files[i].prefix);
         std::free(files[i].ext);
         files[i].name = nullptr;
-        files[i].prefix = nullptr;
         files[i].ext = nullptr;
     }
     std::free(files);
@@ -767,7 +843,6 @@ DW_API void dw_task_list_free(dw_task_snapshot_t* tasks, int32_t count) {
         std::free(tasks[i].name);
         std::free(tasks[i].save_path);
         std::free(tasks[i].filename);
-        std::free(tasks[i].wrap_dir);
     }
     std::free(tasks);
 }

@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include <boost/asio.hpp>
+
 namespace dw {
 
 // 前向声明各协议引擎
@@ -22,38 +24,46 @@ class TorrentEngine;
 class TaskManager;
 
 /**
- * 引擎进度快照（推模型载体）。
- *
- * 引擎线程组装后经 post_progress 写入 TaskRecord 内存字段；A 线程节拍读取转发上层。
- * 自带值语义存储（std::string / std::vector），可安全跨线程按值传递。
- * 仅承载进度数值与终态判定，调度权威态（QUEUED/PAUSED/DOWNLOADING 切换）由 TaskManager 独占。
+ * 引擎事件类型（引擎 alert / 状态变化经此转递给 Wrapper B 线程消费）。
  */
-struct EngineProgress {
-    bool             valid  = false;  // 引擎中是否存在该任务运行时上下文
-    dw_protocol_t    protocol = DW_PROTOCOL_HTTP;
-    dw_task_status_t status = DW_TASK_STATUS_QUEUED;  // 引擎视角状态；上层仅取终态（COMPLETED/ERROR）
+enum class EngineEventType {
+    PARSED,             // 解析完成（元数据+文件信息，含存储迁移完成）
+    DOWNLOAD_FAILED,    // 下载失败（通用失败事件）
+    DOWNLOAD_COMPLETED, // 下载完成
+    STATUS_UPDATE,      // 状态+进度更新（替代原 post_progress）
+};
 
-    // 进度数值
+/**
+ * 引擎事件载体（自带值语义，可安全跨线程按值传递）。
+ *
+ * 文件节点数组经深拷贝存入事件，消费方负责释放各节点字符串字段。
+ */
+struct EngineEvent {
+    EngineEventType type;
+    std::string     engine_key;
+    dw_protocol_t   protocol = DW_PROTOCOL_TORRENT;
+
+    // PARSED 事件字段
+    std::string name;              // 种子名称
+    std::string save_path;         // 引擎当前 save_path
+    bool        multi_file = false; // 是否多文件种子
+    std::vector<dw_file_info_t> files; // 节点树（深拷贝）
+
+    // DOWNLOAD_FAILED 事件字段
+    dw_reason_t reason  = DW_REASON_NONE;
+    std::string message;
+
+    // STATUS_UPDATE 事件字段（原 EngineProgress）
+    dw_task_status_t status = DW_TASK_STATUS_QUEUED;
+    bool             valid  = false;  // 引擎中是否存在该任务运行时上下文
     int64_t          total_size    = -1;
     int64_t          total_done    = -1;
     double           progress      = -1.0;
     double           download_rate = 0.0;
-
-    // 展示 / 元数据
-    std::string      name;
+    double           upload_rate   = 0.0;
     int32_t          support_range = 0;
     std::string      etag;
     std::string      last_modified;
-
-    // 终态原因
-    dw_reason_t      reason  = DW_REASON_NONE;
-    std::string      message;
-
-    // BT 扩展字段
-    double           upload_rate  = 0.0;
-    bool             metadata_ready = false; // BT 元数据是否就绪（torrent_status::has_metadata）；HTTP 不使用
-    int32_t          naming_ready   = 0;     // 定名迁移信号：0=无信号(不更新 TaskRecord) 2=迁移完成；仅 storage_moved_alert 设置
-    bool             multi_file     = false; // BT 是否多文件（name 为根目录名）；定名占位形态判据，HTTP 恒单文件不使用
 };
 
 /**
@@ -112,16 +122,6 @@ void post_task_files(const char*           engine_key,
                      int32_t               count);
 
 /**
- * 引擎进度推送：将最新进度写入 TaskRecord 内存字段。
- *
- * 引擎线程调用，持 TaskManager::mtx_ 极短时间（几个字段赋值）。
- * 任务不在内存 map 时静默丢弃（进度为瞬态无需落库）。A 线程节拍读取并转发上层。
- */
-void post_progress(const char*          engine_key,
-                   dw_protocol_t        protocol,
-                   const EngineProgress& ep);
-
-/**
  * 内部唯一名上调：引擎在元数据就绪 / 探测出名时请求定名。
  *
  * 内部转 TaskManager::resolve_and_record_name：持锁以磁盘为唯一真相源抢占唯一名
@@ -135,6 +135,18 @@ std::string request_unique_name(const char*   engine_key,
                                 dw_protocol_t protocol,
                                 const char*   dir,
                                 const char*   name);
+
+/* ================================================================== */
+/*                          引擎事件投递                              */
+/* ================================================================== */
+
+/**
+ * 引擎事件投递：经 Boost.Asio io_context::post 投递到 B 线程消费。
+ *
+ * 引擎 alert 线程调用，线程安全。事件经值语义拷贝后投递，调用方无需保持数据存活。
+ * files 中各节点的字符串字段由调用方释放（投递前已完成深拷贝）。
+ */
+void post_engine_event(EngineEvent event);
 
 /**
  * 格式化日志输出（内部）。

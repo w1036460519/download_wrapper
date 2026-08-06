@@ -25,9 +25,8 @@ struct TaskRecord {
     dw_protocol_t protocol = DW_PROTOCOL_HTTP;
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
-    std::string              save_path;     // 保存目录（开始即定名直落最终位置，无临时目录）
+    std::string              save_path;     // 保存目录（含重名包层，冲突时直接追加到 save_path）
     std::string              filename;      // 原名快照，兼定名凭证（非空=已判重定名）；定名后与 name 同值
-    std::string              wrap_dir;      // 重名包层目录名（原名(n)）；未冲突为空。物理路径 = save_path/wrap_dir/name
     std::string              url;           // HTTP 身份 + 下载地址
     std::string              magnet_link;   // BT
     std::string              torrent_file;  // BT

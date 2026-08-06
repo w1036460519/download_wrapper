@@ -2,14 +2,13 @@
  * @file torrent_engine.cpp
  * @brief BT/Torrent 下载引擎实现（基于 libtorrent）。
  *
- * 架构（推模型）：
+ * 架构（事件驱动）：
  *   - 单例 lt::session 管理所有 BT 任务；
  *   - A 线程每拍经 post_updates 触发 post_torrent_updates + 携变更门槛的续传检查点；
- *     alert 线程消费 state_update_alert 后经 post_progress 推入 TaskManager 内存，
- *     A 线程下一拍直接从 TaskRecord 字段采集进度；
- *   - alert 轮询线程另处理生命周期事件：完成时请求保存续传、阻断性错误
- *     （torrent_error / file_error）直接推入终态、save_resume_data_alert 经
- *     dw::post_resume_data 输出续传数据；
+ *     alert 线程消费 state_update_alert 后经 post_engine_event 投递 STATUS_UPDATE 事件，
+ *     B 线程消费后写入 TaskRecord 内存，A 线程下一拍直接从 TaskRecord 字段采集进度；
+ *   - alert 轮询线程另处理生命周期事件：完成时投递 DOWNLOAD_COMPLETED 并请求保存续传、
+ *     阻断性错误投递 DOWNLOAD_FAILED、save_resume_data_alert 经 dw::post_resume_data 输出续传数据；
  *   - 只订阅 error / 完成 / 续传相关 alert，不处理 peer / piece / block 等细粒度事件。
  */
 
@@ -101,32 +100,32 @@ namespace dw {
             return DW_TASK_STATUS_DOWNLOADING;
         }
 
-        // 由 torrent_status 组装 EngineProgress 并经 post_progress 推入 TaskManager 内存。
-        // alert 线程消费 state_update_alert 时批量调用；naming_ready 默认 0（不更新
-        // TaskRecord），仅 storage_moved_alert 显式设 2。
-        EngineProgress make_progress(const lt::torrent_status &s, const std::string &key) {
-            EngineProgress ep;
-            ep.valid         = true;
-            ep.protocol      = DW_PROTOCOL_TORRENT;
-            ep.status        = map_status(s);
-            ep.total_size    = s.total_wanted;
-            ep.total_done    = s.total_done;
-            ep.progress      = static_cast<double>(s.progress);
-            ep.download_rate = static_cast<double>(s.download_payload_rate);
-            ep.name          = s.name;
-            ep.reason        = s.errc ? DW_REASON_NETWORK : DW_REASON_NONE;
-            ep.message       = s.errc ? s.errc.message() : std::string{};
-            ep.upload_rate   = static_cast<double>(s.upload_payload_rate);
-            ep.metadata_ready = s.has_metadata;
+        // 由 torrent_status 组装 STATUS_UPDATE 事件并经 post_engine_event 投递。
+        // alert 线程消费 state_update_alert 时批量调用。
+        EngineEvent make_status_update_event(const lt::torrent_status &s, const std::string &key) {
+            EngineEvent ev;
+            ev.type = EngineEventType::STATUS_UPDATE;
+            ev.engine_key = key;
+            ev.protocol = DW_PROTOCOL_TORRENT;
+            ev.valid = true;
+            ev.status = map_status(s);
+            ev.total_size = s.total_wanted;
+            ev.total_done = s.total_done;
+            ev.progress = static_cast<double>(s.progress);
+            ev.download_rate = static_cast<double>(s.download_payload_rate);
+            ev.upload_rate = static_cast<double>(s.upload_payload_rate);
+            ev.name = s.name;
+            ev.reason = s.errc ? DW_REASON_NETWORK : DW_REASON_NONE;
+            ev.message = s.errc ? s.errc.message() : std::string{};
             // 占位形态判据：多文件 torrent 的 name 是根目录名（占位须建目录），单文件
             // name 即文件名（占位须建空文件）。post_torrent_updates 默认
             // status_flags_t::all() 已填充 torrent_file，无需额外同步查询。
             if (s.has_metadata) {
                 if (const auto ti = s.torrent_file.lock()) {
-                    ep.multi_file = ti->num_files() > 1;
+                    ev.multi_file = ti->num_files() > 1;
                 }
             }
-            return ep;
+            return ev;
         }
 
         // 请求保存断点续传数据（异步，结果经 save_resume_data_alert 返回）。
@@ -138,23 +137,19 @@ namespace dw {
             if (!h.is_valid()) return;
             // 元数据未获取完成前不保存 resume：磁力此时仅有 infohash，
             // 落库无实际续传价值，跳过以免无意义写入 / 覆盖有效续传。
-            lt::torrent_status st;
             try {
-                st = h.status();
+                const lt::torrent_status st = h.status();
                 if (!st.has_metadata) return;
             } catch (...) {
                 return;
             }
-            // 仅下载态保存 resume：resume 存在即代表已过定名阶段，
-            // 供调度侧判断恢复时是否跳过 naming 检查。
-            if (map_status(st) != DW_TASK_STATUS_DOWNLOADING) return;
             try {
                 lt::resume_data_flags_t flags = lt::torrent_handle::save_info_dict;
                 if (!force) {
                     flags |= lt::torrent_handle::if_download_progress
-                          | lt::torrent_handle::if_config_changed
-                          | lt::torrent_handle::if_state_changed
-                          | lt::torrent_handle::if_metadata_changed;
+                            | lt::torrent_handle::if_config_changed
+                            | lt::torrent_handle::if_state_changed
+                            | lt::torrent_handle::if_metadata_changed;
                 }
                 h.save_resume_data(flags);
             } catch (const std::exception &e) {
@@ -163,77 +158,116 @@ namespace dw {
             }
         }
 
-        // 前向声明：节点树落库辅助定义在下方（alert 事件点调用）。
-        void post_file_tree(const lt::torrent_handle &h);
+        // 前向声明：扁平文件列表构建（供 PARSED 事件使用）。
+        std::vector<dw_file_info_t> build_flat_file_list(
+            const std::shared_ptr<const lt::torrent_info> &ti);
+
+        // 从 torrent handle 构建 PARSED 事件（元数据就绪时调用）。
+        // 返回空事件表示元数据未就绪或构建失败。
+        EngineEvent build_parsed_event(const lt::torrent_handle &h) {
+            EngineEvent ev;
+            ev.type = EngineEventType::PARSED;
+            ev.protocol = DW_PROTOCOL_TORRENT;
+            if (!h.is_valid()) return ev;
+            ev.engine_key = info_hash_hex(h);
+            if (ev.engine_key.empty()) return ev;
+            try {
+                const lt::torrent_status st = h.status();
+                std::shared_ptr<const lt::torrent_info> ti;
+                ti = h.torrent_file();
+                if (!ti) return ev; // 元数据未就绪
+                ev.name = ti->name();
+                ev.save_path = st.save_path;
+                ev.multi_file = (ti->num_files() > 1) ||
+                                (ti->num_files() == 1 && ti->files().file_path(lt::file_index_t{0}).find('/') !=
+                                 std::string::npos);
+                ev.files = build_flat_file_list(ti);
+            } catch (...) {
+                ev.engine_key.clear(); // 异常时返回空事件
+            }
+            return ev;
+        }
 
         // 处理单个 alert：推模型下关注生命周期、阻断性错误与续传事件，进度由
-        // state_update_alert 推入 TaskManager 内存。文件树由引擎在事件点主动推送落表（添加成功 /
-        // 元数据就绪 / 改名收敛），判重定名决策仍归 TaskManager 调度。
+        // state_update_alert 推入 TaskManager 内存。元数据就绪经 PARSED 事件投递，
+        // 冲突检测与定名决策归 TaskManager 事件消费。
         void handle_alert(const lt::alert *a) {
             if (!a) return;
 
-            // 进度推送：A 线程触发 post_torrent_updates 后，批量 torrent_status 经此推入
-            // TaskManager 内存（持 mtx_ 极短赋值），A 线程下一拍直接读 TaskRecord 字段。
+            // 进度推送：批量 torrent_status 经 STATUS_UPDATE 事件投递到 B 线程。
             if (const auto *su = lt::alert_cast<lt::state_update_alert>(a)) {
                 for (const lt::torrent_status &s: su->status) {
                     const std::string key = info_hash_hex(s.handle);
                     if (key.empty()) continue;
-                    EngineProgress ep = make_progress(s, key);
-                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
+                    EngineEvent ev = make_status_update_event(s, key);
+                    post_engine_event(std::move(ev));
                 }
                 return;
             }
 
-            // 任务添加成功（.torrent / 磁力 / 续传恢复统一入口）：已有元数据则立即
-            // 推送文件树落表；磁力此刻无元数据，post_file_tree 内部自然跳过，
-            // 待 metadata_received 到达后推送。
+            // 任务添加成功（.torrent / 续传恢复）：已有元数据则投递 PARSED 事件；
+            // 磁力此刻无元数据，事件构建自然跳过，待 metadata_received 到达后投递。
             if (const auto *at = lt::alert_cast<lt::add_torrent_alert>(a)) {
-                if (!at->error) post_file_tree(at->handle);
+                if (!at->error) {
+                    EngineEvent ev = build_parsed_event(at->handle);
+                    if (!ev.engine_key.empty()) {
+                        post_engine_event(std::move(ev));
+                    }
+                }
                 return;
             }
-            // 磁力元数据就绪：推送文件树落表（先删后存，存在即覆盖）。
+            // 磁力元数据就绪：投递 PARSED 事件（含名称、路径、文件列表）。
             if (const auto *mr = lt::alert_cast<lt::metadata_received_alert>(a)) {
-                post_file_tree(mr->handle);
+                EngineEvent ev = build_parsed_event(mr->handle);
+                if (!ev.engine_key.empty()) {
+                    post_engine_event(std::move(ev));
+                }
                 return;
             }
-            // 下载完成：请求保存一次续传数据（文件已在最终位置，做种原地继续，无移出环节）。
+            // 下载完成：投递 DOWNLOAD_COMPLETED 事件，并请求保存一次续传数据。
             if (const auto *tf = lt::alert_cast<lt::torrent_finished_alert>(a)) {
+                const std::string key = info_hash_hex(tf->handle);
+                if (!key.empty()) {
+                    EngineEvent ev;
+                    ev.type = EngineEventType::DOWNLOAD_COMPLETED;
+                    ev.engine_key = key;
+                    ev.protocol = DW_PROTOCOL_TORRENT;
+                    post_engine_event(std::move(ev));
+                }
                 request_save_resume(tf->handle);
                 return;
             }
-            // 任务错误（阻断性：转入 error state 时自动推送）：直接推入终态，
-            // A 线程下一拍立即感知，不必等下一轮 post_torrent_updates 刷新。
+            // 任务错误（阻断性）：投递 DOWNLOAD_FAILED 事件。
             if (const auto *te = lt::alert_cast<lt::torrent_error_alert>(a)) {
                 const std::string key = info_hash_hex(te->handle);
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 任务错误 info_hash=%s msg=%s",
                             key.c_str(), te->error.message().c_str());
                 if (!key.empty()) {
-                    EngineProgress ep;
-                    ep.valid = true;
-                    ep.protocol = DW_PROTOCOL_TORRENT;
-                    ep.status = DW_TASK_STATUS_ERROR;
-                    ep.reason = DW_REASON_NETWORK;
-                    ep.message = te->error.message();
-                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
+                    EngineEvent ev;
+                    ev.type = EngineEventType::DOWNLOAD_FAILED;
+                    ev.engine_key = key;
+                    ev.protocol = DW_PROTOCOL_TORRENT;
+                    ev.reason = DW_REASON_NETWORK;
+                    ev.message = te->error.message();
+                    post_engine_event(std::move(ev));
                 }
                 return;
             }
-            // 存储读写失败（阻断性：libtorrent 自动暂停任务并转入 error state）：
-            // 以存储归因直接推入终态。
+            // 存储读写失败（阻断性）：投递 DOWNLOAD_FAILED 事件。
             if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
                 const std::string key = info_hash_hex(fe->handle);
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] 存储错误 file=%s msg=%s",
                             fe->filename(), fe->error.message().c_str());
                 if (!key.empty()) {
-                    EngineProgress ep;
-                    ep.valid = true;
-                    ep.protocol = DW_PROTOCOL_TORRENT;
-                    ep.status = DW_TASK_STATUS_ERROR;
-                    ep.reason = DW_REASON_ERROR;
-                    ep.message = (fe->error.value() == ENOSPC)
+                    EngineEvent ev;
+                    ev.type = EngineEventType::DOWNLOAD_FAILED;
+                    ev.engine_key = key;
+                    ev.protocol = DW_PROTOCOL_TORRENT;
+                    ev.reason = DW_REASON_ERROR;
+                    ev.message = (fe->error.value() == ENOSPC)
                                      ? "存储空间不足"
                                      : "存储异常，无法保存文件";
-                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
+                    post_engine_event(std::move(ev));
                 }
                 return;
             }
@@ -254,39 +288,35 @@ namespace dw {
                 }
                 return;
             }
-            // 定名包层迁移完成：handle 内部 save_path 已指向包层目录。包层不改
-            // 文件内部相对路径，文件树无需重推。
-            // 补推一帧 naming_ready=2，A 线程立即观测迁移收敛、放行后续调度。
+            // 存储路径迁移完成：投递 PARSED 事件（携带最新 save_path）。
             if (const auto *sm = lt::alert_cast<lt::storage_moved_alert>(a)) {
                 const std::string key = info_hash_hex(sm->handle);
                 if (key.empty()) return;
-                try {
-                    EngineProgress ep = make_progress(sm->handle.status(), key);
-                    ep.naming_ready = 2; // 显式标记迁移完成
-                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
-                } catch (...) {}
-                DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[OK] 包层迁移完成: -> '%s'",
+                DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "[OK] 存储迁移完成: -> '%s'",
                             sm->storage_path());
+                EngineEvent ev;
+                ev.type = EngineEventType::PARSED;
+                ev.engine_key = key;
+                ev.protocol = DW_PROTOCOL_TORRENT;
+                ev.save_path = sm->storage_path();
+                post_engine_event(std::move(ev));
                 return;
             }
-            // 迁移失败：零字节落盘时段仅创建目标目录可涉磁盘（mkdir 失败等极端情形）。
-            // 不可放行继续下载——包层名已落库为凭证，而 handle 内部 save_path 仍是原路径，
-            // 放行会令记录路径与实际落盘路径分叉，且与占用该名字的任务直接相撞。
-            // 故推入 ERROR 终态，交由用户重试。
+            // 迁移失败：投递 DOWNLOAD_FAILED 事件。
             if (const auto *smf = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
                 const std::string key = info_hash_hex(smf->handle);
                 if (key.empty()) return;
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "[ERROR] move_storage 失败: %s",
                             smf->error.message().c_str());
-                {
-                    EngineProgress ep;
-                    ep.valid = true;
-                    ep.protocol = DW_PROTOCOL_TORRENT;
-                    ep.status = DW_TASK_STATUS_ERROR;
-                    ep.reason = DW_REASON_ERROR;
-                    ep.message = "保存路径设置失败";
-                    post_progress(key.c_str(), DW_PROTOCOL_TORRENT, ep);
-                }
+                EngineEvent ev;
+                ev.type = EngineEventType::DOWNLOAD_FAILED;
+                ev.engine_key = key;
+                ev.protocol = DW_PROTOCOL_TORRENT;
+                ev.reason = DW_REASON_ERROR;
+                ev.message = (smf->error.value() == ENOSPC)
+                                 ? "存储空间不足"
+                                 : "存储异常";
+                post_engine_event(std::move(ev));
                 return;
             }
             // 其余 alert（含 save_resume_data_failed 等）忽略
@@ -344,32 +374,32 @@ namespace dw {
             for (int i = 0; i < file_count; ++i) {
                 const lt::file_index_t idx{i};
                 (*out_files)[i].index = i;
-                (*out_files)[i].type = 1;        // 扁平列表均为文件
-                (*out_files)[i].parent_id = -1;  // 扁平列表无树层级
                 const std::string path = fs.file_path(idx);
                 (*out_files)[i].name = static_cast<char *>(std::malloc(path.size() + 1));
                 if ((*out_files)[i].name) {
                     std::memcpy((*out_files)[i].name, path.c_str(), path.size() + 1);
                 }
                 (*out_files)[i].size = fs.file_size(idx);
+                (*out_files)[i].offset = fs.file_offset(idx);
+                const std::string ext = dw::utils::file_extension(path);
+                (*out_files)[i].ext = ext.empty() ? nullptr : static_cast<char *>(std::malloc(ext.size() + 1));
+                if ((*out_files)[i].ext) {
+                    std::memcpy(const_cast<char*>((*out_files)[i].ext), ext.c_str(), ext.size() + 1);
+                }
             }
             *out_count = file_count;
             return 0;
         }
 
-        // 依据 torrent_info 的文件相对路径构建显式节点树（文件夹 + 文件）。
-        // 每个文件路径按 '/'、'\\' 拆分：末段为文件，前置各段为文件夹（去重复用）；
-        // prefix 为父路径累积（含尾部分隔符，根层空串）；文件夹 size 聚合后代文件字节。
-        // 调用时机为 alert 事件点（添加成功 / 元数据就绪 / 改名收敛），file_storage
-        // 反映当下命名；改名收敛后重推即覆盖旧名记录（落表为先删后存）。
+        // 扁平文件列表：每个文件一行，name 为相对路径（含目录），不建文件夹节点。
         // 返回的各节点字符串字段由 std::malloc 分配，调用方负责释放。
-        std::vector<dw_file_info_t> build_node_tree(
-                const std::shared_ptr<const lt::torrent_info> &ti) {
-            std::vector<dw_file_info_t> nodes;
+        std::vector<dw_file_info_t> build_flat_file_list(
+            const std::shared_ptr<const lt::torrent_info> &ti) {
+            std::vector<dw_file_info_t> files;
             const lt::file_storage &fs = ti->files();
             const int file_count = fs.num_files();
-            if (file_count <= 0) return nodes;
-            const int64_t now = now_unix_ms();
+            if (file_count <= 0) return files;
+            files.reserve(file_count);
 
             auto dup = [](const std::string &s) -> char * {
                 auto *p = static_cast<char *>(std::malloc(s.size() + 1));
@@ -377,109 +407,22 @@ namespace dw {
                 return p;
             };
 
-            // 累积路径（如 "root/sub"）-> 该文件夹节点在 nodes 中的下标，用于去重。
-            std::unordered_map<std::string, size_t> dir_index;
-            int64_t next_node_id = 1;
-
             for (int i = 0; i < file_count; ++i) {
                 const lt::file_index_t idx{i};
                 const std::string path = fs.file_path(idx);
-                // 拆分为路径段
-                std::vector<std::string> comps;
-                size_t start = 0;
-                while (start <= path.size()) {
-                    const size_t sep = path.find_first_of("/\\", start);
-                    if (sep == std::string::npos) {
-                        if (start < path.size()) comps.push_back(path.substr(start));
-                        break;
-                    }
-                    if (sep > start) comps.push_back(path.substr(start, sep - start));
-                    start = sep + 1;
-                }
-                if (comps.empty()) continue;
-
-                // 逐级创建 / 复用文件夹节点，prefix 随层级累积。
-                int64_t parent_id = -1;
-                std::string cum;      // 当前累积路径（无尾分隔符）
-                std::string prefix;   // 当前层 prefix（父路径累积，含尾分隔符）
-                for (size_t d = 0; d + 1 < comps.size(); ++d) {
-                    cum += comps[d];
-                    auto it = dir_index.find(cum);
-                    if (it == dir_index.end()) {
-                        dw_file_info_t dir{};
-                        dir.index = -1;
-                        dir.node_id = next_node_id++;
-                        dir.parent_id = parent_id;
-                        dir.type = 0;
-                        dir.size = 0;
-                        dir.status = 0;
-                        dir.created_at = now;
-                        dir.name = dup(comps[d]);
-                        dir.prefix = dup(prefix);
-                        dir.ext = nullptr;
-                        nodes.push_back(dir);
-                        dir_index[cum] = nodes.size() - 1;
-                        parent_id = dir.node_id;
-                    } else {
-                        parent_id = nodes[it->second].node_id;
-                    }
-                    cum += '/';
-                    prefix += comps[d];
-                    prefix += '/';
-                }
-
-                // 文件节点
-                const std::string &fname = comps.back();
-                dw_file_info_t file{};
-                file.index = i;
-                file.node_id = next_node_id++;
-                file.parent_id = parent_id;
-                file.type = 1;
-                file.size = fs.file_size(idx);
-                file.status = 0;
-                file.created_at = now;
-                file.name = dup(fname);
-                file.prefix = dup(prefix);
-                const std::string ext = dw::utils::file_extension(fname);
-                file.ext = ext.empty() ? nullptr : dup(ext);
-                nodes.push_back(file);
-
-                // 聚合文件大小到全部祖先文件夹（沿 parent_id 上溯）。
-                int64_t cur = parent_id;
-                while (cur >= 0) {
-                    bool matched = false;
-                    for (auto &nd: nodes) {
-                        if (nd.node_id == cur && nd.type == 0) {
-                            nd.size += file.size;
-                            cur = nd.parent_id;
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if (!matched) break;
-                }
+                dw_file_info_t f{};
+                f.index = i;
+                f.size = fs.file_size(idx);
+                f.offset = fs.file_offset(idx);
+                f.name = dup(path);
+                const std::string ext = dw::utils::file_extension(path);
+                f.ext = ext.empty() ? nullptr : dup(ext);
+                f.status = 0; // 下载中
+                f.downloaded_bytes = 0; // PARSED 时刻无 piece 下载，初始为 0
+                f.play_position_ms = 0;
+                files.push_back(f);
             }
-            return nodes;
-        }
-
-        // 事件点推送：构建节点树并经内部通道落库（无元数据时自然跳过）。
-        // 释放构建期分配的字符串。
-        void post_file_tree(const lt::torrent_handle &h) {
-            if (!h.is_valid()) return;
-            const std::string key = info_hash_hex(h);
-            if (key.empty()) return;
-            std::shared_ptr<const lt::torrent_info> ti;
-            try { ti = h.torrent_file(); } catch (...) { return; }
-            if (!ti) return;
-            std::vector<dw_file_info_t> nodes = build_node_tree(ti);
-            if (nodes.empty()) return;
-            post_task_files(key.c_str(), DW_PROTOCOL_TORRENT,
-                            nodes.data(), static_cast<int32_t>(nodes.size()));
-            for (auto &nd: nodes) {
-                std::free(nd.name);
-                std::free(nd.prefix);
-                std::free(nd.ext);
-            }
+            return files;
         }
 
         // 设置同步返回结果，message 由 malloc 分配（成功时为 nullptr）。
@@ -524,7 +467,7 @@ namespace dw {
             // 仅订阅错误、状态更新与存储（元数据就绪改名的 rename 事件），屏蔽 peer/piece/block 等细粒度事件
             pack.set_int(lt::settings_pack::alert_mask,
                          lt::alert_category::error | lt::alert_category::status
-                             | lt::alert_category::storage);
+                         | lt::alert_category::storage);
 
             int listen_port = 0;
             if (cfg) {
@@ -686,10 +629,8 @@ namespace dw {
             }
         }
 
-        // flags：两来源（磁力 / .torrent）统一 metadata-only 模式——
-        // default_dont_download 使全部文件优先级为 0（接 swarm 拿元数据、零 payload 下载），
-        // auto_managed 保持运行以拉取元数据；真正开下由 apply_file_selection 显式定型
-        // 优先级并解除 default_dont_download（RESOLVING 校验通过后由调度触发）。
+        // default_dont_download + auto_managed：接 swarm 拿元数据、零 payload 下载，
+        // 真正开下由 apply_file_selection 显式定型优先级并解除 default_dont_download。
         atp.flags = lt::torrent_flags::update_subscribe
                     | lt::torrent_flags::need_save_resume
                     | lt::torrent_flags::default_dont_download
@@ -818,8 +759,7 @@ namespace dw {
         } catch (...) { return -1; }
 
         // 零字节落盘时段（default_dont_download）move_storage 仅创建目标目录并改
-        // 内部 save_path，无数据搬移；storage_moved_alert 异步收敛后经 post_progress
-        // 推入 naming_ready=2 通知调度侧放行。
+        // 内部 save_path，storage_moved_alert 异步收敛后投递 PARSED 事件通知调度侧放行。
         try {
             h.move_storage(std::string(new_save_path));
         } catch (const std::exception &e) {
@@ -833,11 +773,12 @@ namespace dw {
     void TorrentEngine::post_updates() {
         // 节拍入口（A 线程调用）：
         //   1) post_torrent_updates：触发引擎收集变更任务状态，结果经 state_update_alert
-        //      异步回 alert 线程，由 handle_alert 调 post_progress 推入 TaskManager 内存；
+        //      异步回 alert 线程，由 handle_alert 投递 STATUS_UPDATE 事件；
         //   2) 续传检查点：对有元数据任务请求 save_resume_data（携变更门槛，无变化
         //      不产生 alert），结果经 save_resume_data_alert → post_resume_data 输出。
         if (!g_session) return;
-        try { g_session->post_torrent_updates(); } catch (...) {}
+        try { g_session->post_torrent_updates(); } catch (...) {
+        }
         std::vector<lt::torrent_handle> handles;
         try { handles = g_session->get_torrents(); } catch (...) { return; }
         for (const auto &h: handles) {
@@ -944,12 +885,14 @@ namespace dw {
     }
 
     int32_t TorrentEngine::parse_torrent_file(const char *torrent_file_path,
+                                              char **out_name,
                                               char **out_info_hash,
                                               dw_file_info_t **out_files,
                                               int32_t *out_count) {
-        if (!torrent_file_path || !out_info_hash || !out_files || !out_count) {
+        if (!torrent_file_path || !out_name || !out_info_hash || !out_files || !out_count) {
             return -1;
         }
+        *out_name = nullptr;
         *out_info_hash = nullptr;
         *out_files = nullptr;
         *out_count = 0;
@@ -961,6 +904,14 @@ namespace dw {
             return -1;
         }
 
+        // 种子名称
+        const std::string name = ti->name();
+        *out_name = static_cast<char *>(std::malloc(name.size() + 1));
+        if (!*out_name) {
+            return -1;
+        }
+        std::memcpy(*out_name, name.c_str(), name.size() + 1);
+
         // info_hash
         const lt::info_hash_t &hashes = ti->info_hashes();
         std::string info_hash_str;
@@ -970,21 +921,77 @@ namespace dw {
             info_hash_str = lt::aux::to_hex(hashes.v1);
         } else {
             DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] .torrent 文件无有效 info_hash");
+            std::free(*out_name);
+            *out_name = nullptr;
             return -1;
         }
         *out_info_hash = static_cast<char *>(std::malloc(info_hash_str.size() + 1));
         if (!*out_info_hash) {
+            std::free(*out_name);
+            *out_name = nullptr;
             return -1;
         }
         std::memcpy(*out_info_hash, info_hash_str.c_str(), info_hash_str.size() + 1);
 
         // 文件列表
         if (fill_file_list(ti, out_files, out_count) != 0) {
+            std::free(*out_name);
+            *out_name = nullptr;
             std::free(*out_info_hash);
             *out_info_hash = nullptr;
             return -1;
         }
         return 0;
+    }
+
+    // Piece→文件进度映射：从 piece bitmap 计算每个文件的已下载字节数。
+    // 处理跨 piece（首尾 piece 部分重叠文件边界）和跨文件（一个 piece 跨越两个文件）。
+    // 返回 vector 长度等于 file_count，每项为对应文件的已下载字节数。
+    static std::vector<int64_t> calc_per_file_downloaded(
+        const lt::file_storage &fs,
+        const lt::typed_bitfield<lt::piece_index_t> &pieces) {
+
+        const int file_count = fs.num_files();
+        const int64_t piece_len = fs.piece_length();
+        const int64_t total_size = fs.total_size();
+        std::vector<int64_t> result(file_count, 0);
+        if (file_count <= 0 || piece_len <= 0 || total_size <= 0) {
+            return result;
+        }
+
+        for (int i = 0; i < file_count; ++i) {
+            const lt::file_index_t idx{i};
+            const int64_t f_off = fs.file_offset(idx);
+            const int64_t f_size = fs.file_size(idx);
+            if (f_size <= 0) continue;
+
+            const int64_t f_end = f_off + f_size - 1; // 文件末字节（含）
+            const int first_piece = static_cast<int>(f_off / piece_len);
+            const int last_piece = static_cast<int>(f_end / piece_len);
+
+            int64_t downloaded = 0;
+            for (int p = first_piece; p <= last_piece; ++p) {
+                const lt::piece_index_t pi{p};
+                if (pi >= pieces.end_index() || !pieces.get_bit(pi)) {
+                    continue; // 该 piece 未下载
+                }
+                // piece 在全局字节流的窗口
+                const int64_t piece_start = static_cast<int64_t>(p) * piece_len;
+                int64_t piece_end = piece_start + piece_len - 1;
+                // 最后一个 piece 可能不足 piece_len
+                if (piece_end >= total_size) {
+                    piece_end = total_size - 1;
+                }
+                // 裁剪到文件窗口（处理跨文件边界）
+                const int64_t seg_start = (piece_start > f_off) ? piece_start : f_off;
+                const int64_t seg_end = (piece_end < f_end) ? piece_end : f_end;
+                if (seg_end >= seg_start) {
+                    downloaded += seg_end - seg_start + 1;
+                }
+            }
+            result[i] = downloaded;
+        }
+        return result;
     }
 
     int32_t TorrentEngine::get_file_list(const char *task_id,
@@ -1014,10 +1021,25 @@ namespace dw {
             return -1;
         }
         const int32_t ret = fill_file_list(ti, out_files, out_count);
-        if (ret == 0) {
-            DW_LOG_TASK(DW_LOG_INFO, task_id, "[EVENT] get_file_list 成功 count=%d", *out_count);
+        if (ret != 0) {
+            return ret;
         }
-        return ret;
+
+        // 运行时查询：从 piece bitmap 计算每个文件的已下载字节数
+        try {
+            const lt::torrent_status st = handle.status(lt::torrent_handle::query_pieces);
+            const lt::file_storage &fs = ti->files();
+            const auto downloaded = calc_per_file_downloaded(fs, st.pieces);
+            for (int32_t i = 0; i < *out_count && i < static_cast<int32_t>(downloaded.size()); ++i) {
+                (*out_files)[i].downloaded_bytes = downloaded[i];
+            }
+        } catch (const std::exception &e) {
+            DW_LOG_TASK(DW_LOG_ERROR, task_id, "[ERROR] get_file_list 计算进度失败: %s", e.what());
+            // 进度计算失败不影响文件列表返回，downloaded_bytes 保持 0
+        }
+
+        DW_LOG_TASK(DW_LOG_INFO, task_id, "[EVENT] get_file_list 成功 count=%d", *out_count);
+        return 0;
     }
 
     std::vector<dw_byte_range_t> TorrentEngine::get_file_ranges(const char *task_id,
@@ -1046,7 +1068,7 @@ namespace dw {
                 return ranges;
             }
             const lt::file_index_t fidx{file_index};
-            const int64_t f_off  = fs.file_offset(fidx);
+            const int64_t f_off = fs.file_offset(fidx);
             const int64_t f_size = fs.file_size(fidx);
             const int32_t piece_len = fs.piece_length();
             if (f_size <= 0 || piece_len <= 0) {
@@ -1054,7 +1076,7 @@ namespace dw {
             }
             const int64_t f_end = f_off + f_size - 1; // 文件末字节（含，torrent 全局偏移）
             const int first_piece = static_cast<int>(f_off / piece_len);
-            const int last_piece  = static_cast<int>(f_end / piece_len);
+            const int last_piece = static_cast<int>(f_end / piece_len);
 
             // have 位图：仅整块 have 的 piece 计入（bit 置位即该 piece 已校验完成）。
             const lt::torrent_status st = handle.status(lt::torrent_handle::query_pieces);
@@ -1067,12 +1089,12 @@ namespace dw {
                 }
                 // piece 在 torrent 全局的字节窗口，裁剪到文件窗口后转文件内相对偏移
                 const int64_t piece_start = static_cast<int64_t>(p) * piece_len;
-                const int64_t piece_end   = piece_start + piece_len - 1;
+                const int64_t piece_end = piece_start + piece_len - 1;
                 const int64_t seg_start = (piece_start > f_off) ? piece_start : f_off;
-                const int64_t seg_end   = (piece_end   < f_end)  ? piece_end   : f_end;
+                const int64_t seg_end = (piece_end < f_end) ? piece_end : f_end;
                 if (seg_end < seg_start) continue;
                 const int64_t rel_start = seg_start - f_off;
-                const int64_t rel_end   = seg_end   - f_off;
+                const int64_t rel_end = seg_end - f_off;
                 // 合并连续段：与上一段首尾相接则延展
                 if (!ranges.empty() && ranges.back().end + 1 == rel_start) {
                     ranges.back().end = rel_end;
@@ -1119,7 +1141,7 @@ namespace dw {
                 return 0;
             }
             const lt::file_index_t fidx{file_index};
-            const int64_t f_off  = fs.file_offset(fidx);
+            const int64_t f_off = fs.file_offset(fidx);
             const int64_t f_size = fs.file_size(fidx);
             const int32_t piece_len = fs.piece_length();
             if (f_size <= 0 || piece_len <= 0) {
@@ -1127,10 +1149,10 @@ namespace dw {
             }
             const int64_t off = (byte_offset > 0) ? byte_offset : 0;
             const int start_piece = static_cast<int>((f_off + off) / piece_len);
-            const int last_piece  = static_cast<int>((f_off + f_size - 1) / piece_len);
+            const int last_piece = static_cast<int>((f_off + f_size - 1) / piece_len);
             // readahead 窗口 N 片，按递增 deadline 提优（越靠前越紧急）。
             constexpr int kReadaheadPieces = 8;
-            constexpr int kDeadlineStepMs  = 1000;
+            constexpr int kDeadlineStepMs = 1000;
             for (int i = 0; i < kReadaheadPieces; ++i) {
                 const int p = start_piece + i;
                 if (p > last_piece) break;
@@ -1198,8 +1220,8 @@ namespace dw {
             // 添加路径的初始优先级不同，统一覆写为确认意图，消除路径差异。
             // count<=0 = 全部默认优先级；count>0 = 选中默认、其余不下载。
             std::vector<lt::download_priority_t> prio(
-                    static_cast<size_t>(n > 0 ? n : 0),
-                    count > 0 ? lt::dont_download : lt::default_priority);
+                static_cast<size_t>(n > 0 ? n : 0),
+                count > 0 ? lt::dont_download : lt::default_priority);
             if (count > 0 && file_indexes) {
                 for (int32_t i = 0; i < count; ++i) {
                     if (file_indexes[i] >= 0 && file_indexes[i] < n) {

@@ -6,10 +6,10 @@
  *   - 注册表仅常驻排队 / 活跃任务（DOWNLOADING/QUEUED），
  *     暂停 / 完成 / 错误任务落库后从内存移除，按需经 add/resume/list 回读；
  *     引擎仅持有当前活跃任务的运行时句柄；
- *   - 进度推模型：各引擎线程经 on_progress 将进度写入 TaskRecord 内存（持 mtx_ < 1us），
- *     A 线程按固定周期遍历读取并转发上层；断点续传经 on_resume_data 汇入持久化（触发权下沉引擎：
- *     HTTP 由 worker 线程随进度推进自推，BT 由 save_resume_data_alert 事件驱动，
- *     检查点随 post_updates 每拍携变更门槛请求，无变化不产生 alert）；
+ *   - 事件驱动模型：引擎经 post_engine_event 投递事件（STATUS_UPDATE/PARSED/DOWNLOAD_FAILED/
+ *     DOWNLOAD_COMPLETED），B 线程消费并更新 TaskRecord 内存，A 线程按固定周期读取并转发上层；
+ *     断点续传经 on_resume_data 汇入持久化（触发权下沉引擎：HTTP 由 worker 线程随进度推进自推，
+ *     BT 由 save_resume_data_alert 事件驱动，检查点随 post_updates 每拍携变更门槛请求，无变化不产生 alert）；
  *   - 并发准入：活跃任务数 < max_concurrent_downloads 才准入下载，其余置 QUEUED；
  *   - 调度纯事件驱动：状态跃迁释放许可 / 新增 / 恢复 / 调整优先级时唤醒调度线程，
  *     调度线程另按固定周期刷写脏进度到库（持久化与调度职责分离）；
@@ -33,9 +33,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include <boost/asio.hpp>
+
 namespace dw {
     class IDownloadEngine;
-    struct EngineProgress;
+    struct EngineEvent;
 
     /**
      * 任务中枢单例（由 dw_downloader 持有）。
@@ -103,6 +105,14 @@ namespace dw {
         /// 读取某文件已下载区间快照（任务未加载进引擎时的播放兜底）；无记录返回空 vector。
         std::vector<dw_byte_range_t> load_segments(int64_t id, int32_t file_index);
 
+        // ---- 分段内存缓存（STATUS_UPDATE 事件时从引擎拉取并缓存） ----
+
+        /// 读取缓存的已下载区间（代理热路径，无需查引擎或 DB）；未缓存返回空 vector。
+        std::vector<dw_byte_range_t> get_cached_segments(int64_t id, int32_t file_index);
+
+        /// 查询任务当前状态（mtx_ 保护）；任务不存在返回 -1。
+        int32_t get_task_status(int64_t id);
+
         // ---- 回调拦截（post_resume_data 调用） ----
         /// 持久化 resume_data；命中内存记录返回其自增 id（供上层回调），非激活任务丢弃返回 0。
         int64_t on_resume_data(const char *engine_key, dw_protocol_t proto, const uint8_t *data, size_t size);
@@ -112,10 +122,10 @@ namespace dw {
         void on_task_files(const char *engine_key, dw_protocol_t proto,
                            const dw_file_info_t *files, int32_t count);
 
-        // ---- 回调拦截（post_progress 调用） ----
-        /// 引擎进度推送：写入 TaskRecord 内存字段（持 mtx_ 极短时间），A 线程节拍读取。
-        /// 任务不在内存中时静默丢弃（进度为瞬态无需落库）。
-        void on_progress(const char *engine_key, dw_protocol_t proto, const EngineProgress &ep);
+        // ---- 引擎事件消费（Boost.Asio 事件投递入口） ----
+        /// 引擎 alert 经 Boost.Asio io_context::post 投递到此，B 线程消费。
+        /// 事件经值语义拷贝后投递，线程安全。
+        void on_engine_event(EngineEvent event);
 
         // ---- 唯一名定名（add 内部与引擎 request_unique_name 上调共用） ----
         /// 持 mtx_ 抢占唯一名：以磁盘为唯一判重真相源（不查库），候选名未被占用即立即
@@ -139,13 +149,18 @@ namespace dw {
         /// 从数据库加载任务的文件列表（key 为自增 id）。
         std::vector<dw_file_info_t> load_files(int64_t id);
 
+        // ---- 内部访问器（供同库模块经持锁快照访问持久化层） ----
+
+        /// 返回内部互斥锁引用，供调用方持锁期间安全访问 store_。
+        std::mutex& get_mutex() { return mtx_; }
+        /// 返回持久化存储层引用（调用方须持 mtx_ 保证线程安全）。
+        TaskStore& get_store() { return store_; }
+
     private:
-        // RESOLVING 校验动作（下载前统一关卡）：A 线程锁内收集，锁外执行引擎调用，
-        // 通过后回锁迁 DOWNLOADING（未通过保持 RESOLVING 下拍再查）。
+        // 校验动作（下载前统一关卡）：A 线程锁内收集，锁外执行引擎调用，
+        // 通过后回锁迁 DOWNLOADING（未通过保持原态下拍再查）。
         struct ResolveAction {
-            TaskRecord rec; // 锁内记录快照（HTTP 已含定名后 filename，供 start_engine_task）
-            bool naming_done; // 定名凭证（filename 非空即已判重定名）：BT 跳过判重定名编排
-            bool multi_file; // BT 内容是否多文件：定名占位形态判据（true=根目录名建目录）
+            TaskRecord rec; // 锁内记录快照
             std::vector<uint8_t> resume; // HTTP 续传存档（BT 引擎侧 add 时已装载，恒空）
         };
 
@@ -159,6 +174,9 @@ namespace dw {
 
         // B 线程（重载）：较长节拍或被 schedule 唤醒，持锁完成持久化 / 区间快照 / 终态注销 / 准入，随后锁外 sweep。
         void maintenance_loop();
+
+        // B 线程消费单个引擎事件（PARSED/STORAGE_MOVED/STORAGE_MOVE_FAILED）。
+        void consume_engine_event(EngineEvent event);
 
         // 待删文件项：remove 登记，B 线程在引擎确认资源释放后删除。
         struct PendingFileDelete {
@@ -217,7 +235,8 @@ namespace dw {
 
         // 将活引擎的已下载连续区间快照落库（HTTP 单文件 index=0，BT 遍历已选 file_indexes）；
         // 供任务未加载进引擎时的播放兜底。假定已持 mtx_，仅短暂访问引擎自有锁，无死锁。
-        void snapshot_segments_locked(const TaskRecord &task_record);
+        // 同时更新 segment_cache_ 内存缓存，并检查文件/任务级完成条件。
+        void snapshot_segments_locked(TaskRecord &task_record);
 
         std::mutex mtx_;
         std::condition_variable cv_;
@@ -225,6 +244,13 @@ namespace dw {
         std::unordered_map<std::string, int64_t> url_index_; // HTTP 自然键反查：url → id
         std::unordered_map<std::string, int64_t> info_hash_index_; // BT 自然键反查：info_hash → id
         std::unordered_map<std::string, PendingFileDelete> pending_deletes_; // 待删文件：engine key → 项（mtx_ 保护）
+
+        // Boost.Asio 事件队列：引擎 alert 经此投递，B 线程 maintenance_loop 中 poll 消费。
+        boost::asio::io_context event_ioc_;
+
+        // 分段内存缓存：task_id → (file_index → ranges)。STATUS_UPDATE 事件时从引擎拉取更新，
+        // dw_get_file_ranges 优先读此缓存（下载中任务不回退 DB，避免过时快照误导代理）。
+        std::map<int64_t, std::map<int32_t, std::vector<dw_byte_range_t>>> segment_cache_;
 
         TaskStore store_; // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
         std::thread worker_; // A 线程：轻量采集 + 回调

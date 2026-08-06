@@ -65,8 +65,10 @@ typedef enum {
     DW_TASK_STATUS_COMPLETED   = 2, /**< 已完成（终态）。 */
     DW_TASK_STATUS_ERROR       = 3, /**< 已失败（终态）。 */
     DW_TASK_STATUS_QUEUED      = 4, /**< 排队中（等待调度）。 */
-    DW_TASK_STATUS_RESOLVING   = 5, /**< 解析中（BT 等待元数据 / 唯一名定名，占用下载名额；
-                                         就绪后按确认位迁 DOWNLOADING 或回落 PAUSED）。 */
+    DW_TASK_STATUS_RESOLVING   = 5, /**< 解析中（BT 等待元数据，占用下载名额；
+                                         元数据就绪后经事件驱动迁 PARSED）。 */
+    DW_TASK_STATUS_PARSED      = 6, /**< 解析完成（元数据就绪 + 冲突检测通过，
+                                         文件列表已落库；调度准入后迁 DOWNLOADING）。 */
 } dw_task_status_t;
 
 /**
@@ -134,27 +136,21 @@ typedef void (*dw_log_cb)(dw_log_level_t  level,
 /* ------------------------------------------------------------------ */
 
 /**
- * 单个文件 / 文件夹节点信息（BT 多文件种子）。
+ * 单个文件信息（扁平文件列表）。
  *
- * 两种用途共用同一结构：
- *   1) 解析 / 探测的扁平文件列表（dw_parse_torrent_file / dw_get_file_list）：
- *      仅 index / name（相对路径）/ size 有效，节点字段为 0 / NULL；
- *   2) 落库后的显式节点树（dw_load_task_files）：文件夹与文件均建节点，
- *      调用方按 parent_id 组树，name 为纯节点名（非完整路径）。
- * name / prefix / ext 均由库分配，统一经 dw_file_list_free 释放。
+ * name 为相对路径（含目录），ext 为后缀（不含点）。
+ * name / ext 由库分配，统一经 dw_file_list_free 释放。
  * HTTP 任务不使用。
  */
 typedef struct dw_file_info {
-    int32_t  index;      /**< libtorrent 文件索引（用于设置优先级）；文件夹节点为 -1。 */
-    char*    name;       /**< 节点名（文件含后缀 / 文件夹名）；扁平列表下为相对路径。 */
-    int64_t  size;       /**< 文件字节数；文件夹为后代文件聚合和。 */
-    int64_t  node_id;    /**< 任务内节点序号（组树用）；扁平列表为 0。 */
-    int64_t  parent_id;  /**< 父节点 node_id；根节点为 -1。 */
-    int32_t  type;       /**< 节点类型：0=文件夹，1=文件。 */
-    char*    prefix;     /**< 父路径累积（根层空串，含尾部分隔符），免递归拼路径；可为 NULL。 */
-    char*    ext;        /**< 后缀（不含点，如 mkv）；文件夹为 NULL。 */
-    int32_t  status;     /**< 文件状态：0=下载中，1=磁盘已删除，2=完成正常；文件夹恒 0。 */
-    int64_t  created_at; /**< 建节点时间戳（毫秒），仅用于目录内排序。 */
+    int32_t  index;      /**< libtorrent 文件索引（用于设置优先级）。 */
+    char*    name;       /**< 相对路径（含目录）。 */
+    int64_t  size;       /**< 文件字节数。 */
+    char*    ext;        /**< 后缀（不含点，如 mkv）；可为 NULL。 */
+    int32_t  status;     /**< 文件状态：0=下载中，1=磁盘已删除，2=完成正常。 */
+    int64_t  offset;     /**< 文件在 torrent 全局字节流中的起始偏移（HTTP 单文件为 0）。 */
+    int64_t  downloaded_bytes; /**< 已下载字节数（BT 从 piece bitmap 推算）。 */
+    int64_t  play_position_ms; /**< 播放进度（毫秒）。 */
 } dw_file_info_t;
 
 /* ------------------------------------------------------------------ */
@@ -194,8 +190,8 @@ typedef struct dw_progress {
     const char*      info_hash;        /**< 种子 info_hash：BT 任务的识别键与展示；HTTP 为空串。 */
     dw_protocol_t    protocol;         /**< 协议类型。 */
     const char*      name;             /**< 任务显示名称。 */
-    const char*      output_path;      /**< 权威保存目录 save_path（不含包层与文件名）；
-                                                有效落盘目录 = output_path[/wrap_dir]。 */
+    const char*      output_path;      /**< 权威保存目录 save_path（已含包层目录，冲突时直接追加）。
+                                                有效落盘目录 = output_path。 */
     const char*      filename;         /**< 目标文件名（不含目录）。 */
     int64_t          total_size;       /**< 总大小（字节）；-1=未知。 */
     int64_t          total_done;       /**< 已完成字节；-1=未知。 */
@@ -222,11 +218,6 @@ typedef struct dw_progress {
 
     int64_t          id;               /**< 任务自增 id：上层交互主键，由库内回填；
                                             url / info_hash 为引擎内部识别键与展示数据。 */
-
-    /* ===== 重名包层（追加，保持既有字段偏移） ===== */
-
-    const char*      wrap_dir;         /**< 重名包层目录名（原名(n)）；未冲突为空串。
-                                            物理路径 = output_path/wrap_dir/filename。 */
 } dw_progress_t;
 
 /* ------------------------------------------------------------------ */
@@ -362,8 +353,6 @@ typedef struct dw_task_snapshot {
     int32_t          priority;     /**< 队列优先级。 */
     int64_t          created_at;   /**< 创建时间（Unix 毫秒）。 */
     int64_t          id;           /**< 任务自增 id（上层交互主键）。 */
-    char*            wrap_dir;     /**< 重名包层目录名（原名(n)）；未冲突为空串。
-                                        物理路径 = save_path/wrap_dir/name。 */
 } dw_task_snapshot_t;
 
 /* ================================================================== */
@@ -438,7 +427,7 @@ DW_API void dw_set_log_callback(dw_log_cb cb);
  * 添加单个下载任务。
  *
  * 文件名不接受外部指定（params.filename 被忽略）：库内以磁盘为唯一真相源判重定名，
- * 结果经进度回调的 filename / wrap_dir 回报。
+ * 结果经进度回调的 filename / output_path 回报。
  *
  * @param protocol    协议类型。
  * @param params      任务参数指针，不可为 NULL。
@@ -539,15 +528,17 @@ DW_API int dw_set_file_priority(int64_t id,
 /**
  * 本地解析 .torrent 文件（不创建任务、不依赖 session）。
  *
- * 用于添加任务前获取文件列表，供前端展示文件选择对话框。
+ * 用于添加任务前获取种子名称、info_hash 与文件列表，供前端展示文件选择对话框。
  *
  * @param torrent_file_path  .torrent 文件路径，不可为 NULL。
+ * @param out_name           输出：堆分配的种子名称（调用者 dw_free 释放）。
  * @param out_info_hash      输出：堆分配的 info_hash hex 字符串（调用者 dw_free 释放）。
  * @param out_files          输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
  * @param out_count          输出：文件数量。
  * @return                   0=成功，-1=失败。
  */
 DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
+                                     char**           out_name,
                                      char**           out_info_hash,
                                      dw_file_info_t** out_files,
                                      int32_t*         out_count);
@@ -573,16 +564,16 @@ DW_API int32_t dw_get_file_list(int64_t          id,
 /**
  * 查询单文件当前已下载字节区间（已合并连续段）。
  *
- * torrent：由 have 位图裁剪到文件窗口后合并（仅整块 have 的 piece 计入）；
- * HTTP：由现有 parts 合并（file_index 恒 0）。
- * 依赖元数据就绪；未就绪返回空数组（*out_count=0、*out_ranges=NULL）。
+ * 优先读 wrapper 内存缓存（B 线程周期从引擎拉取更新），缓存未命中时：
+ *   - 下载中任务（DOWNLOADING/RESOLVING）：返回空 + 状态码 1（代理应等待）；
+ *   - 非下载中任务：回退 DB 快照（静态数据，不会增长）。
  *
- * @param id          任务自增 id；库内按 id 回读引擎键后分发。
+ * @param id          任务自增 id。
  * @param file_index  文件索引（HTTP 恒 0）。
- * @param out_ranges  输出：堆分配的区间数组（调用者 dw_byte_range_free 释放）；
- *                    无区间时为 NULL，不可为 NULL 入参。
- * @param out_count   输出：区间数量，不可为 NULL。
- * @return            0=成功（含空结果），-1=失败（任务不存在 / 参数非法）。
+ * @param out_ranges  输出：堆分配的区间数组（调用者 dw_byte_range_free 释放）；无区间时为 NULL。
+ * @param out_count   输出：区间数量。
+ * @return            0=成功且有数据，1=成功但无数据（下载中，应等待重试），
+ *                    2=成功但无数据（非下载中，不应等待），-1=失败。
  */
 DW_API int32_t dw_get_file_ranges(int64_t           id,
                                   int32_t           file_index,
@@ -596,6 +587,23 @@ DW_API int32_t dw_get_file_ranges(int64_t           id,
  * @param count   数组长度。
  */
 DW_API void dw_byte_range_free(dw_byte_range_t* ranges, int32_t count);
+
+/**
+ * 查询任务指定文件的物理路径与总大小（边下边播代理用）。
+ *
+ * 按 save_path/filename 拼接物理路径（save_path 已含包层目录）；
+ * BT 多文件另经 task_files 表按 file_index 查 name（name 已含完整相对路径）。
+ *
+ * @param id           任务自增 id。
+ * @param file_index   文件索引（HTTP 恒 0）。
+ * @param out_path     输出：堆分配路径字符串（调用者 dw_free 释放）；失败时为 NULL。
+ * @param out_size     输出：文件总字节数；未知时为 -1。
+ * @return             0=成功，-1=失败（任务不存在 / 参数非法）。
+ */
+DW_API int32_t dw_get_task_file_info(int64_t id,
+                                     int32_t file_index,
+                                     char**  out_path,
+                                     int64_t* out_size);
 
 /**
  * 设置任务内多个文件的下载优先级（任务内文件级优先）。
@@ -617,12 +625,13 @@ DW_API int32_t dw_set_file_priorities(int64_t             id,
                                       dw_submit_result_t* out_result);
 
 /**
- * 确认 BT 任务的文件选择（RESOLVING 状态机的用户确认入口）。
+ * 修改/确认 BT 任务的文件选择。
  *
- * 落库确认位与文件选择意图（跨重启有效），并将任务重新入队交调度线程处理：
- * 调度准入后任务进入 RESOLVING（占名额），待元数据与唯一名定名均就绪时
- * 按确认意图应用文件优先级并迁 DOWNLOADING；不阻塞等待元数据。
- * 已在 RESOLVING / DOWNLOADING 的任务：仅更新意图，就绪判定 / 优先级应用由调度拍处理。
+ * 落库文件选择意图（跨重启有效）：
+ * - QUEUED / RESOLVING：仅落库，调度准入时取最新选择；
+ * - DOWNLOADING：锁外立即应用新选择；
+ * - PAUSED / ERROR：重置入队等待准入；
+ * - COMPLETED：仅记录，不重启任务。
  *
  * HTTP 为 no-op（单文件无选择语义），返回 DW_REASON_NONE。
  *

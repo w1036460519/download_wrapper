@@ -74,6 +74,8 @@ public:
     void delete_task_files(int64_t id);
     /// 任务级 0→2 传播：将全部文件节点置为完成正常（不触碰已删除态）。
     void mark_task_files_completed(int64_t id);
+    /// 单文件完成标记：将指定 (task_id, file_index) 的文件节点置为完成（幂等，已删除态不触碰）。
+    void mark_file_completed(int64_t id, int32_t file_index);
 
     // ---- 边下边播缓存 ----
 
