@@ -69,7 +69,7 @@ namespace dw {
 
     int32_t HttpEngine::init(const dw_config_t *cfg) {
         if (!cfg) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP init 失败: cfg 为空");
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP init 失败: cfg 为空");
             return -1;
         }
 
@@ -77,7 +77,7 @@ namespace dw {
         apply_config(cfg);
 
         if (!ensure_running()) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP init 失败: curl_global_init 失败");
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP init 失败: curl_global_init 失败");
             return -1;
         }
 
@@ -126,12 +126,12 @@ namespace dw {
     int32_t HttpEngine::add_task(const dw_task_params_t *params,
                                  dw_submit_result_t *out_result) {
         if (!params || !out_result) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP add_task 失败: 入参为空 params=%p out_result=%p",
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP add_task 失败: 入参为空 params=%p out_result=%p",
                        static_cast<const void *>(params), static_cast<void *>(out_result));
             return -1;
         }
         DW_LOG_TASK(DW_LOG_DEBUG, params->url ? params->url : "",
-                    "[EVENT] HTTP add_task 进入");
+                    "HTTP add_task 进入");
 
         const char *url = (params->url && params->url[0]) ? params->url : nullptr;
         const char *err = nullptr;
@@ -158,7 +158,7 @@ namespace dw {
                 std::lock_guard<std::mutex> lk(he::g_map_mtx);
                 if (const auto it = he::g_tasks.find(url); it != he::g_tasks.end()) {
                     if (it->second->thread_done.load() != 1 && it->second->delete_req.load() != 1) {
-                        DW_LOG_TASK(DW_LOG_INFO, url, "[EVENT] HTTP add_task 任务运行中（幂等继续）");
+                        DW_LOG_TASK(DW_LOG_INFO, url, "HTTP add_task 任务运行中（幂等继续）");
                         set_result(out_result, url, DW_REASON_NONE, nullptr, nullptr);
                         return 0;
                     }
@@ -171,7 +171,7 @@ namespace dw {
                 // 删除中的 ctx：cancel_req 已置位，worker 短暂后自行退出，join 开销可控。
                 if (stale->task_thread.joinable()) stale->task_thread.join();
                 stale.reset();
-                DW_LOG_TASK(DW_LOG_INFO, url, "[CLEANUP] 回收残留上下文后重新添加");
+                DW_LOG_TASK(DW_LOG_INFO, url, "回收残留上下文后重新添加");
             }
         }
 
@@ -206,7 +206,7 @@ namespace dw {
             // 存档损坏在此同步检出（与下方文件不可用同为回退全量重下，仅补可观测性）。
             if (!rd.ok) {
                 DW_LOG_TASK(DW_LOG_INFO, url,
-                            "[EVENT] resume 存档无效（格式损坏），回退全量重下（沿用原名）: size=%zu",
+                            "resume 存档无效（格式损坏），回退全量重下（沿用原名）: size=%zu",
                             static_cast<size_t>(params->resume_data_size));
             }
             // 续传回落同一落盘文件：优先用 resume 持久化的物理路径（即最终路径）；
@@ -221,7 +221,7 @@ namespace dw {
             if (rd.ok && !full_path.empty()) {
                 if (DwFile probe; !probe.open(full_path, false)) {
                     DW_LOG_TASK(DW_LOG_INFO, url,
-                                "[EVENT] 续传文件不可用（errno=%d），回退全量重下: %s",
+                                "续传文件不可用（errno=%d），回退全量重下: %s",
                                 errno, full_path.c_str());
                 } else {
                     tCtx->full_file_path = full_path;
@@ -262,7 +262,7 @@ namespace dw {
         start_task(tCtx);
 
         DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
-                    "[EVENT] HTTP add_task 成功: output=%s probing=%d",
+                    "HTTP add_task 成功: output=%s probing=%d",
                     tCtx->output_path.c_str(), tCtx->probing);
         set_result(out_result, url, DW_REASON_NONE,
                    tCtx->probing ? nullptr : "跳过探测，使用 resume_data",
@@ -273,11 +273,11 @@ namespace dw {
     int32_t HttpEngine::pause_task(const char *id,
                                    dw_submit_result_t *out_result) {
         if (!id || !*id || !out_result) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP pause_task 失败: 入参为空 id=%s out_result=%p",
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP pause_task 失败: 入参为空 id=%s out_result=%p",
                        (id && *id) ? id : "(null)", static_cast<void *>(out_result));
             return -1;
         }
-        DW_LOG_TASK(DW_LOG_DEBUG, id, "[EVENT] HTTP pause_task 进入");
+        DW_LOG_TASK(DW_LOG_DEBUG, id, "HTTP pause_task 进入");
 
         if (!ensure_running()) {
             set_result(out_result, id, DW_REASON_ERROR, nullptr,
@@ -299,15 +299,15 @@ namespace dw {
                 }
             }
             if (hit) {
-                DW_LOG_TASK(DW_LOG_INFO, url, "[EVENT] HTTP pause_task 成功（非销毁，待 sweep 回收 ctx）");
+                DW_LOG_TASK(DW_LOG_INFO, url, "HTTP pause_task 成功（非销毁，待 sweep 回收 ctx）");
             }
             set_result(out_result, url, DW_REASON_NONE, nullptr, nullptr);
             return 0;
         } catch (const std::exception &e) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP pause_task exception: %s", e.what());
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP pause_task exception: %s", e.what());
             return -1;
         } catch (...) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP pause_task unknown exception");
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP pause_task unknown exception");
             return -1;
         }
     }
@@ -315,11 +315,11 @@ namespace dw {
     int32_t HttpEngine::delete_task(const char *id,
                                     dw_submit_result_t *out_result) {
         if (!id || !*id || !out_result) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP delete_task 失败: 入参为空 id=%s out_result=%p",
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP delete_task 失败: 入参为空 id=%s out_result=%p",
                        (id && *id) ? id : "(null)", static_cast<void *>(out_result));
             return -1;
         }
-        DW_LOG_TASK(DW_LOG_DEBUG, id, "[EVENT] HTTP delete_task 进入");
+        DW_LOG_TASK(DW_LOG_DEBUG, id, "HTTP delete_task 进入");
 
         if (!ensure_running()) {
             set_result(out_result, id, DW_REASON_ERROR, nullptr,
@@ -343,16 +343,16 @@ namespace dw {
             }
             set_result(out_result, url, DW_REASON_NONE, nullptr, nullptr);
             if (hit) {
-                DW_LOG_TASK(DW_LOG_INFO, url, "[EVENT] HTTP delete_task 已标记（待 sweep 回收）");
+                DW_LOG_TASK(DW_LOG_INFO, url, "HTTP delete_task 已标记（待 sweep 回收）");
                 return 0;
             }
             // 未持有任务（暂停 ctx 已回收 / 从未运行）：无运行时资源。
             return 1;
         } catch (const std::exception &e) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP delete_task exception: %s", e.what());
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP delete_task exception: %s", e.what());
             return -1;
         } catch (...) {
-            DW_LOG_SYS(DW_LOG_ERROR, "[ERROR] HTTP delete_task unknown exception");
+            DW_LOG_SYS(DW_LOG_ERROR, "HTTP delete_task unknown exception");
             return -1;
         }
     }
@@ -444,8 +444,8 @@ namespace dw {
             const bool deleting = owned->delete_req.load() == 1;
             owned.reset(); // 显式析构关闭全部分片文件句柄（Windows 句柄打开期间禁止删除文件）
             DW_LOG_TASK(DW_LOG_INFO, url.c_str(),
-                        deleting ? "[CLEANUP] 删除回收 HTTP 上下文 url=%s"
-                                 : "[CLEANUP] 终态回收 HTTP 上下文 url=%s", url.c_str());
+                        deleting ? "删除回收 HTTP 上下文 url=%s"
+                                 : "终态回收 HTTP 上下文 url=%s", url.c_str());
         }
     }
 } // namespace dw

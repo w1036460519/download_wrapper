@@ -3,8 +3,7 @@
  * @brief 唯一文件/目录名抢占工具：以磁盘为唯一判重真相源，定名即物化占位。
  */
 
-#ifndef DW_UTILS_UNIQUE_NAME_H
-#define DW_UTILS_UNIQUE_NAME_H
+#pragma once
 
 #include <string>
 
@@ -25,7 +24,7 @@ namespace dw::utils {
  *   - 原名冲突：按 n=1..9999 依次尝试 name(n) 作为包层目录名，形态恒为目录。
  *     整名尾部加序号、不拆扩展名，带点名（如 Ubuntu.22.04-LTS）也不会插错位置。
  *
- * 占位创建失败（磁盘满 / 权限等）不阻断定名：经 out_error 回报原因并返回候选名，
+ * 占位创建失败（磁盘满 / 权限等）不阻断定名：经 out_error 回报原因并返回候选名 ，
  * 退化为无占位行为，真实落盘时由引擎自身的错误路径归因。
  *
  * @param dir        目标目录（不存在时自动递归创建）。
@@ -38,6 +37,25 @@ std::string acquire_unique_name(const std::string& dir,
                                 const std::string& name,
                                 bool multi_file,
                                 std::string* out_error = nullptr);
+
+/**
+ * 在目录 dir 下抢占一个 wrapper 文件夹名（恒建目录占位）。
+ *
+ * 新方案下，每个任务统一在 save_path 下创建一个 wrapper 目录，HTTP/BT 内部
+ * 文件落在 wrapper 内部，不再依赖文件名形态判重。
+ *
+ * 行为：
+ *   - 原名未被占用：在 dir/name 建目录（直接是 wrapper 本身）
+ *   - 原名被占用：依次尝试 name(1)/name(2)/...，建目录
+ *
+ * @param dir        目标目录（不存在时自动递归创建）。
+ * @param name       期望的 wrapper 名（basename，不含路径分隔符）。
+ * @param out_error  非 NULL 时写入占位失败原因；成功置空串。
+ * @return 抢占到的 basename；原名未冲突时原样返回。
+ */
+std::string acquire_wrapper_name(const std::string& dir,
+                                 const std::string& name,
+                                 std::string* out_error = nullptr);
 
 /**
  * 物化已定名条目的占位（幂等）：dir/name 已存在则不动，不存在则按 multi_file
@@ -56,4 +74,4 @@ bool release_placeholder(const std::string& dir, const std::string& name);
 
 } // namespace dw::utils
 
-#endif /* DW_UTILS_UNIQUE_NAME_H */
+

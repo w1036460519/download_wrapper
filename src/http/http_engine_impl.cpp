@@ -23,6 +23,9 @@
 #include <libtorrent/entry.hpp>
 #include <libtorrent/error_code.hpp>
 
+#include <boost/url.hpp>
+#include <boost/algorithm/string.hpp>
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -47,12 +50,7 @@ namespace dw {
 
             /* ---------- 字符串工具 ---------- */
 
-            bool equal_ignore_case(std::string_view a, std::string_view b) noexcept {
-                return std::ranges::equal(a, b, [](char x, char y) noexcept {
-                    return std::tolower(static_cast<unsigned char>(x))
-                           == std::tolower(static_cast<unsigned char>(y));
-                });
-            }
+            // boost::algorithm::iequals 替代手写大小写比较
 
             std::string_view trim_view(std::string_view s) noexcept {
                 constexpr std::string_view ws = " \t\r\n\v\f";
@@ -91,26 +89,8 @@ namespace dw {
             }
 
             std::string percent_decode(std::string_view in) {
-                auto hex = [](const char c) -> int {
-                    if (c >= '0' && c <= '9') return c - '0';
-                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-                    return -1;
-                };
-                std::string out;
-                out.reserve(in.size());
-                for (size_t i = 0; i < in.size(); ++i) {
-                    if (in[i] == '%' && i + 2 < in.size()) {
-                        const int hi = hex(in[i + 1]), lo = hex(in[i + 2]);
-                        if (hi >= 0 && lo >= 0) {
-                            out.push_back(static_cast<char>((hi << 4) | lo));
-                            i += 2;
-                            continue;
-                        }
-                    }
-                    out.push_back(in[i] == '+' ? ' ' : in[i]);
-                }
-                return out;
+                // 使用 Boost.URL 的 pct_decode
+                return boost::urls::pct_string_view(in).decode();
             }
 
             /// 剥离路径分隔符，仅保留 basename（防 query 参数携路径逃逸落盘目录）。
@@ -121,40 +101,45 @@ namespace dw {
                 return s;
             }
 
-            std::string extract_filename_from_url(std::string_view url) {
-                if (const auto hash = url.find('#'); hash != std::string_view::npos) {
-                    url = url.substr(0, hash);
+            std::string extract_filename_from_url(std::string_view url_sv) {
+                // 使用 Boost.URL 解析
+                boost::system::result<boost::urls::url_view> parsed =
+                    boost::urls::parse_uri(std::string(url_sv));
+                if (!parsed) {
+                    // 解析失败，回退到简单路径提取
+                    if (const auto slash = url_sv.find_last_of('/'); slash != std::string_view::npos) {
+                        if (const auto filename = url_sv.substr(slash + 1); !filename.empty()) {
+                            return sanitize_basename(percent_decode(filename));
+                        }
+                    }
+                    return {};
                 }
-                std::string_view query;
-                if (const auto q = url.find('?'); q != std::string_view::npos) {
-                    query = url.substr(q + 1);
-                    url = url.substr(0, q);
-                }
-                // 优先级：query 参数 filename > query 参数 name > 路径末段（键大小写不敏感，均 percent-decode）。
+
+                // 优先级：query 参数 filename > query 参数 name > 路径末段
+                auto params = parsed->params();
                 std::string by_filename, by_name;
-                size_t pos = 0;
-                while (pos < query.size()) {
-                    const size_t amp = query.find('&', pos);
-                    const std::string_view kv = (amp == std::string_view::npos)
-                                                    ? query.substr(pos)
-                                                    : query.substr(pos, amp - pos);
-                    pos = (amp == std::string_view::npos) ? query.size() : amp + 1;
-                    const auto eq = kv.find('=');
-                    if (eq == std::string_view::npos) continue;
-                    const auto key = kv.substr(0, eq);
-                    const auto val = kv.substr(eq + 1);
+
+                for (auto it = params.begin(); it != params.end(); ++it) {
+                    auto key = (*it).key;
+                    auto val = (*it).value;
                     if (val.empty()) continue;
-                    if (by_filename.empty() && equal_ignore_case(key, "filename")) {
-                        by_filename = sanitize_basename(percent_decode(val));
-                    } else if (by_name.empty() && equal_ignore_case(key, "name")) {
-                        by_name = sanitize_basename(percent_decode(val));
+
+                    if (by_filename.empty() && boost::algorithm::iequals(key, "filename")) {
+                        by_filename = sanitize_basename(std::string(val));
+                    } else if (by_name.empty() && boost::algorithm::iequals(key, "name")) {
+                        by_name = sanitize_basename(std::string(val));
                     }
                 }
+
                 if (!by_filename.empty()) return by_filename;
                 if (!by_name.empty()) return by_name;
-                if (const auto slash = url.find_last_of('/'); slash != std::string_view::npos) {
-                    if (const auto filename = url.substr(slash + 1); !filename.empty()) {
-                        return sanitize_basename(percent_decode(filename));
+
+                // 路径末段
+                auto segments = parsed->encoded_segments();
+                if (!segments.empty()) {
+                    auto last = segments.back();
+                    if (!last.empty()) {
+                        return sanitize_basename(std::string(last));
                     }
                 }
                 return {};
@@ -317,7 +302,7 @@ namespace dw {
                     const auto name = trim_view(raw.substr(0, colon));
                     const auto val = trim_view(raw.substr(colon + 1));
 
-                    if (equal_ignore_case(name, "Content-Range")) {
+                    if (boost::algorithm::iequals(name, "Content-Range")) {
                         // bytes 0-1/239784356
                         if (const auto slash = val.find('/'); slash != std::string_view::npos) {
                             if (const auto total_sv = val.substr(slash + 1);
@@ -337,14 +322,14 @@ namespace dw {
                                 }
                             }
                         }
-                    } else if (equal_ignore_case(name, "Content-Length")) {
+                    } else if (boost::algorithm::iequals(name, "Content-Length")) {
                         // 兜底仅限探测收到 200（全量流，CL 即总大小）；206 的 CL 是探测
                         // 窗口大小而非文件总长，总大小恒由上方 Content-Range 的 total 提供。
                         if (int64_t cl = 0; sv_to_int(val, cl) && cl > 0 && pCtx->seen_total_size <= 0 && tCtx->
                                             probing && pCtx->seen_http_code != 206) {
                             pCtx->seen_total_size = cl;
                         }
-                    } else if (equal_ignore_case(name, "Content-Disposition")) {
+                    } else if (boost::algorithm::iequals(name, "Content-Disposition")) {
                         // 服务器真实建议名优先于 URL 推断（header 先于首笔 body，finalize_probing
                         // 定名时已可用）；filename 已有值时跳过解析（add 显式指定名 /
                         // 恢复任务的历史凭证名，两者优先级均更高）。
@@ -353,7 +338,7 @@ namespace dw {
                                 tCtx->filename = parsed;
                             }
                         }
-                    } else if (equal_ignore_case(name, "ETag")) {
+                    } else if (boost::algorithm::iequals(name, "ETag")) {
                         pCtx->seen_etag.assign(val);
                         if (tCtx->etag.empty()) tCtx->etag = pCtx->seen_etag;
                         if (!tCtx->etag.empty() && pCtx->seen_etag != tCtx->etag) {
@@ -362,7 +347,7 @@ namespace dw {
                                         pCtx->index, tCtx->etag.c_str(), pCtx->seen_etag.c_str());
                             return mark_drift_error();
                         }
-                    } else if (equal_ignore_case(name, "Last-Modified")) {
+                    } else if (boost::algorithm::iequals(name, "Last-Modified")) {
                         pCtx->seen_last_modified.assign(val);
                         if (tCtx->last_modified.empty()) tCtx->last_modified = pCtx->seen_last_modified;
                         if (!tCtx->last_modified.empty() && pCtx->seen_last_modified != tCtx->last_modified) {
@@ -659,33 +644,32 @@ namespace dw {
                     if (tCtx->filename.empty()) {
                         tCtx->filename = "download";
                     }
-
-                    // 定名单点：优先级 add 指定名 > Content-Disposition（header_cb 已填）>
-                    // URL 参数 filename/name > 路径末段 > 兜底名；无论哪级来源均经
-                    // request_unique_name 上调 TaskManager 判重（重名时返回包层目录名
-                    // wrap_dir，文件本名不变），随后经 post_task_files 推单文件节点落文件表
-                    //（与 BT 统一通道，先删后存）。恢复任务回退全量重下（is_resume=1
-                    // 但存档失效）同样上调：TaskManager 幂等守卫沿用既有 wrap_dir，
-                    // 包层任务据此重建包层路径，不会落回原目录与他任务相撞。
-                    // 已知允许误差：恢复任务若 resume 存档尚未落库即终止（is_resume=0），
-                    // 此处按首次重新定名，磁盘半成品会命中判重再包一层 name(1) 全量重下，
-                    // 窗口极小（探测定名后至首个 resume 落库前异常终止），不做额外防护。
+                
+                    // 新方案：HTTP 落统一 wrapper 模型。
+                    //   raw_name  = tCtx->filename（wrapper 内的内部文件名，含后缀，如 "Inception.mp4"）
+                    //   wrapper   = strip_extension(raw_name)（wrapper 目录名，去后缀，如 "Inception"）
+                    //   unique    = request_unique_name(...)（判重后实际 wrapper 名，含可能的 (n) 后缀）
+                    //   落盘路径  = output_path / unique / raw_name
+                    //   output_path 保持不变（恒为 save_path），wrapper 目录由 request_unique_name 内物化。
+                    // 恢复任务若 resume 存档失效（全量重下）同样上调，幂等守卫已沿用既有 wrapper。
+                    // 已知允许误差：恢复任务若 resume 存档尚未落库即终止（is_resume=0），此处按首次
+                    // 重新定名，磁盘半成品会命中判重再包一层 name(1) 全量重下，窗口极小不做额外防护。
+                    const std::string raw_name = tCtx->filename;
+                    const std::string wrapper = dw::utils::strip_extension(raw_name);
                     const std::string unique = dw::request_unique_name(
                         tCtx->url.c_str(), DW_PROTOCOL_HTTP,
-                        tCtx->output_path.c_str(), tCtx->filename.c_str());
-                    if (unique != tCtx->filename) {
-                        // 重名包层：落盘目录追加一层包层目录（save_path/wrap_dir/原名），
-                        // 与 BT move_storage 迁 save_path 语义统一。
-                        tCtx->output_path =
-                                (std::filesystem::path(tCtx->output_path) / unique).string();
+                        tCtx->output_path.c_str(), wrapper.c_str(), raw_name.c_str());
+                    if (unique != wrapper) {
+                        DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+                                    "HTTP 判重：wrapper 包层 '%s' -> '%s'", wrapper.c_str(), unique.c_str());
                     }
-
+                
                     // HTTP 单文件模型：头到齐即可确定最终文件，推单条根层文件节点。
                     // 指针字段仅在调用期有效，库内深拷落库。
                     dw_file_info_t f{};
                     f.index = 0;
-                    f.name = const_cast<char *>(tCtx->filename.c_str());
-                    const std::string ext = dw::utils::file_extension(tCtx->filename);
+                    f.name = const_cast<char *>(raw_name.c_str());
+                    const std::string ext = dw::utils::file_extension(raw_name);
                     f.ext = ext.empty() ? nullptr : const_cast<char *>(ext.c_str());
                     f.size = tCtx->total_size > 0 ? tCtx->total_size : 0;
                     f.offset = 0; // HTTP 单文件模型，全局偏移恒为 0
@@ -693,9 +677,11 @@ namespace dw {
                     f.downloaded_bytes = 0;
                     f.play_position_ms = 0;
                     dw::post_task_files(tCtx->url.c_str(), DW_PROTOCOL_HTTP, &f, 1);
+                
+                    // 内部文件物理路径：save_path / wrapper / raw_filename
+                    tCtx->full_file_path =
+                            (std::filesystem::path(tCtx->output_path) / unique / raw_name).string();
                 }
-                tCtx->full_file_path =
-                        (std::filesystem::path(tCtx->output_path) / tCtx->filename).string();
 
                 if (!tCtx->full_file_path.empty()) {
                     if (const auto dir_path = std::filesystem::path(tCtx->full_file_path).parent_path();

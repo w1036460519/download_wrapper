@@ -19,8 +19,10 @@ find_package(Threads REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 # libtorrent 提供 CMake config 包，优先使用 find_package
-# Boost 头文件经 libtorrent 的 PUBLIC 依赖传递，无需显式 find_package
+# Boost.Beast / Boost.Asio 为 playback_proxy 直接依赖（header-only），
+# Boost.URL 为 URL 解析库（需链接），经 vcpkg 安装后通过 libtorrent 依赖链可用。
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
+find_package(Boost REQUIRED COMPONENTS url)
 
 if(WIN32)
     # NOMINMAX：阻止 windows.h 定义 min/max 宏（经 curl 头传入），否则会撕碎
@@ -79,6 +81,7 @@ target_link_libraries(download_wrapper
         Threads::Threads
         LibtorrentRasterbar::torrent-rasterbar
         unofficial::sqlite3::sqlite3
+        Boost::url
 )
 
 target_compile_definitions(download_wrapper PRIVATE DOWNLOAD_WRAPPER_BUILD)

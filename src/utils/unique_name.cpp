@@ -75,6 +75,13 @@ std::string acquire_unique_name(const std::string &dir,
     return fallback;
 }
 
+std::string acquire_wrapper_name(const std::string &dir,
+                                 const std::string &name,
+                                 std::string *out_error) {
+    // wrapper 恒为目录占位，委托 acquire_unique_name(multi_file=true)
+    return acquire_unique_name(dir, name, true, out_error);
+}
+
 void ensure_placeholder(const std::string &dir,
                         const std::string &name,
                         const bool multi_file) {

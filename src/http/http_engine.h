@@ -3,8 +3,7 @@
  * @brief HTTP 下载引擎内部实现头文件。
  */
 
-#ifndef DW_HTTP_ENGINE_H
-#define DW_HTTP_ENGINE_H
+#pragma once
 
 #include "download_wrapper/download_wrapper.h"
 #include "internal/engine_interface.h"
@@ -86,4 +85,3 @@ private:
 
 } // namespace dw
 
-#endif /* DW_HTTP_ENGINE_H */

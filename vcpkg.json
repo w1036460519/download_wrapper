@@ -5,6 +5,10 @@
   "dependencies": [
     "curl",
     "sqlite3",
+    "boost-asio",
+    "boost-beast",
+    "boost-url",
+    "boost-algorithm",
     {
       "name": "libtorrent",
       "default-features": false

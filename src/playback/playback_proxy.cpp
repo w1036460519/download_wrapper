@@ -21,6 +21,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <boost/url.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,24 +59,6 @@ static std::atomic<bool>         g_running{false};
 // ========================================================================
 //  工具函数
 // ========================================================================
-
-/// URL 查询参数解析：从 query 字符串中提取指定 key 的整数值。
-/// 支持 "task=123&file=0" 格式。未找到返回 false。
-bool parse_query_int(const std::string& query,
-                     const std::string& key, int& out) {
-    const std::string needle = key + "=";
-    auto pos = query.find(needle);
-    if (pos == std::string::npos) return false;
-    pos += needle.size();
-    auto end = query.find('&', pos);
-    std::string val = query.substr(pos, end == std::string::npos ? end : end - pos);
-    try {
-        out = std::stoi(val);
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
 
 /// 解析 HTTP Range 头。支持 "bytes=start-end" 与 "bytes=start-"（开放区间）。
 /// 解析成功返回 true。
@@ -139,13 +123,16 @@ private:
     http::request<http::string_body> req_;
 
     // ---- 请求级状态（handle_request 初始化，后续阶段只读） ----
-    int     task_id_     = 0;
-    int     file_index_  = 0;
-    int64_t range_start_ = 0;
-    int64_t range_end_   = 0;   // 含（闭合区间）；-1 在 handle_request 中已补齐
-    int64_t total_size_  = -1;
+    // key_type_ + natural_key_ 拆分存储：与 C ABI 一致，URL 参数原样透传。
+    // type 取值 "http" / "bt"；natural_key 须 URL 编码。
+    std::string natural_key_;
+    int     key_type_     = DW_KEY_TYPE_HTTP;
+    int     file_index_   = 0;
+    int64_t range_start_  = 0;
+    int64_t range_end_    = 0;   // 含（闭合区间）；-1 在 handle_request 中已补齐
+    int64_t total_size_   = -1;
     std::string file_path_;
-    bool header_sent_ = false;
+    bool header_sent_     = false;
 
     net::steady_timer timer_{stream_.get_executor()};
 
@@ -166,19 +153,33 @@ private:
     //  阶段 2：解析请求、构造响应头
     // ================================================================
     void handle_request() {
-        // ---- 路径校验 ----
-        auto target = req_.target();
-        if (target.size() < 6 ||
-            target.substr(0, 6) != "/file?") {
+        // ---- 路径校验与参数解析（Boost.URL）----
+        boost::system::result<boost::urls::url_view> parsed =
+            boost::urls::parse_relative_ref(req_.target());
+        if (!parsed || parsed->encoded_path() != "/file") {
             send_error(http::status::not_found, "Not Found");
             return;
         }
-
-        // ---- 解析 URL 参数 ----
-        auto query = target.substr(6);
-        if (!parse_query_int(query, "task", task_id_) ||
-            !parse_query_int(query, "file", file_index_)) {
-            send_error(http::status::bad_request, "Missing task/file parameter");
+        auto params = parsed->params();
+        auto type_it = params.find("type");
+        auto key_it  = params.find("key");
+        auto file_it = params.find("file");
+        if (type_it == params.end() || key_it == params.end() || file_it == params.end()) {
+            send_error(http::status::bad_request, "Missing type/key/file parameter");
+            return;
+        }
+        try {
+            const std::string type_str((*type_it).value);
+            if (type_str == "http") key_type_ = DW_KEY_TYPE_HTTP;
+            else if (type_str == "bt") key_type_ = DW_KEY_TYPE_BT;
+            else {
+                send_error(http::status::bad_request, "Invalid type parameter");
+                return;
+            }
+            natural_key_ = std::string((*key_it).value);
+            file_index_  = std::stoi(std::string((*file_it).value));
+        } catch (...) {
+            send_error(http::status::bad_request, "Invalid type/key/file parameter");
             return;
         }
 
@@ -195,9 +196,11 @@ private:
         }
 
         // ---- 获取文件路径与总大小 ----
+        const dw_task_key_t task_key{
+            static_cast<dw_key_type_t>(key_type_), natural_key_.c_str()};
         char*    raw_path = nullptr;
         int64_t  file_size = -1;
-        if (dw_get_task_file_info(static_cast<int64_t>(task_id_),
+        if (dw_get_task_file_info(&task_key,
                                   static_cast<int32_t>(file_index_),
                                   &raw_path, &file_size) != 0 || !raw_path) {
             send_error(http::status::not_found, "Task or file not found");
@@ -249,9 +252,11 @@ private:
         auto self = shared_from_this();
 
         // ---- 查询已下载分段（优先缓存，按状态区分） ----
+        const dw_task_key_t task_key{
+            static_cast<dw_key_type_t>(key_type_), natural_key_.c_str()};
         dw_byte_range_t* ranges     = nullptr;
         int32_t          range_count = 0;
-        const int32_t rc = dw_get_file_ranges(static_cast<int64_t>(task_id_),
+        const int32_t rc = dw_get_file_ranges(&task_key,
                                               static_cast<int32_t>(file_index_),
                                               &ranges, &range_count);
 
@@ -354,9 +359,10 @@ private:
 
         // 拷贝到成员以延长生命周期（async 期间需要存活）
         header_res_ = std::move(res);
+        header_sr_.emplace(header_res_);
 
         http::async_write_header(
-            stream_, header_res_,
+            stream_, *header_sr_,
             [self](beast::error_code ec, std::size_t) {
                 if (ec) return; // 客户端断开，不再继续
                 // header 发送成功，取出暂存的首批 body 数据并发送
@@ -459,6 +465,7 @@ private:
 
     // ---- 成员 ----
     http::response<http::empty_body> header_res_;  // 响应头（async 期间需存活）
+    std::optional<http::response_serializer<http::empty_body>> header_sr_; // 序列化器
     int64_t pending_next_pos_ = 0;                 // 首批 body 的下一传输位置
     std::vector<uint8_t> pending_data_;            // 首批 body 数据（header 发送期间暂存）
     std::vector<uint8_t> write_data_;              // 当前 body 写入数据（async 期间需存活）
@@ -487,6 +494,11 @@ void do_accept() {
 // ========================================================================
 //  C API 实现
 // ========================================================================
+
+// C API 位于 dw::playback 命名空间外部，需重新声明别名
+namespace beast = boost::beast;
+namespace net   = boost::asio;
+using tcp = boost::asio::ip::tcp;
 
 int dw_proxy_start(void) {
     if (dw::playback::g_running) {
@@ -540,10 +552,16 @@ void dw_proxy_stop(void) {
     dw::playback::g_port = 0;
 }
 
-const char* dw_proxy_get_url(int task_id, int file_index) {
+const char* dw_proxy_get_url(const dw_task_key_t* key, int file_index) {
+    if (!key || !key->natural_key) {
+        return "";
+    }
     static thread_local std::string url;
+    const char *type_str =
+        key->key_type == DW_KEY_TYPE_BT ? "bt" : "http";
     url = "http://127.0.0.1:" + std::to_string(dw::playback::g_port) +
-          "/file?task=" + std::to_string(task_id) +
+          "/file?type=" + type_str +
+          "&key=" + key->natural_key +
           "&file=" + std::to_string(file_index);
     return url.c_str();
 }

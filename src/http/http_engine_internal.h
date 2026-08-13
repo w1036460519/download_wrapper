@@ -349,9 +349,6 @@ namespace dw {
             /** 递归创建目录 */
             bool mkdir_recursive(const std::string &path);
 
-            /** 忽略大小写比较 */
-            bool equal_ignore_case(std::string_view a, std::string_view b) noexcept;
-
             /** 去除首尾空白字符 */
             std::string_view trim_view(std::string_view s) noexcept;
 

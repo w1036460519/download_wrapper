@@ -3,8 +3,7 @@
  * @brief BT/Torrent 下载引擎内部实现头文件。
  */
 
-#ifndef DW_TORRENT_ENGINE_H
-#define DW_TORRENT_ENGINE_H
+#pragma once
 
 #include "download_wrapper/download_wrapper.h"
 #include "internal/engine_interface.h"
@@ -86,13 +85,6 @@ public:
     static char* info_hash_to_magnet(const char* task_id);
 
     /**
-     * 设置文件下载优先级。
-     */
-    static int set_file_priority(const char* task_id,
-                                 int32_t     file_index,
-                                 int32_t     priority);
-
-    /**
      * 本地解析 .torrent 文件，返回种子名称、info_hash 和文件列表。
      * 不依赖 session，不创建任务。
      */
@@ -101,14 +93,6 @@ public:
                                       char**           out_info_hash,
                                       dw_file_info_t** out_files,
                                       int32_t*         out_count);
-
-    /**
-     * 获取 session 中已存在任务的文件列表。
-     * 任务元数据就绪后可用。
-     */
-    static int32_t get_file_list(const char*      task_id,
-                                 dw_file_info_t** out_files,
-                                 int32_t*         out_count);
 
     /**
      * 节拍入口（A 线程调用，session 线程安全，无需持 TaskManager 锁）：
@@ -128,22 +112,13 @@ public:
                                                  int32_t     file_index) override;
 
     /**
-     * 声明当前播放的文件与字节偏移，对播放点附近 piece 施加 set_piece_deadline 提优。
-     * file_index<0 表示停止提优（clear_piece_deadlines）。
-     * @return 1=成功，0=失败。
+     * 播放提优：为指定文件设置 piece deadline（readahead 窗口）。
+     * 仅 DOWNLOADING 态任务可调用（handle 有效）。
+     * @return 0=成功，-1=失败。
      */
-    static int set_playing_file(const char* task_id,
-                                int32_t     file_index,
-                                int64_t     byte_offset);
-
-    /**
-     * 批量设置任务内多个文件的下载优先级（任务内文件级优先）。
-     * @return 1=成功，0=失败。
-     */
-    static int set_file_priorities(const char*    task_id,
-                                   const int32_t* file_indexes,
-                                   const int32_t* priorities,
-                                   int32_t        count);
+    int32_t set_playing_file(const char* task_id,
+                             int32_t     file_index,
+                             int64_t     byte_offset) override;
 
     /**
      * 应用文件选择意图（RESOLVING 就绪出口，TaskManager 经统一接口调用）。
@@ -176,4 +151,3 @@ private:
 
 } // namespace dw
 
-#endif /* DW_TORRENT_ENGINE_H */

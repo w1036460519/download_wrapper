@@ -18,8 +18,7 @@
  *   - 新增字段仅追加到末尾，保持 ABI 向后兼容。
  */
 
-#ifndef DOWNLOAD_WRAPPER_H
-#define DOWNLOAD_WRAPPER_H
+#pragma once
 
 #ifdef __cplusplus
 #include <cstddef>
@@ -54,6 +53,34 @@ typedef enum {
 } dw_protocol_t;
 
 /**
+ * 任务键类型：决定 natural_key 字段的语义，并同步 SQLite 库内 key_type 列。
+ *
+ *   HTTP  → natural_key = url
+ *   BT    → natural_key = info_hash
+ *   LOCAL → natural_key = content_root（save_path 下的实际根目录名）
+ */
+typedef enum {
+    DW_KEY_TYPE_HTTP  = 0,
+    DW_KEY_TYPE_BT    = 1,
+    DW_KEY_TYPE_LOCAL = 2,
+} dw_key_type_t;
+
+/**
+ * 任务唯一键：(key_type, natural_key) 二元组。
+ *
+ *   - 输入时（函数入参）：natural_key 由调用方持有，调用期间须保持有效。
+ *   - 输出时（dw_progress_t / dw_submit_result_t / dw_task_snapshot_t 内嵌 key）：natural_key 由库
+ *     分配并随宿主结构体一同释放（dw_free / dw_task_list_free / dw_submit_result_release）。
+ *
+ * clientId 不在此结构中：clientId 由 App 启动时经 dw_config_t 注入 session，所有任务的 clientId
+ * 均取自 session 配置；本机任务不需要每调用携带，多客户端 / 远端任务处理暂未实现。
+ */
+typedef struct dw_task_key {
+    dw_key_type_t key_type;
+    const char*   natural_key;
+} dw_task_key_t;
+
+/**
  * 任务状态枚举。
  *
  * 前 4 值与 libcurl_wrapper 的 tw_task_status_t 完全对齐，
@@ -69,6 +96,7 @@ typedef enum {
                                          元数据就绪后经事件驱动迁 PARSED）。 */
     DW_TASK_STATUS_PARSED      = 6, /**< 解析完成（元数据就绪 + 冲突检测通过，
                                          文件列表已落库；调度准入后迁 DOWNLOADING）。 */
+    DW_TASK_STATUS_INVALIDATED = 7, /**< 已失效（物理文件不存在，仅可删除）。 */
 } dw_task_status_t;
 
 /**
@@ -190,8 +218,7 @@ typedef struct dw_progress {
     const char*      info_hash;        /**< 种子 info_hash：BT 任务的识别键与展示；HTTP 为空串。 */
     dw_protocol_t    protocol;         /**< 协议类型。 */
     const char*      name;             /**< 任务显示名称。 */
-    const char*      output_path;      /**< 权威保存目录 save_path（已含包层目录，冲突时直接追加）。
-                                                有效落盘目录 = output_path。 */
+    const char*      output_path;      /**< 用户指定的保存目录 save_path（恒不变）。实际落盘目录 = output_path / content_root。 */
     const char*      filename;         /**< 目标文件名（不含目录）。 */
     int64_t          total_size;       /**< 总大小（字节）；-1=未知。 */
     int64_t          total_done;       /**< 已完成字节；-1=未知。 */
@@ -204,6 +231,11 @@ typedef struct dw_progress {
     const char*      message;          /**< 状态描述 / 错误文本。 */
     int64_t          saved_at_unix_ms; /**< 快照生成时间戳（Unix 毫秒）。 */
 
+    /* ===== 扩展字段（追加，保持既有字段偏移） ===== */
+
+    int32_t          source;         /**< 来源：0=本地任务 1=本地文件 2=远程文件。 */
+    dw_task_key_t    key;            /**< 任务唯一键：key_type + natural_key。natural_key 由库分配。 */
+
     /* ===== HTTP 特有字段 ===== */
 
     int32_t          support_range;    /**< 服务器是否支持 Range：0/1。 */
@@ -214,10 +246,10 @@ typedef struct dw_progress {
 
     double           upload_rate;      /**< 上传速率（B/s）。 */
 
-    /* ===== 交互主键（追加，保持既有字段偏移） ===== */
+    /* ===== content_root（追加，保持既有字段偏移） ===== */
 
-    int64_t          id;               /**< 任务自增 id：上层交互主键，由库内回填；
-                                            url / info_hash 为引擎内部识别键与展示数据。 */
+    const char*      content_root;     /**< save_path 下的实际根目录名。物理路径 = output_path / content_root。
+                                                空串 = 尚未定名（PARSED 前）。 */
 } dw_progress_t;
 
 /* ------------------------------------------------------------------ */
@@ -261,6 +293,7 @@ typedef struct dw_task_params {
     /* ===== 队列（通用，追加保持 ABI 兼容） ===== */
 
     int32_t        priority;         /**< 队列优先级：越大越优先，默认 0；同级按提交顺序 FIFO。 */
+    int32_t        source;           /**< 来源：0=本地任务 1=本地文件 2=远程文件；默认 0。 */
 } dw_task_params_t;
 
 /* ------------------------------------------------------------------ */
@@ -275,9 +308,9 @@ typedef struct dw_task_params {
  * id：      任务自增 id（上层交互主键）；add 成功回填新建 id，控制操作回显入参 id。
  */
 typedef struct dw_submit_result {
-    dw_reason_t code;
-    char*       message;
-    int64_t     id;      /**< 任务自增 id：add 成功后回填新建 id，控制操作回显入参 id。 */
+    dw_reason_t   code;
+    char*         message;
+    dw_task_key_t key; /**< 任务唯一键：add 成功后回填，控制操作回显入参 key。natural_key 由库分配。 */
 } dw_submit_result_t;
 
 /* ------------------------------------------------------------------ */
@@ -326,6 +359,7 @@ typedef struct dw_config {
     /* ===== 追加字段（置于末尾以保持既有字段偏移的 ABI 兼容） ===== */
 
     double seed_ratio_limit;   /**< BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文；0=库内默认 3.0（即下载:上传=1:3），<0=永久做种。 */
+    const char* client_id;     /**< 客户端唯一标识（UUIDv4，App 启动时从 SharedPreferences 读出后传入）。库内以此为 session 级别 clientId 隔离多客户端任务；本字段必填。 */
 } dw_config_t;
 
 /* ------------------------------------------------------------------ */
@@ -340,19 +374,22 @@ typedef struct dw_config {
  * 所有字符串由库分配，整个数组通过 dw_task_list_free 统一释放。
  */
 typedef struct dw_task_snapshot {
-    char*            url;          /**< 下载 URL：HTTP 任务识别键与展示；BT 为空串。 */
-    char*            info_hash;    /**< 种子 info_hash：BT 任务识别键与展示；HTTP 为空串。 */
-    dw_protocol_t    protocol;     /**< 协议类型。 */
-    char*            name;         /**< 任务显示名称。 */
-    char*            save_path;    /**< 保存目录。 */
-    char*            filename;     /**< 目标文件名（可能为空串）。 */
+    dw_task_key_t   key;           /**< 任务唯一键。natural_key 由库分配。 */
+    char*           url;          /**< 下载 URL：HTTP 任务识别键与展示；BT 为空串。 */
+    char*           info_hash;    /**< 种子 info_hash：BT 任务识别键与展示；HTTP 为空串。 */
+    dw_protocol_t   protocol;     /**< 协议类型。 */
+    char*           name;         /**< 任务显示名称。 */
+    char*           save_path;    /**< 保存目录。 */
+    char*           filename;     /**< 目标文件名（可能为空串）。 */
     dw_task_status_t status;       /**< 持久化的任务状态。 */
-    double           progress;     /**< 进度 0.0-1.0；-1=未知。 */
-    int64_t          total_size;   /**< 总大小（字节）；-1=未知。 */
-    int64_t          total_done;   /**< 已完成字节；-1=未知。 */
-    int32_t          priority;     /**< 队列优先级。 */
-    int64_t          created_at;   /**< 创建时间（Unix 毫秒）。 */
-    int64_t          id;           /**< 任务自增 id（上层交互主键）。 */
+    double          progress;     /**< 进度 0.0-1.0；-1=未知。 */
+    int64_t         total_size;   /**< 总大小（字节）；-1=未知。 */
+    int64_t         total_done;   /**< 已完成字节；-1=未知。 */
+    int32_t         priority;     /**< 队列优先级。 */
+    int64_t         created_at;   /**< 创建时间（Unix 毫秒）。 */
+    int64_t         modified_at;  /**< 最近修改时间（Unix 毫秒）。 */
+    int32_t         source;       /**< 来源：0=本地任务 1=本地文件 2=远程文件。 */
+    char*           content_root; /**< save_path 下的实际根目录名。物理路径 = save_path / content_root。空串=尚未定名。 */
 } dw_task_snapshot_t;
 
 /* ================================================================== */
@@ -363,6 +400,7 @@ typedef struct dw_task_snapshot {
  * 初始化下载器全局单例。
  *
  * 同时初始化 HTTP 引擎（libcurl）和 BT 引擎（libtorrent）。
+ * cfg.client_id 为必填：库内以此为 session 级 clientId 隔离多客户端任务。
  *
  * @param cfg  全局配置指针，NULL 时使用默认配置。
  * @return     0=成功，-1=失败。
@@ -429,9 +467,9 @@ DW_API void dw_set_log_callback(dw_log_cb cb);
  * 文件名不接受外部指定（params.filename 被忽略）：库内以磁盘为唯一真相源判重定名，
  * 结果经进度回调的 filename / output_path 回报。
  *
- * @param protocol    协议类型。
+ * @param protocol    协议类型。natural_key 从 params.url (HTTP) / params.info_hash (BT) 推导。
  * @param params      任务参数指针，不可为 NULL。
- * @param out_result  同步返回结果指针，不可为 NULL。
+ * @param out_result  同步返回结果指针，不可为 NULL；成功后回填 key。
  * @return            0=成功，-1=失败（参数非法或内部错误）。
  */
 DW_API int32_t dw_add_task(dw_protocol_t           protocol,
@@ -441,41 +479,35 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
 /**
  * 暂停单个任务。
  *
- * @param protocol    协议类型。
- * @param id          任务自增 id（由 add / 快照获知），库内按 id 回读定位。
+ * @param key         任务唯一键。调用期间 natural_key 须保持有效。
  * @param out_result  同步返回结果指针，不可为 NULL。
  * @return            0=成功，-1=失败（参数非法或内部错误）。
  */
-DW_API int32_t dw_pause_task(dw_protocol_t       protocol,
-                             int64_t             id,
-                             dw_submit_result_t* out_result);
+DW_API int32_t dw_pause_task(const dw_task_key_t*  key,
+                             dw_submit_result_t*   out_result);
 
 /**
  * 恢复（继续）单个任务。
  *
- * @param protocol    协议类型。
- * @param id          任务自增 id；库内按 id 回读全字段还原引擎参数。
+ * @param key         任务唯一键。调用期间 natural_key 须保持有效。
  * @param out_result  同步返回结果指针，不可为 NULL。
  * @return            0=成功，-1=失败（参数非法或内部错误）。
  */
-DW_API int32_t dw_resume_task(dw_protocol_t       protocol,
-                              int64_t             id,
-                              dw_submit_result_t* out_result);
+DW_API int32_t dw_resume_task(const dw_task_key_t* key,
+                              dw_submit_result_t*  out_result);
 
 /**
  * 删除单个任务。
  *
- * @param protocol      协议类型。
- * @param id            任务自增 id，库内按 id 回读定位。
+ * @param key           任务唯一键。调用期间 natural_key 须保持有效。
  * @param delete_files  非 0=同步删除落盘文件（引擎确认资源释放后异步执行，
  *                      仅尝试一次，成败不影响任务删除本身）；0=仅删任务记录。
  * @param out_result    同步返回结果指针，不可为 NULL。
  * @return              0=成功，-1=失败（参数非法或内部错误）。
  */
-DW_API int32_t dw_delete_task(dw_protocol_t       protocol,
-                              int64_t             id,
-                              int32_t             delete_files,
-                              dw_submit_result_t* out_result);
+DW_API int32_t dw_delete_task(const dw_task_key_t* key,
+                              int32_t              delete_files,
+                              dw_submit_result_t*  out_result);
 
 /* ================================================================== */
 /*                         BT 工具函数                                */
@@ -504,26 +536,14 @@ DW_API char* dw_magnet_to_info_hash(const char* magnet_link);
 DW_API char* dw_torrent_file_to_info_hash(const char* torrent_file_path);
 
 /**
- * 通过任务 id 获取磁力链接。
+ * 通过任务键获取磁力链接。
  *
- * 任务必须已存在于 session 中；库内按 id 回读 info_hash 后调引擎。
+ * 任务必须已存在于 session 中；库内按 key 的 natural_key 回读 info_hash 后调引擎。
  *
- * @param id  任务自增 id。
- * @return    成功返回堆分配的磁力链接（调用者 dw_free 释放），失败返回 NULL。
+ * @param key   任务唯一键（key_type=DW_KEY_TYPE_BT，natural_key=info_hash）。
+ * @return      成功返回堆分配的磁力链接（调用者 dw_free 释放），失败返回 NULL。
  */
-DW_API char* dw_info_hash_to_magnet(int64_t id);
-
-/**
- * 设置 BT 任务的文件下载优先级。
- *
- * @param id          任务自增 id；库内按 id 回读 info_hash 后调引擎。
- * @param file_index  文件索引。
- * @param priority    优先级：0=不下载，1=正常，7=最高。
- * @return            1=成功，0=失败。
- */
-DW_API int dw_set_file_priority(int64_t id,
-                                int32_t file_index,
-                                int32_t priority);
+DW_API char* dw_info_hash_to_magnet(const dw_task_key_t* key);
 
 /**
  * 本地解析 .torrent 文件（不创建任务、不依赖 session）。
@@ -548,14 +568,14 @@ DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
  *
  * 用于磁力链接任务元数据就绪后获取文件列表。
  *
- * @param id          任务自增 id；库内按 id 回读 info_hash 后调引擎。
- * @param out_files   输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
- * @param out_count   输出：文件数量。
- * @return            0=成功，-1=失败（元数据未就绪或任务不存在）。
+ * @param key        任务唯一键。
+ * @param out_files  输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
+ * @param out_count  输出：文件数量。
+ * @return           0=成功，-1=失败（元数据未就绪或任务不存在）。
  */
-DW_API int32_t dw_get_file_list(int64_t          id,
-                                dw_file_info_t** out_files,
-                                int32_t*         out_count);
+DW_API int32_t dw_get_file_list(const dw_task_key_t* key,
+                                dw_file_info_t**     out_files,
+                                int32_t*             out_count);
 
 /* ================================================================== */
 /*                        边下边播（区间 / 提优 / 进度）              */
@@ -568,17 +588,17 @@ DW_API int32_t dw_get_file_list(int64_t          id,
  *   - 下载中任务（DOWNLOADING/RESOLVING）：返回空 + 状态码 1（代理应等待）；
  *   - 非下载中任务：回退 DB 快照（静态数据，不会增长）。
  *
- * @param id          任务自增 id。
+ * @param key         任务唯一键。
  * @param file_index  文件索引（HTTP 恒 0）。
  * @param out_ranges  输出：堆分配的区间数组（调用者 dw_byte_range_free 释放）；无区间时为 NULL。
  * @param out_count   输出：区间数量。
  * @return            0=成功且有数据，1=成功但无数据（下载中，应等待重试），
  *                    2=成功但无数据（非下载中，不应等待），-1=失败。
  */
-DW_API int32_t dw_get_file_ranges(int64_t           id,
-                                  int32_t           file_index,
-                                  dw_byte_range_t** out_ranges,
-                                  int32_t*          out_count);
+DW_API int32_t dw_get_file_ranges(const dw_task_key_t*  key,
+                                  int32_t              file_index,
+                                  dw_byte_range_t**    out_ranges,
+                                  int32_t*             out_count);
 
 /**
  * 释放 dw_get_file_ranges 返回的区间数组。
@@ -594,57 +614,16 @@ DW_API void dw_byte_range_free(dw_byte_range_t* ranges, int32_t count);
  * 按 save_path/filename 拼接物理路径（save_path 已含包层目录）；
  * BT 多文件另经 task_files 表按 file_index 查 name（name 已含完整相对路径）。
  *
- * @param id           任务自增 id。
- * @param file_index   文件索引（HTTP 恒 0）。
- * @param out_path     输出：堆分配路径字符串（调用者 dw_free 释放）；失败时为 NULL。
- * @param out_size     输出：文件总字节数；未知时为 -1。
- * @return             0=成功，-1=失败（任务不存在 / 参数非法）。
+ * @param key         任务唯一键。
+ * @param file_index  文件索引（HTTP 恒 0）。
+ * @param out_path    输出：堆分配路径字符串（调用者 dw_free 释放）；失败时为 NULL。
+ * @param out_size    输出：文件总字节数；未知时为 -1。
+ * @return            0=成功，-1=失败（任务不存在 / 参数非法）。
  */
-DW_API int32_t dw_get_task_file_info(int64_t id,
-                                     int32_t file_index,
-                                     char**  out_path,
-                                     int64_t* out_size);
-
-/**
- * 设置任务内多个文件的下载优先级（任务内文件级优先）。
- *
- * HTTP 为 no-op（单文件），返回 DW_REASON_NONE。
- * torrent：逐文件调 torrent_handle::file_priority 设置。
- *
- * @param id            任务自增 id；库内按 id 回读引擎键后分发。
- * @param file_indexes  文件索引数组，不可为 NULL。
- * @param priorities    优先级数组（与 file_indexes 一一对应），不可为 NULL。
- * @param count         数组长度。
- * @param out_result    输出：同步结果；code=DW_REASON_NONE 表示成功。
- * @return              0=成功，-1=失败（任务不存在 / 参数非法）。
- */
-DW_API int32_t dw_set_file_priorities(int64_t             id,
-                                      const int32_t*      file_indexes,
-                                      const int32_t*      priorities,
-                                      int32_t             count,
-                                      dw_submit_result_t* out_result);
-
-/**
- * 修改/确认 BT 任务的文件选择。
- *
- * 落库文件选择意图（跨重启有效）：
- * - QUEUED / RESOLVING：仅落库，调度准入时取最新选择；
- * - DOWNLOADING：锁外立即应用新选择；
- * - PAUSED / ERROR：重置入队等待准入；
- * - COMPLETED：仅记录，不重启任务。
- *
- * HTTP 为 no-op（单文件无选择语义），返回 DW_REASON_NONE。
- *
- * @param id            任务自增 id。
- * @param file_indexes  要下载的文件索引数组；NULL 或 count<=0 表示下载全部文件。
- * @param count         数组长度。
- * @param out_result    输出：同步结果；code=DW_REASON_NONE 表示成功。
- * @return              0=成功，-1=失败（任务不存在 / 参数非法）。
- */
-DW_API int32_t dw_confirm_file_selection(int64_t             id,
-                                         const int32_t*      file_indexes,
-                                         int32_t             count,
-                                         dw_submit_result_t* out_result);
+DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
+                                     int32_t             file_index,
+                                     char**              out_path,
+                                     int64_t*            out_size);
 
 /**
  * 声明当前正在播放的文件与播放字节偏移，驱动播放点附近 piece 提优。
@@ -653,44 +632,44 @@ DW_API int32_t dw_confirm_file_selection(int64_t             id,
  * torrent：对偏移附近 piece 施加 set_piece_deadline（readahead 窗口）。
  * file_index<0 表示停止播放态提优（clear_piece_deadlines）。
  *
- * @param id           任务自增 id；库内按 id 回读引擎键后分发。
- * @param file_index   文件索引；<0 表示停止提优。
- * @param byte_offset  当前播放字节偏移（文件内）。
- * @param out_result   输出：同步结果；code=DW_REASON_NONE 表示成功。
- * @return             0=成功，-1=失败（任务不存在 / 参数非法）。
+ * @param key         任务唯一键。
+ * @param file_index  文件索引；<0 表示停止提优。
+ * @param byte_offset 当前播放字节偏移（文件内）。
+ * @param out_result  输出：同步结果；code=DW_REASON_NONE 表示成功。
+ * @return            0=成功，-1=失败（任务不存在 / 参数非法）。
  */
-DW_API int32_t dw_set_playing_file(int64_t             id,
-                                   int32_t             file_index,
-                                   int64_t             byte_offset,
-                                   dw_submit_result_t* out_result);
+DW_API int32_t dw_set_playing_file(const dw_task_key_t*  key,
+                                   int32_t              file_index,
+                                   int64_t              byte_offset,
+                                   dw_submit_result_t*  out_result);
 
 /**
- * 写入文件播放进度（毫秒），落 file_cache 表。由 App 侧防抖调用。
+ * 写入文件播放进度（毫秒），落 task_files 表。由 App 侧防抖调用。
  *
  * 与下载协议无关，wrapper 只存不解释播放语义。
  *
- * @param id           任务自增 id。
- * @param file_index   文件索引（HTTP 恒 0）。
- * @param position_ms  播放进度（毫秒）。
- * @param out_result   输出：同步结果；code=DW_REASON_NONE 表示成功。
- * @return             0=成功，-1=失败（参数非法 / 落库失败）。
+ * @param key         任务唯一键。
+ * @param file_index  文件索引（HTTP 恒 0）。
+ * @param position_ms 播放进度（毫秒）。
+ * @param out_result  输出：同步结果；code=DW_REASON_NONE 表示成功。
+ * @return            0=成功，-1=失败（参数非法 / 落库失败）。
  */
-DW_API int32_t dw_set_play_position(int64_t             id,
-                                    int32_t             file_index,
-                                    int64_t             position_ms,
-                                    dw_submit_result_t* out_result);
+DW_API int32_t dw_set_play_position(const dw_task_key_t*  key,
+                                    int32_t              file_index,
+                                    int64_t              position_ms,
+                                    dw_submit_result_t*  out_result);
 
 /**
  * 读取已保存的文件播放进度（毫秒）。
  *
- * @param id               任务自增 id。
- * @param file_index       文件索引（HTTP 恒 0）。
- * @param out_position_ms  输出：播放进度毫秒；无记录时为 0，不可为 NULL。
- * @return                 0=成功（含无记录），-1=失败（参数非法）。
+ * @param key             任务唯一键。
+ * @param file_index      文件索引（HTTP 恒 0）。
+ * @param out_position_ms 输出：播放进度毫秒；无记录时为 0，不可为 NULL。
+ * @return                0=成功（含无记录），-1=失败（参数非法）。
  */
-DW_API int32_t dw_get_play_position(int64_t  id,
-                                    int32_t  file_index,
-                                    int64_t* out_position_ms);
+DW_API int32_t dw_get_play_position(const dw_task_key_t* key,
+                                    int32_t              file_index,
+                                    int64_t*             out_position_ms);
 
 /* ================================================================== */
 /*                        任务快照与队列                              */
@@ -714,11 +693,11 @@ DW_API int32_t dw_list_tasks(dw_task_snapshot_t** out_tasks,
  *
  * 立即持久化并触发一次队列调度；对下载中任务仅更新优先级、不中断。
  *
- * @param id        任务自增 id。
- * @param priority  新优先级值。
- * @return          0=成功，-1=失败（任务不存在）。
+ * @param key      任务唯一键。
+ * @param priority 新优先级值。
+ * @return         0=成功，-1=失败（任务不存在）。
  */
-DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority);
+DW_API int32_t dw_set_task_priority(const dw_task_key_t* key, int32_t priority);
 
 /* ================================================================== */
 /*                        任务文件持久化                              */
@@ -729,14 +708,68 @@ DW_API int32_t dw_set_task_priority(int64_t id, int32_t priority);
  *
  * 用于任务详情页展示文件列表；即使引擎句柄已释放仍可读取。
  *
- * @param id          任务自增 id；task_files 表按 id 直接关联。
- * @param out_files   输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
- * @param out_count   输出：文件数量。
- * @return            0=成功，-1=失败（任务不存在或无文件记录）。
+ * @param key       任务唯一键。
+ * @param out_files 输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
+ * @param out_count 输出：文件数量。
+ * @return          0=成功，-1=失败（任务不存在或无文件记录）。
  */
-DW_API int32_t dw_load_task_files(int64_t id,
-                                   dw_file_info_t** out_files,
-                                   int32_t* out_count);
+DW_API int32_t dw_load_task_files(const dw_task_key_t* key,
+                                   dw_file_info_t**    out_files,
+                                   int32_t*            out_count);
+
+/* ================================================================== */
+/*                        本地文件浏览与管理                          */
+/* ================================================================== */
+
+/**
+ * 增量扫描本地文件任务。
+ *
+ * 扫描 save_path 目录，将非下载任务占用且尚未登记的条目注册为本地文件任务
+ * （source=1，status=COMPLETED）。已有任务不做任何处理（增量添加，不删除旧记录）。
+ * 仅返回本次新增的任务快照，返回的数组经 dw_task_list_free 释放。
+ *
+ * @param save_path    下载目录路径。
+ * @param out_tasks    输出：堆分配的新增任务快照数组。
+ * @param out_count    输出：新增任务数量。
+ * @return             0=成功，-1=失败。
+ */
+DW_API int32_t dw_scan_local_tasks(const char*           save_path,
+                                    dw_task_snapshot_t** out_tasks,
+                                    int32_t*             out_count);
+
+/**
+ * 校验本地文件任务的存在性。
+ *
+ * 遍历 save_path 下所有 source=1 且未失效的任务，检查物理文件是否仍存在。
+ * 不存在的任务状态迁移为 INVALIDATED。
+ *
+ * @param save_path              下载目录路径。
+ * @param out_invalidated_count  输出：本次新标记为失效的任务数量（可为 NULL）。
+ * @return                       0=成功，-1=失败。
+ */
+DW_API int32_t dw_validate_local_tasks(const char* save_path,
+                                        int32_t*    out_invalidated_count);
+
+/**
+ * 全量清理指定 save_path 下的非下载任务（source IN (1,2)）。
+ *
+ * 删除物理文件 + DB 记录，不涉及 engine 层。
+ *
+ * @param save_path  下载目录路径。
+ * @return           0=成功，-1=失败。
+ */
+DW_API int32_t dw_clear_local_tasks(const char* save_path);
+
+/**
+ * 删除本地文件任务（source=1）。
+ *
+ * 仅 DB + 磁盘清理，不涉及 engine 层。
+ * 下载任务（source=0）拒绝，应走 dw_delete_task。
+ *
+ * @param key  任务唯一键（key_type=DW_KEY_TYPE_LOCAL）。
+ * @return     0=成功，-1=失败（非本地任务或不存在）。
+ */
+DW_API int32_t dw_delete_local_entry(const dw_task_key_t* key);
 
 /* ================================================================== */
 /*                          资源释放                                  */
@@ -778,4 +811,4 @@ DW_API void dw_free(void* ptr);
 } /* extern "C" */
 #endif
 
-#endif /* DOWNLOAD_WRAPPER_H */
+

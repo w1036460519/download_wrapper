@@ -5,8 +5,7 @@
  * 库内多个模块（任务中枢、HTTP/BT 引擎、日志）均需获取时间戳与格式化时间，
  * 统一收敛到此处，避免各文件重复实现。
  */
-#ifndef DW_UTILS_TIME_UTIL_H
-#define DW_UTILS_TIME_UTIL_H
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -28,4 +27,4 @@ namespace dw::utils {
 
 }
 
-#endif /* DW_UTILS_TIME_UTIL_H */
+

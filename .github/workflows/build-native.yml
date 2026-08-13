@@ -1,26 +1,7 @@
 name: Build download_wrapper
 
-# 触发条件：改动源码/依赖/本工作流时构建；推送 v* 标签时构建并发布 Release；也支持手动触发
+# 触发条件：仅手动触发（Actions 页面 → Run workflow）
 on:
-  push:
-    branches: [main]
-    tags:
-      - 'v*'
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'CMakeLists.txt'
-      - 'vcpkg.json'
-      - 'vcpkg-triplets/**'
-      - '.github/workflows/build-native.yml'
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'CMakeLists.txt'
-      - 'vcpkg.json'
-      - 'vcpkg-triplets/**'
-      - '.github/workflows/build-native.yml'
   workflow_dispatch:
 
 env:

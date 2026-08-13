@@ -1,5 +1,4 @@
-#ifndef DOWNLOAD_WRAPPER_PLAYBACK_PROXY_H
-#define DOWNLOAD_WRAPPER_PLAYBACK_PROXY_H
+#pragma once
 
 #include "download_wrapper/download_wrapper.h"
 
@@ -20,10 +19,13 @@ DW_API void dw_proxy_stop(void);
 
 /// 生成代理 URL
 ///
-/// \param task_id    任务 ID（数据库自增主键）
-/// \param file_index 文件索引（HTTP 恒 0）
-/// \return URL 字符串（线程局部静态存储，下次调用覆盖）
-DW_API const char* dw_proxy_get_url(int task_id, int file_index);
+/// URL 形如 http://127.0.0.1:<port>/file?type=<http|bt>&key=<urlencoded natural_key>&file=<index>
+/// 调用方须保证 key 在返回的 URL 使用期间有效（线程局部静态存储）。
+///
+/// \param key        任务唯一键：key_type + natural_key。
+/// \param file_index 文件索引（HTTP 恒 0）。
+/// \return URL 字符串（线程局部静态存储，下次调用覆盖）。
+DW_API const char* dw_proxy_get_url(const dw_task_key_t* key, int file_index);
 
 /// 查询代理是否运行中
 ///
@@ -33,5 +35,3 @@ DW_API int dw_proxy_is_running(void);
 #ifdef __cplusplus
 }
 #endif
-
-#endif // DOWNLOAD_WRAPPER_PLAYBACK_PROXY_H

@@ -5,8 +5,7 @@
  * 库内多处需要把字符串数组 / 整型数组与单一分隔符文本互转，
  * 统一收敛到此处，避免各文件重复实现。
  */
-#ifndef DW_UTILS_STRING_UTIL_H
-#define DW_UTILS_STRING_UTIL_H
+#pragma once
 
 #include <cstdint>
 #include <string>
@@ -44,9 +43,16 @@ namespace dw::utils {
     /**
  * 提取文件名扩展名（不含点），基于 std::filesystem::path::extension()。
  * @param name 单段文件名（非路径）。
- * @return 扩展名（"a.tar.gz" 返回 "gz"）；无扩展名、dotfile（".hidden"）或尾点（"name."）返回空串。
+ * @return 扩展名（"a.tar.gz" 返回 "gz"）；无扩展名、dotfile（".hidden"）或尾点 （"name."）返回空串。
  */
     std::string file_extension(const std::string &name);
+
+    /**
+ * 去除文件名扩展名（去掉最后一个点之后的尾段，保留 dotfile）。
+ * @param name 单段文件名。
+ * @return 去后缀后的名称（"a.tar.gz" 返回 "a.tar"）；无扩展名返回原串。
+ */
+    std::string strip_extension(const std::string &name);
 }
 
-#endif /* DW_UTILS_STRING_UTIL_H */
+

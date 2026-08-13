@@ -12,8 +12,7 @@
  *     由 download_wrapper.cpp 经具体指针调用，不污染本接口。
  */
 
-#ifndef DW_ENGINE_INTERFACE_H
-#define DW_ENGINE_INTERFACE_H
+#pragma once
 
 #include "download_wrapper/download_wrapper.h"
 
@@ -76,6 +75,11 @@ public:
                                          const int32_t* /*file_indexes*/,
                                          int32_t        /*count*/) { return 0; }
 
+    /// 播放提优能力（BT 覆写）：为指定文件设置 piece deadline 以加速播放。
+    /// @return 0=成功，-1=失败（任务不存在 / 元数据未就绪）。
+    virtual int32_t set_playing_file(const char* /*id*/, int32_t /*file_index*/,
+                                     int64_t /*byte_offset*/) { return -1; }
+
     /// 包层迁移能力（BT 覆写）：把 handle 的 save_path 迁至 new_save_path，
     /// 异步收敛（storage_moved_alert 到达后推 naming_ready=2 通知调度放行）；
     /// 包层不改文件内部相对路径，文件树无需重推。
@@ -86,4 +90,4 @@ public:
 
 } // namespace dw
 
-#endif /* DW_ENGINE_INTERFACE_H */
+

@@ -3,14 +3,14 @@
  * @brief download_wrapper 内部实现头文件，不对外暴露。
  */
 
-#ifndef DOWNLOADER_INTERNAL_H
-#define DOWNLOADER_INTERNAL_H
+#pragma once
 
 #include "download_wrapper/download_wrapper.h"
 
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -31,6 +31,9 @@ enum class EngineEventType {
     DOWNLOAD_FAILED,    // 下载失败（通用失败事件）
     DOWNLOAD_COMPLETED, // 下载完成
     STATUS_UPDATE,      // 状态+进度更新（替代原 post_progress）
+    RESUME_DATA,        // 断点续传数据就绪（BT resume）
+    BT_PAUSED,          // BT 引擎已实际暂停（libtorrent handle.pause 已生效），由 alert 线程确认后投递
+    BT_RESUMED,         // BT 引擎已实际恢复（libtorrent handle.resume 已生效），由 alert 线程确认后投递
 };
 
 /**
@@ -64,7 +67,87 @@ struct EngineEvent {
     int32_t          support_range = 0;
     std::string      etag;
     std::string      last_modified;
+
+    // RESUME_DATA 事件字段
+    std::vector<uint8_t> resume_data;
 };
+
+// ---- 枚举名称序列化（供 to_string 重载使用）----
+
+inline const char* to_string(EngineEventType t) {
+    switch (t) {
+    case EngineEventType::PARSED:             return "PARSED";
+    case EngineEventType::DOWNLOAD_FAILED:    return "DOWNLOAD_FAILED";
+    case EngineEventType::DOWNLOAD_COMPLETED: return "DOWNLOAD_COMPLETED";
+    case EngineEventType::STATUS_UPDATE:      return "STATUS_UPDATE";
+    case EngineEventType::RESUME_DATA:        return "RESUME_DATA";
+    case EngineEventType::BT_PAUSED:          return "BT_PAUSED";
+    case EngineEventType::BT_RESUMED:         return "BT_RESUMED";
+    }
+    return "UNKNOWN";
+}
+
+inline const char* to_string(dw_protocol_t p) {
+    switch (p) {
+    case DW_PROTOCOL_HTTP:    return "HTTP";
+    case DW_PROTOCOL_TORRENT: return "TORRENT";
+    }
+    return "UNKNOWN";
+}
+
+inline const char* to_string(dw_task_status_t s) {
+    switch (s) {
+    case DW_TASK_STATUS_DOWNLOADING:  return "DOWNLOADING";
+    case DW_TASK_STATUS_PAUSED:       return "PAUSED";
+    case DW_TASK_STATUS_COMPLETED:    return "COMPLETED";
+    case DW_TASK_STATUS_ERROR:        return "ERROR";
+    case DW_TASK_STATUS_QUEUED:       return "QUEUED";
+    case DW_TASK_STATUS_RESOLVING:    return "RESOLVING";
+    case DW_TASK_STATUS_PARSED:       return "PARSED";
+    case DW_TASK_STATUS_INVALIDATED:  return "INVALIDATED";
+    }
+    return "UNKNOWN";
+}
+
+inline const char* to_string(dw_reason_t r) {
+    switch (r) {
+    case DW_REASON_NONE:          return "NONE";
+    case DW_REASON_INTERNAL:      return "INTERNAL";
+    case DW_REASON_NETWORK:       return "NETWORK";
+    case DW_REASON_INVALID_INPUT: return "INVALID_INPUT";
+    case DW_REASON_AUTH:          return "AUTH";
+    case DW_REASON_ERROR:         return "ERROR";
+    }
+    return "UNKNOWN";
+}
+
+// ---- EngineEvent 序列化（重载，类 std::to_string 约定）----
+
+inline std::string to_string(const EngineEvent &e) {
+    std::ostringstream os;
+    os << "EngineEvent{type=" << to_string(e.type)
+       << ", key=" << e.engine_key
+       << ", proto=" << to_string(e.protocol)
+       << ", name=" << e.name
+       << ", save_path=" << e.save_path
+       << ", multi_file=" << e.multi_file
+       << ", files=" << e.files.size()
+       << ", reason=" << to_string(e.reason)
+       << ", msg=" << e.message
+       << ", status=" << to_string(e.status)
+       << ", valid=" << e.valid
+       << ", total_size=" << e.total_size
+       << ", total_done=" << e.total_done
+       << ", progress=" << e.progress
+       << ", dl_rate=" << e.download_rate
+       << ", ul_rate=" << e.upload_rate
+       << ", support_range=" << e.support_range
+       << ", etag=" << e.etag
+       << ", last_modified=" << e.last_modified
+       << ", resume_size=" << e.resume_data.size()
+       << "}";
+    return os.str();
+}
 
 /**
  * 下载器全局单例内部实现。
@@ -122,19 +205,31 @@ void post_task_files(const char*           engine_key,
                      int32_t               count);
 
 /**
+ * 内部单文件节点懒创建 / 进度推送：按 (engine_key, file_index) 命中 task_id 后
+ * upsert task_files 一行（不存在则插入下载中占位，存在则仅上提 downloaded_bytes / size）。
+ * HTTP 探测定名后零碎进度 / BT 元数据外的 per-file 进度均走此路径。
+ */
+void post_task_file_update(const char*   engine_key,
+                           dw_protocol_t protocol,
+                           int32_t       file_index,
+                           int64_t       downloaded_bytes,
+                           int64_t       total_size);
+
+/**
  * 内部唯一名上调：引擎在元数据就绪 / 探测出名时请求定名。
  *
- * 内部转 TaskManager::resolve_and_record_name：持锁以磁盘为唯一真相源抢占唯一名
- *（候选未被占用即立即创建条目物化占位）→ 回写任务 name=filename=原名、
- * wrap_dir=包层目录名（未冲突为空）并立即落库（持久预留）。返回第一层条目名：
- * 与入参 name 不等即重名包层（返回值即 wrap_dir），引擎应将落盘目录追加一层该返回值
- * 目录（文件本名不变）；任务未知时仅抢名返回（不落库）。
- * 本通道占位形态恒为文件（HTTP 单文件模型），多文件协议不得经此路径定名。
+ * 内部转 TaskManager::resolve_and_record_name：持锁以磁盘为唯一真相源抢占唯一 wrapper 名
+ * （候选未被占用即立即创建 wrapper 目录物化占位）→ 回写任务 name=wrapper（可能含 (n) 后缀）、
+ * filename=inner_name（HTTP/BT 单文件）、save_path=原 dir（不变）并立即落库（持久预留）。
+ * 返回 wrapper 名（与入参 wrapper_name 不等即重名包层，调用方按目录名创建 wrapper）；
+ * 任务未知时仅抢名返回（不落库）。
+ * 本通道 wrapper 占位恒为目录，多文件 BT 不得经此路径定名（走 PARSED 事件）。
  */
 std::string request_unique_name(const char*   engine_key,
                                 dw_protocol_t protocol,
                                 const char*   dir,
-                                const char*   name);
+                                const char*   wrapper_name,
+                                const char*   inner_name);
 
 /* ================================================================== */
 /*                          引擎事件投递                              */
@@ -164,11 +259,11 @@ void emit_logf(dw_log_level_t level, const char* trace_id,
                const char* func, int32_t line,
                const char* fmt, ...) DW_PRINTF_FMT(5, 6);
 
-/// 从 task_id 计算 trace_id（hash 截取 8 位十六进制），无需跨层透传。
+/// 从 task_id 计算 trace_id（取 size_t 自然宽度，不补零），无需跨层透传。
 inline std::string make_trace(const char* task_id) {
     if (!task_id || !task_id[0]) return {};
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "%08zx",
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%zx",
                   std::hash<std::string_view>{}(task_id));
     return buf;
 }
@@ -193,4 +288,3 @@ inline std::string make_trace(const char* task_id) {
 #define DW_LOG_SYS(level, fmt, ...) \
     dw::emit_logf((level), "", __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__)
 
-#endif /* DOWNLOADER_INTERNAL_H */
