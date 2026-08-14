@@ -238,7 +238,7 @@ typedef struct dw_progress {
 
     /* ===== HTTP 特有字段 ===== */
 
-    int32_t          support_range;    /**< 服务器是否支持 Range：0/1。 */
+    int32_t          support_range;    /**< 服务器是否支持 Range：0=不支持（200，单分片全量），1=支持（206，可分片并发/续传）。 */
     const char*      etag;             /**< HTTP ETag。 */
     const char*      last_modified;    /**< HTTP Last-Modified。 */
 

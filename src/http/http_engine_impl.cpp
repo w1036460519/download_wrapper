@@ -896,12 +896,11 @@ namespace dw {
                 ev.type = EngineEventType::STATUS_UPDATE;
                 ev.engine_key = tCtx->url;
                 ev.protocol = DW_PROTOCOL_HTTP;
-                ev.valid = true;
-                ev.status = snap.task_status;
                 ev.total_size = snap.total_size;
                 ev.total_done = snap.total_done;
                 ev.progress = snap.progress;
                 ev.download_rate = snap.download_rate;
+                ev.total_upload = 0; // HTTP 协议无上传量
                 ev.name = tCtx->filename;
                 ev.support_range = snap.support_range;
                 ev.etag = tCtx->etag;

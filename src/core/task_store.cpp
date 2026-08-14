@@ -144,6 +144,7 @@ namespace dw {
                 "  progress REAL,"
                 "  total_size INTEGER,"
                 "  total_done INTEGER,"
+                // 服务端 Range 支持：0=不支持（200，单分片全量），1=支持（206，可分片并发/续传）
                 "  support_range INTEGER,"
                 "  etag TEXT,"
                 "  last_modified TEXT,"

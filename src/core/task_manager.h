@@ -255,6 +255,16 @@ namespace dw {
         // 在引擎启动一个任务（不持 mtx_）；BT 携带 resume_data
         bool start_engine_task(const TaskRecord &task_record, const std::vector<uint8_t> &resume);
 
+        // 同步等待 task 达到任一指定状态。调用方须持 unique_lock 传入（与 run_schedule 模式一致），
+        // 内部 cv_.wait_for 期间会释放锁供 B 线程消费事件；返回时锁仍由调用方持有。
+        // timeout=0 表示不超时。返回 true=任一目标状态置位，false=超时/running_ 关闭/任务被删除/中途 ERROR。
+        // 用于 add_task / resume_task 同步阻塞到「BT 走 PARSED→QUEUED，HTTP 走 RESOLVING→DOWNLOADING」
+        // （HTTP 引擎不推 PARSED 事件，状态机直接 RESOLVING→DOWNLOADING 跳过 QUEUED）。
+        bool await_status_locked(std::unique_lock<std::mutex> &lock,
+                                 const TaskKey &key,
+                                 const std::initializer_list<dw_task_status_t> &targets,
+                                 std::chrono::milliseconds timeout);
+
         // 复位运行态遥测（速率/探测/原因/消息）：任务离开活跃态转 PAUSED/QUEUED 时调用，避免合成帧残留旧速率。
         static void reset_live_telemetry(TaskRecord &rec);
 

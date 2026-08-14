@@ -109,7 +109,7 @@ struct TaskRecord {
     int64_t          total_size   = -1;
     int64_t          total_done   = -1;
     double           progress     = -1.0;
-    int32_t          support_range = 0;
+    int32_t          support_range = 0;  // 服务端 Range 支持：0=不支持（200，单分片全量），1=支持（206，可分片并发/续传）
     std::string      etag;
     std::string      last_modified;
 
@@ -122,6 +122,7 @@ struct TaskRecord {
     // 任务离开活跃态转 PAUSED/QUEUED 时归零，避免合成帧残留旧值。
     double      download_rate = 0.0;            // 下载速率（B/s）
     double      upload_rate   = 0.0;            // 上传速率（B/s）；HTTP 恒为 0
+    int64_t     total_upload  = 0;              // 累计上传字节（bytes）；HTTP 恒为 0，BT 取自 all_time_upload
     dw_reason_t reason        = DW_REASON_NONE; // 采集到的原因码；仅终态 ERROR 有意义
     std::string message;                        // 采集到的状态 / 错误文本
 

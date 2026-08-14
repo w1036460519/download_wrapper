@@ -39,37 +39,37 @@ enum class EngineEventType {
 /**
  * 引擎事件载体（自带值语义，可安全跨线程按值传递）。
  *
- * 文件节点数组经深拷贝存入事件，消费方负责释放各节点字符串字段。
+ * 字段按事件类型复用：PARSED 事件用 name/save_path/files，STATUS_UPDATE 用进度/速率/总量，
+ * BT_PAUSED/BT_RESUMED 等简单事件仅设 type/engine_key/protocol。消费方按 event.type 分支解析。
+ * files 中各节点的字符串字段由调用方释放（投递前已完成深拷贝）。
  */
 struct EngineEvent {
-    EngineEventType type;
-    std::string     engine_key;
-    dw_protocol_t   protocol = DW_PROTOCOL_TORRENT;
+    EngineEventType type;                 // 事件类型（决定其余字段语义）
+    std::string     engine_key;           // 引擎侧标识（BT=info_hash，HTTP=url）
+    dw_protocol_t   protocol = DW_PROTOCOL_TORRENT; // 来源协议
 
     // PARSED 事件字段
-    std::string name;              // 种子名称
+    std::string name;              // 种子/文件名（HTTP 探测定名或 BT 元数据）
     std::string save_path;         // 引擎当前 save_path
-    bool        multi_file = false; // 是否多文件种子
-    std::vector<dw_file_info_t> files; // 节点树（深拷贝）
+    std::vector<dw_file_info_t> files; // 节点树（深拷贝，仅 PARSED 使用）
 
     // DOWNLOAD_FAILED 事件字段
-    dw_reason_t reason  = DW_REASON_NONE;
-    std::string message;
+    dw_reason_t reason  = DW_REASON_NONE; // 失败原因码
+    std::string message;                  // 错误描述文本
 
-    // STATUS_UPDATE 事件字段（原 EngineProgress）
-    dw_task_status_t status = DW_TASK_STATUS_QUEUED;
-    bool             valid  = false;  // 引擎中是否存在该任务运行时上下文
-    int64_t          total_size    = -1;
-    int64_t          total_done    = -1;
-    double           progress      = -1.0;
-    double           download_rate = 0.0;
-    double           upload_rate   = 0.0;
-    int32_t          support_range = 0;
-    std::string      etag;
-    std::string      last_modified;
+    // STATUS_UPDATE 事件字段：进度+上报量（不携带 status，状态由事件类型或终态分支解析）
+    int64_t          total_size    = -1;       // 总字节数（bytes），-1=unknown
+    int64_t          total_done    = -1;       // 已完成字节数（bytes），-1=unknown
+    double           progress      = -1.0;     // 完成比例（0.0~1.0），-1.0=unknown
+    double           download_rate = 0.0;      // 下载速率（B/s）
+    double           upload_rate   = 0.0;      // 上传速率（B/s，HTTP 恒为 0）
+    int64_t          total_upload  = 0;        // 累计上传字节（bytes，HTTP 恒为 0）
+    int32_t          support_range = 0;        // 服务端 Range 支持：0=不支持（200，单分片全量），1=支持（206，可分片并发/续传）
+    std::string      etag;                    // HTTP ETag
+    std::string      last_modified;           // HTTP Last-Modified
 
     // RESUME_DATA 事件字段
-    std::vector<uint8_t> resume_data;
+    std::vector<uint8_t> resume_data;          // 序列化续传数据
 };
 
 // ---- 枚举名称序列化（供 to_string 重载使用）----
@@ -130,17 +130,15 @@ inline std::string to_string(const EngineEvent &e) {
        << ", proto=" << to_string(e.protocol)
        << ", name=" << e.name
        << ", save_path=" << e.save_path
-       << ", multi_file=" << e.multi_file
        << ", files=" << e.files.size()
        << ", reason=" << to_string(e.reason)
        << ", msg=" << e.message
-       << ", status=" << to_string(e.status)
-       << ", valid=" << e.valid
        << ", total_size=" << e.total_size
        << ", total_done=" << e.total_done
        << ", progress=" << e.progress
        << ", dl_rate=" << e.download_rate
        << ", ul_rate=" << e.upload_rate
+       << ", total_upload=" << e.total_upload
        << ", support_range=" << e.support_range
        << ", etag=" << e.etag
        << ", last_modified=" << e.last_modified

@@ -130,8 +130,7 @@ namespace dw {
                        static_cast<const void *>(params), static_cast<void *>(out_result));
             return -1;
         }
-        DW_LOG_TASK(DW_LOG_DEBUG, params->url ? params->url : "",
-                    "HTTP add_task 进入");
+        DW_LOG_TASK(DW_LOG_DEBUG, params->url, "HTTP add_task 进入");
 
         const char *url = (params->url && params->url[0]) ? params->url : nullptr;
         const char *err = nullptr;

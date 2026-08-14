@@ -65,7 +65,7 @@ namespace dw::utils {
         return ext.size() > 1 ? ext.substr(1) : std::string();
     }
 
-    std::string strip_extension(const std::string& name) {
+    std::string strip_extension(const std::string &name) {
         // 查找最后一个点：保留 dotfile（首字符为 . 且无其他点）；只剥真正的扩展名。
         if (name.empty()) return name;
         const auto p = std::filesystem::path(name);
