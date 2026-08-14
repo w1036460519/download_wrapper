@@ -75,11 +75,17 @@ namespace dw {
             }
         }
 
-        // 由 torrent_status 组装 STATUS_UPDATE 事件并经 post_engine_event 投递。
-        // alert 线程消费 state_update_alert 时批量调用。
-        // 不携带 status：状态由事件类型或终态分支解析（map_status 已移除）；
-        // 增加 total_upload（跨会话累计上传字节，取自 s.all_time_upload）。
+        // 处理 state_update_alert 事件
         EngineEvent make_status_update_event(const lt::torrent_status &s, const std::string &key) {
+            if (s.errc) {
+                DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "任务发生错误. code: %d, msg: %s",
+                            s.errc.value(), s.errc.message().c_str());
+                return EngineEvent{
+                    .type = EngineEventType::DOWNLOAD_FAILED,
+                    .engine_key = key,
+                    .protocol = DW_PROTOCOL_TORRENT
+                };
+            }
             EngineEvent ev;
             ev.type = EngineEventType::STATUS_UPDATE;
             ev.engine_key = key;
@@ -91,16 +97,10 @@ namespace dw {
             ev.upload_rate = static_cast<double>(s.upload_payload_rate);
             ev.total_upload = s.all_time_upload;
             ev.name = s.name;
-            ev.reason = s.errc ? DW_REASON_NETWORK : DW_REASON_NONE;
-            ev.message = s.errc ? s.errc.message() : std::string{};
             return ev;
         }
 
-        // 请求保存断点续传数据（异步，结果经 save_resume_data_alert 返回）。
-        // force=true 时无条件保存一次（用于完成移出后固化最终 save_path）；否则携
-        // 变更门槛标志：下载推进 / 配置变更（含改名）/ 暂停态变化 / 元数据变化才产生
-        // alert，去重下沉 libtorrent，支撑每拍无节流调用；刻意排除 if_counters_changed
-        //（活跃计时器每秒都在变，纳入会退化为每拍必存）。
+        // 请求保存恢复数据
         void request_save_resume(const lt::torrent_handle &h, const bool force = false) {
             if (!h.is_valid()) return;
             try {
@@ -119,7 +119,7 @@ namespace dw {
                 h.save_resume_data(flags);
             } catch (const std::exception &e) {
                 const std::string rsk = info_hash_hex(h);
-                DW_LOG_TASK(DW_LOG_ERROR, rsk.c_str(), "请求保存 resume_data 失败: %s", e.what());
+                DW_LOG_TASK(DW_LOG_ERROR, rsk.c_str(), "请求恢复数据失败: %s", e.what());
             }
         }
 
@@ -391,7 +391,7 @@ namespace dw {
                 r->message = nullptr;
             }
             if (code != DW_REASON_NONE) {
-                DW_LOG_TASK(DW_LOG_ERROR, task_id, "操作结果 code=%d msg=%s", code, msg ? msg : "");
+                DW_LOG_TASK(DW_LOG_ERROR, task_id, "操作结果 code=%d, msg=%s", code, msg ? msg : "");
             }
         }
     } // namespace（匿名）
@@ -443,11 +443,11 @@ namespace dw {
 
             g_session = std::make_unique<lt::session>(std::move(pack));
         } catch (const std::exception &e) {
-            DW_LOG_SYS(DW_LOG_ERROR, "创建 session 失败: %s", e.what());
+            DW_LOG_SYS(DW_LOG_ERROR, "初始化BT引擎失败: %s", e.what());
             return -1;
         }
         if (!g_session || !g_session->is_valid()) {
-            DW_LOG_SYS(DW_LOG_ERROR, "session 创建后无效");
+            DW_LOG_SYS(DW_LOG_ERROR, "初始化BT引擎失败");
             g_session.reset();
             return -1;
         }
@@ -456,7 +456,7 @@ namespace dw {
         g_alert_thread = std::thread(alert_loop);
 
         initialized_ = true;
-        DW_LOG_SYS(DW_LOG_INFO, "BT 引擎初始化完成 interval=%dms", g_interval_ms);
+        DW_LOG_SYS(DW_LOG_INFO, "初始化BT引擎完成 interval: %dms", g_interval_ms);
         return 0;
     }
 
@@ -464,7 +464,7 @@ namespace dw {
         if (!initialized_) {
             return;
         }
-        // 先停止 alert 线程，再销毁 session
+        // 先停止 alert 采集线程，再销毁 session
         g_running.store(false);
         if (g_alert_thread.joinable()) {
             g_alert_thread.join();
@@ -472,7 +472,7 @@ namespace dw {
         g_session.reset();
 
         initialized_ = false;
-        DW_LOG_SYS(DW_LOG_INFO, "BT 引擎已销毁");
+        DW_LOG_SYS(DW_LOG_INFO, "销毁BT引擎完成");
     }
 
     int32_t TorrentEngine::add_task(const dw_task_params_t *params,
