@@ -77,8 +77,8 @@ struct TaskRecord {
     std::string              torrent_file;  // BT
     std::string              name;          // 任务显示名称（种子原始名 / HTTP 原始文件名；STATUS_UPDATE 可更新）
 
-    std::vector<std::string> trackers;
     std::vector<int32_t>     file_indexes;
+    std::vector<int32_t>     priority_file_indexes; // 优先下载文件索引（不持久化）
 
     // 队列元数据
     int64_t     created_at  = 0;   // Unix 毫秒

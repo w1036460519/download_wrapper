@@ -634,8 +634,7 @@ namespace dw {
 
         const std::string key(info_hash);
 
-        lt::torrent_handle handle = find_handle(key);
-        if (!handle.is_valid()) {
+        if (lt::torrent_handle handle = find_handle(key); !handle.is_valid()) {
             // 重建：add_task 创建 handle，事件驱动状态流转，不在此 resume
             dw_submit_result_t add_result{};
             add_task(params, &add_result);
@@ -649,21 +648,65 @@ namespace dw {
             set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
             return 0;
         } else {
-            // handle 已存在：直接恢复下载
+            // handle 已存在：恢复下载
             if (const lt::torrent_status ts = handle.status(); ts.errc) {
                 handle.clear_error();
             }
+            // 设置文件优先级（无论是否暂停都需要设置）。
+            if (const std::shared_ptr<const lt::torrent_info> ti = handle.torrent_file(); ti) {
+                const int n = ti->files().num_files();
+                // 读取当前优先级，将已有 top_priority 重置为 default（适配取消优先）。
+                std::vector<lt::download_priority_t> prio = handle.get_file_priorities();
+                if (static_cast<int>(prio.size()) < n) {
+                    prio.resize(static_cast<size_t>(n), lt::dont_download);
+                }
+                for (auto &p: prio) {
+                    if (p == lt::top_priority) p = lt::default_priority;
+                }
+                // file_indexes: 控制是否下载，不在列表中的设为 dont_download。
+                if (params->file_indexes && params->file_index_size > 0) {
+                    for (int32_t i = 0; i < params->file_index_size; ++i) {
+                        if (params->file_indexes[i] >= 0 && params->file_indexes[i] < n) {
+                            prio[static_cast<size_t>(params->file_indexes[i])] = lt::default_priority;
+                        }
+                    }
+                }
+                // priority_file_indexes: 优先下载，设为最高优先级。
+                if (params->priority_file_indexes && params->priority_file_index_size > 0) {
+                    for (int32_t i = 0; i < params->priority_file_index_size; ++i) {
+                        if (params->priority_file_indexes[i] >= 0 && params->priority_file_indexes[i] < n) {
+                            prio[static_cast<size_t>(params->priority_file_indexes[i])] = lt::top_priority;
+                        }
+                    }
+                }
+                try {
+                    handle.prioritize_files(prio);
+                } catch (const std::exception &e) {
+                    DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "设置文件优先级失败: %s", e.what());
+                }
+            }
             try {
-                handle.set_flags(lt::torrent_flags::auto_managed);
-                handle.resume();
+                if (const lt::torrent_status st = handle.status(); st.flags & lt::torrent_flags::paused) {
+                    // 已暂停：调用 resume() 触发 torrent_resumed_alert → BT_RESUMED 事件。
+                    handle.set_flags(lt::torrent_flags::auto_managed);
+                    handle.resume();
+                    set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
+                    return 0;
+                }
+                // 非暂停状态：无需重复调用 handle.resume()，补发 BT_RESUMED 事件。
             } catch (const std::exception &e) {
                 set_result(out_result, key.c_str(), DW_REASON_ERROR, e.what());
                 return -1;
             }
-            DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "恢复下载（handle 已存在）");
-            set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
-            return 0;
+            // 重复操作补发恢复事件
+            post_engine_event(EngineEvent{
+                .type = EngineEventType::BT_RESUMED,
+                .engine_key = key,
+                .protocol = DW_PROTOCOL_TORRENT
+            });
         }
+        set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
+        return 0;
     }
 
     int32_t TorrentEngine::pause_task(const char *task_id,
@@ -673,15 +716,28 @@ namespace dw {
             set_result(out_result, task_id, DW_REASON_ERROR, "任务标识为空");
             return -1;
         }
-        if (const lt::torrent_handle handle = find_handle(std::string(task_id)); handle.is_valid()) {
+        const std::string key(task_id);
+        if (const lt::torrent_handle handle = find_handle(key); handle.is_valid()) {
             try {
-                handle.unset_flags(lt::torrent_flags::auto_managed);
-                handle.pause();
+                const lt::torrent_status st = handle.status();
+                if (!(st.flags & lt::torrent_flags::paused)) {
+                    // 未暂停：调用 pause() 触发 torrent_paused_alert → BT_PAUSED 事件。
+                    handle.unset_flags(lt::torrent_flags::auto_managed);
+                    handle.pause();
+                    set_result(out_result, task_id, DW_REASON_NONE, nullptr);
+                    return 0;
+                }
             } catch (const std::exception &e) {
                 set_result(out_result, task_id, DW_REASON_ERROR, e.what());
                 return -1;
             }
         }
+        // 重复操作补发暂停事件
+        post_engine_event(EngineEvent{
+            .type = EngineEventType::BT_PAUSED,
+            .engine_key = key,
+            .protocol = DW_PROTOCOL_TORRENT
+        });
         set_result(out_result, task_id, DW_REASON_NONE, nullptr);
         return 0;
     }

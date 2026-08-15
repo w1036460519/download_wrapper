@@ -1220,12 +1220,11 @@ namespace dw {
              *          Part 6: 辅助函数
              * ===================================================================== */
 
-            std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path,
-                                                         const char *filename) {
+            std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path) {
                 auto tCtx = std::make_unique<dl_task_ctx>();
                 tCtx->url = url;
                 tCtx->output_path = output_path;
-                tCtx->filename = filename ? filename : "";
+                // filename 留空：由探测阶段从 URL 或 Content-Disposition 响应头解析。
                 tCtx->total_size = -1;
                 tCtx->status = DW_TASK_STATUS_DOWNLOADING;
                 tCtx->reason = DW_REASON_NONE;

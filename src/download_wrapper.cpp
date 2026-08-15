@@ -295,7 +295,8 @@ DW_API void dw_set_log_callback(dw_log_cb cb) {
 
 DW_API int32_t dw_add_task(dw_protocol_t           protocol,
                            const dw_task_params_t* params,
-                           dw_submit_result_t*     out_result) {
+                           dw_submit_result_t*     out_result,
+                           const int32_t           force) {
     auto* d = dw::global_downloader();
     const char* trace_id = (params && params->trace_id) ? params->trace_id : "";
     if (!d || !d->initialized.load() || !params || !out_result) {
@@ -316,7 +317,7 @@ DW_API int32_t dw_add_task(dw_protocol_t           protocol,
         return -1;
     }
     // 入队 + 调度由 TaskManager 统一接管，引擎启动由调度线程按并发额度触发。
-    return d->task_manager->add(protocol, params, out_result);
+    return d->task_manager->add(protocol, params, out_result, force != 0);
 }
 
 DW_API int32_t dw_pause_task(const dw_task_key_t*  key,
@@ -350,6 +351,7 @@ DW_API int32_t dw_pause_task(const dw_task_key_t*  key,
 }
 
 DW_API int32_t dw_resume_task(const dw_task_key_t* key,
+                              const char **trackers, int32_t tracker_count,
                               dw_submit_result_t*  out_result) {
     auto* d = dw::global_downloader();
     if (!d || !d->initialized.load() || !out_result) {
@@ -365,10 +367,9 @@ DW_API int32_t dw_resume_task(const dw_task_key_t* key,
     out_result->code    = DW_REASON_NONE;
     out_result->message = nullptr;
 
-    // 协议仅在传递到引擎时才需要；resume 本身仅改内存态与触发重调度。
     const dw_protocol_t proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     const std::string nk = dw::natural_key_of(key);
-    const int32_t rc = d->task_manager->resume(proto, nk, out_result);
+    const int32_t rc = d->task_manager->resume(proto, nk, trackers, tracker_count, out_result);
     if (rc != 0) {
         out_result->code = DW_REASON_ERROR;
         return rc;
@@ -449,14 +450,14 @@ DW_API char* dw_info_hash_to_magnet(const dw_task_key_t* key) {
         return nullptr;
     }
     // 按任务键回读 info_hash（BT 的 natural_key 即 info_hash）。
-    std::string info_hash;
+    dw::TaskRecord task_record;
     const dw_protocol_t proto = key->protocol;
-    if (!d->task_manager->engine_key_of(proto, dw::natural_key_of(key), info_hash)) {
+    if (!d->task_manager->load_task_record(proto, dw::natural_key_of(key), task_record)) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 key_type=%d natural_key=%s",
                 key->protocol, key->natural_key ? key->natural_key : "");
         return nullptr;
     }
-    return dw::TorrentEngine::info_hash_to_magnet(info_hash.c_str());
+    return dw::TorrentEngine::info_hash_to_magnet(task_record.info_hash.c_str());
 }
 
 DW_API int32_t dw_parse_torrent_file(const char*      torrent_file_path,
@@ -742,7 +743,9 @@ DW_API int32_t dw_list_tasks(dw_task_snapshot_t** out_tasks,
     return d->task_manager->list(out_tasks, out_count);
 }
 
-DW_API int32_t dw_set_task_priority(const dw_task_key_t* key, int32_t priority) {
+DW_API int32_t dw_set_task_priority(const dw_task_key_t* key,
+                                    const int32_t *priority_file_indexes,
+                                    const int32_t priority_file_index_size) {
     auto* d = dw::global_downloader();
     if (!d || !d->initialized.load() || !d->task_manager || !key) {
         DW_LOGF(DW_LOG_ERROR, "",
@@ -751,7 +754,8 @@ DW_API int32_t dw_set_task_priority(const dw_task_key_t* key, int32_t priority) 
         return -1;
     }
     const dw_protocol_t sp_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    return d->task_manager->set_priority(sp_proto, dw::natural_key_of(key), priority);
+    return d->task_manager->set_priority(sp_proto, dw::natural_key_of(key),
+                                         priority_file_indexes, priority_file_index_size);
 }
 
 /* ------------------------------------------------------------------ */

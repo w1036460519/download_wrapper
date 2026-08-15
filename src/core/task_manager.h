@@ -65,18 +65,22 @@ namespace dw {
         void stop();
 
         // ---- 控制操作（C ABI 转发到此） ----
-        int32_t add(dw_protocol_t proto, const dw_task_params_t *params, dw_submit_result_t *out);
+        int32_t add(dw_protocol_t proto, const dw_task_params_t *params, dw_submit_result_t *out,
+                    bool force = false);
 
         int32_t pause(dw_protocol_t proto, const std::string &natural_key, dw_submit_result_t *out);
 
-        int32_t resume(dw_protocol_t proto, const std::string &natural_key, dw_submit_result_t *out);
+        int32_t resume(dw_protocol_t proto, const std::string &natural_key,
+                       const char **trackers, int32_t tracker_count,
+                       dw_submit_result_t *out);
 
         /// 删除任务：标记 DELETING + 调引擎 delete_task(delete_files)；
         /// 引擎发 DELETED 事件后 wrapper 回收资源 + 按标识删文件。
         int32_t remove(dw_protocol_t proto, const std::string &natural_key, int32_t delete_files,
                        dw_submit_result_t *out);
 
-        int32_t set_priority(dw_protocol_t proto, const std::string &natural_key, int32_t priority);
+        int32_t set_priority(dw_protocol_t proto, const std::string &natural_key,
+                             const int32_t *priority_file_indexes, int32_t priority_file_index_size);
 
         /// 设置播放提优标识：写入 playing_file_index/byte_offset，唤醒调度器。
         /// 调度器负责任务准入与 piece deadline 设置，API 层不直接操作引擎。
@@ -85,14 +89,9 @@ namespace dw {
         /// @return true=成功设置，false=任务不存在或已完成。
         bool set_playing(dw_protocol_t proto, const std::string &natural_key, int32_t file_index, int64_t byte_offset);
 
-        /// 按 (proto, natural_key) 回读引擎识别键（HTTP=url，BT=info_hash）：先查常驻内存，未命中回落 DB。
-        /// 供低频 BT 工具函数（磁力/优先级/文件列表）定位引擎句柄。命中返回 true。
-        bool engine_key_of(dw_protocol_t proto, const std::string &natural_key, std::string &out_key);
-
-        /// 按 (proto, natural_key) 回读引擎识别键与协议：先查常驻内存，未命中回落 DB。命中返回 true。
-        /// 供边下边播多协议分发（区间查询 / 提优）定位目标引擎。
-        bool engine_ref_of(dw_protocol_t proto, const std::string &natural_key, std::string &out_key,
-                           dw_protocol_t &out_proto);
+        /// 按 (proto, natural_key) 查询任务记录：内存优先，DB 命中时注册入内存。
+        /// 供低频工具函数（磁力/文件列表）定位任务。命中返回 true。
+        bool load_task_record(dw_protocol_t proto, const std::string &natural_key, TaskRecord &out_record);
 
         // ---- 边下边播缓存（直落 task_store，与协议无关） ----
 
@@ -278,6 +277,12 @@ namespace dw {
 
         // 内存注册：union_id → TaskRecord，无冗余索引。
         void register_task(TaskRecord task_record);
+
+        // 按 natural_key 查询任务：内存优先，未命中则从 DB 加载并注册入内存。
+        // 成功返回 true，同时填充 out_record；任务不存在返回 false。持 mtx_ 调用。
+        bool load_task_record_locked(const std::string &client_id, dw_protocol_t proto,
+                                     const std::string &natural_key,
+                                     TaskRecord &out_record);
 
         // 注销：清 tasks_，union_id 定位。
         void unregister_task(const std::string &union_id);

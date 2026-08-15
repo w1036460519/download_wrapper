@@ -184,7 +184,7 @@ namespace dw {
 
         const bool has_resume = params->resume_data && params->resume_data_size > 0;
 
-        auto tCtx_guard = task_create_new(url, params->save_path, params->filename);
+        auto tCtx_guard = task_create_new(url, params->save_path);
         if (!tCtx_guard) {
             set_result(out_result, url, DW_REASON_ERROR, nullptr,
                        "task_create_new failed: url=%s", url);
@@ -208,12 +208,9 @@ namespace dw {
                             "resume 存档无效（格式损坏），回退全量重下（沿用原名）: size=%zu",
                             static_cast<size_t>(params->resume_data_size));
             }
-            // 续传回落同一落盘文件：优先用 resume 持久化的物理路径（即最终路径）；
-            // 旧格式无 path 时回退 save_path/filename。
+            // 续传回落同一落盘文件：使用 resume 持久化的物理路径。
+            // 旧格式无 path 时 full_path 为空，走全量重下路径。
             std::string full_path = rd.full_file_path;
-            if (full_path.empty() && params->filename && params->filename[0]) {
-                full_path = (std::filesystem::path(params->save_path) / params->filename).string();
-            }
             // 局部验证打开既有文件（不创建，即开即关；写入由各分片句柄承担）：
             // 文件被外部删除/不可写时打开失败，丢弃续传进度回退全量重下，
             // 避免静默重建空稀疏文件在已下区间留洞。

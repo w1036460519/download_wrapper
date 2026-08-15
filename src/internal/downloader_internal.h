@@ -161,7 +161,6 @@ namespace dw {
     inline std::string to_string(const dw_task_params_t &p) {
         boost::json::object obj;
         obj["save_path"] = p.save_path ? p.save_path : "";
-        obj["filename"] = p.filename ? p.filename : "";
         obj["url"] = p.url ? p.url : "";
         obj["trace_id"] = p.trace_id ? p.trace_id : "";
         obj["info_hash"] = p.info_hash ? p.info_hash : "";
@@ -169,6 +168,7 @@ namespace dw {
         obj["torrent"] = p.torrent_file ? p.torrent_file : "";
         obj["trackers"] = p.tracker_count;
         obj["file_indexes"] = p.file_index_size;
+        obj["priority_file_indexes"] = p.priority_file_index_size;
         obj["url_seeds"] = p.url_seed_count;
         obj["priority"] = p.priority;
         obj["source"] = to_string_source(p.source);

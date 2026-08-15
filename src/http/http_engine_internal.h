@@ -394,9 +394,8 @@ namespace dw {
             /** 启动任务 */
             void start_task(dl_task_ctx *tCtx);
 
-            /** 创建新任务上下文 */
-            std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path,
-                                                         const char *filename);
+            /** 创建新任务上下文（filename 留空，由探测阶段从 URL 或响应头解析） */
+            std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path);
 
             /** 校验添加输入参数 */
             int validate_add_input(const char *url, const char *output_path, const char **err_out);

@@ -262,9 +262,6 @@ typedef struct dw_task_params {
     /* ===== 通用字段 ===== */
 
     const char *save_path; /**< 保存目录（必填）。 */
-    const char *filename; /**< 已定名的目标文件名：库内派发引擎时回填的定名结果。
-                                          dw_add_task 忽略此字段——文件名一律由库内判重定名
-                                          产生（外部指定名不被接受），经进度回调回报。 */
     const uint8_t *resume_data; /**< 断点续传数据（可为 NULL）。 */
     size_t resume_data_size; /**< resume_data 字节长度。 */
 
@@ -282,6 +279,8 @@ typedef struct dw_task_params {
     int32_t tracker_count; /**< trackers 数组长度。 */
     const int32_t *file_indexes; /**< 待下载文件索引数组（NULL=全部）。 */
     int32_t file_index_size; /**< file_indexes 数组长度。 */
+    const int32_t *priority_file_indexes; /**< 优先下载文件索引数组（NULL=无优先）。 */
+    int32_t priority_file_index_size; /**< priority_file_indexes 数组长度。 */
     const char **url_seeds; /**< Web Seed URL 数组（BEP 19）。 */
     int32_t url_seed_count; /**< url_seeds 数组长度。 */
 
@@ -474,17 +473,19 @@ DW_API void dw_set_log_callback(dw_log_cb cb);
 /**
  * 添加单个下载任务。
  *
- * 文件名不接受外部指定（params.filename 被忽略）：库内以磁盘为唯一真相源判重定名，
+ * 文件名由库内自动确定：HTTP 从 URL 或响应头解析，BT 从种子元数据获取。
  * 结果经进度回调的 filename / output_path 回报。
  *
  * @param protocol    协议类型。natural_key 从 params.url (HTTP) / params.info_hash (BT) 推导。
  * @param params      任务参数指针，不可为 NULL。
- * @param out_result  同步返回结果指针，不可为 NULL；成功后回填 key。
+ * @param out_result  同步返回结果指针，不可为 NULL。
+ * @param force       是否强制覆盖添加（非 0=清理旧记录后重新添加，0=默认行为）。
  * @return            0=成功，-1=失败（参数非法或内部错误）。
  */
 DW_API int32_t dw_add_task(dw_protocol_t protocol,
                            const dw_task_params_t *params,
-                           dw_submit_result_t *out_result);
+                           dw_submit_result_t *out_result,
+                           int32_t force);
 
 /**
  * 暂停单个任务。
@@ -499,11 +500,14 @@ DW_API int32_t dw_pause_task(const dw_task_key_t *key,
 /**
  * 恢复（继续）单个任务。
  *
- * @param key         任务唯一键。调用期间 natural_key 须保持有效。
- * @param out_result  同步返回结果指针，不可为 NULL。
- * @return            0=成功，-1=失败（参数非法或内部错误）。
+ * @param key           任务唯一键。调用期间 natural_key 须保持有效。
+ * @param trackers      外部追加的 tracker URL 数组（可为 NULL）；不持久化，仅本次恢复生效。
+ * @param tracker_count trackers 数组长度。
+ * @param out_result    同步返回结果指针，不可为 NULL。
+ * @return              0=成功，-1=失败（参数非法或内部错误）。
  */
 DW_API int32_t dw_resume_task(const dw_task_key_t *key,
+                              const char **trackers, int32_t tracker_count,
                               dw_submit_result_t *out_result);
 
 /**
@@ -703,11 +707,14 @@ DW_API int32_t dw_list_tasks(dw_task_snapshot_t **out_tasks,
  *
  * 立即持久化并触发一次队列调度；对下载中任务仅更新优先级、不中断。
  *
- * @param key      任务唯一键。
- * @param priority 新优先级值。
- * @return         0=成功，-1=失败（任务不存在）。
+ * @param key                       任务唯一键。
+ * @param priority_file_indexes     优先下载文件索引数组（可为 NULL）。
+ * @param priority_file_index_size  priority_file_indexes 数组长度（0=取消优先）。
+ * @return                          0=成功，-1=失败（任务不存在）。
  */
-DW_API int32_t dw_set_task_priority(const dw_task_key_t *key, int32_t priority);
+DW_API int32_t dw_set_task_priority(const dw_task_key_t *key,
+                                    const int32_t *priority_file_indexes,
+                                    int32_t priority_file_index_size);
 
 /* ================================================================== */
 /*                        任务文件持久化                              */

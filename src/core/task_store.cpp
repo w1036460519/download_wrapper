@@ -55,7 +55,7 @@ namespace dw {
             r.info_hash = col_text(st, 8);
             r.magnet_link = col_text(st, 9);
             r.torrent_file = col_text(st, 10);
-            r.trackers = split_lines(col_text(st, 11));
+            // 列 11 = trackers：不加载到 TaskRecord（数据量大，无持久化意义）。
             r.file_indexes = split_ints(col_text(st, 12));
             r.priority = sqlite3_column_int(st, 13);
             r.status = static_cast<dw_task_status_t>(sqlite3_column_int(st, 14));
@@ -270,12 +270,16 @@ namespace dw {
 
     bool TaskStore::load_by_natural_key(const std::string &client_id, const dw_protocol_t protocol,
                                         const std::string &natural_key, TaskRecord &out) const {
-        // key_type 决定 natural_key 落库列：HTTP=url / BT=info_hash / LOCAL=content_root。
-        const char *col = (protocol == DW_PROTOCOL_HTTP)
-                              ? "url"
-                              : (protocol == DW_PROTOCOL_TORRENT)
-                                    ? "info_hash"
-                                    : "content_root";
+        const char *col = nullptr;
+        switch (protocol) {
+            case DW_PROTOCOL_HTTP: col = "url";
+                break;
+            case DW_PROTOCOL_TORRENT: col = "info_hash";
+                break;
+            case DW_PROTOCOL_LOCAL: col = "content_root";
+                break;
+            default: return false;
+        }
         return load_one_by(db_, client_id, protocol, col, natural_key, out);
     }
 
@@ -335,7 +339,6 @@ namespace dw {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
 
-        const std::string trackers = join_lines(r.trackers);
         const std::string indexes = join_ints(r.file_indexes);
 
         sqlite3_bind_text(st, 1, r.client_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -349,7 +352,7 @@ namespace dw {
         sqlite3_bind_text(st, 9, r.info_hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 10, r.magnet_link.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 11, r.torrent_file.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 12, trackers.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 12, "", -1, SQLITE_TRANSIENT); // trackers：不持久化
         sqlite3_bind_text(st, 13, indexes.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 14, r.priority);
         sqlite3_bind_int(st, 15, r.status);
@@ -384,7 +387,6 @@ namespace dw {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
 
-        const std::string trackers = join_lines(r.trackers);
         const std::string indexes = join_ints(r.file_indexes);
 
         sqlite3_bind_int(st, 1, r.protocol);
@@ -395,7 +397,7 @@ namespace dw {
         sqlite3_bind_text(st, 6, r.info_hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 7, r.magnet_link.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 8, r.torrent_file.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 9, trackers.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 9, "", -1, SQLITE_TRANSIENT); // trackers：不持久化
         sqlite3_bind_text(st, 10, indexes.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 11, r.priority);
         sqlite3_bind_int(st, 12, r.status);
