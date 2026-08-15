@@ -109,7 +109,6 @@ struct TaskRecord {
     std::string message;                        // 采集到的状态 / 错误文本
 
     // BT 扩展遥测（引擎推入，A 线程校验拍判断用；不持久化）
-    bool bt_metadata_ready = false; // 元数据是否就绪（has_metadata）
     bool bt_multi_file     = false; // 多文件 torrent（name 为根目录名）
 
     // 播放提优信号（dw_set_playing_file 写入，调度器消费；不持久化）

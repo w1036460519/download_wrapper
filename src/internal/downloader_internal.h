@@ -32,10 +32,11 @@ namespace dw {
         DOWNLOAD_FAILED, // 下载失败（通用失败事件）
         DOWNLOAD_COMPLETED, // 下载完成
         STATUS_UPDATE, // 状态+进度更新（替代原 post_progress）
-        RESUME_DATA, // 断点续传数据就绪（BT resume）
+        RESUME_DATA, // 断点续传数据就绪（BT resume / HTTP 定期存档）
         BT_PAUSED, // BT 引擎已实际暂停（libtorrent handle.pause 已生效），由 alert 线程确认后投递
         BT_RESUMED, // BT 引擎已实际恢复（libtorrent handle.resume 已生效），由 alert 线程确认后投递
         DELETED, // 任务已从引擎移除（remove_torrent 收敛 / handle 无效直接删除），wrapper 据此回收资源
+        TASK_FILES, // 任务文件列表推送（HTTP 响应头就绪后推送单文件信息）
     };
 
     /**
@@ -89,6 +90,7 @@ namespace dw {
             case EngineEventType::BT_PAUSED: return "BT_PAUSED";
             case EngineEventType::BT_RESUMED: return "BT_RESUMED";
             case EngineEventType::DELETED: return "DELETED";
+            case EngineEventType::TASK_FILES: return "TASK_FILES";
             default: return "UNKNOWN";
         }
     }
@@ -131,6 +133,21 @@ namespace dw {
         }
     }
 
+    // ---- dw_file_info_t 序列化（调试日志用）----
+
+    inline std::string to_string(const dw_file_info_t &f) {
+        boost::json::object obj;
+        obj["index"] = f.index;
+        obj["name"] = f.name ? f.name : "";
+        obj["size"] = f.size;
+        obj["ext"] = f.ext ? f.ext : "";
+        obj["status"] = f.status;
+        obj["offset"] = f.offset;
+        obj["downloaded_bytes"] = f.downloaded_bytes;
+        obj["play_position_ms"] = f.play_position_ms;
+        return boost::json::serialize(obj);
+    }
+
     // ---- EngineEvent 序列化（重载，类 std::to_string 约定）----
 
     inline std::string to_string(const EngineEvent &e) {
@@ -140,7 +157,12 @@ namespace dw {
         obj["protocol"] = to_string(e.protocol);
         obj["name"] = e.name;
         obj["save_path"] = e.save_path;
-        obj["files"] = e.files.size();
+        // 文件列表：序列化每个文件信息
+        boost::json::array files_arr;
+        for (const auto &f : e.files) {
+            files_arr.push_back(boost::json::parse(to_string(f)));
+        }
+        obj["files"] = std::move(files_arr);
         obj["reason"] = to_string(e.reason);
         obj["message"] = e.message;
         obj["total_size"] = e.total_size;
@@ -211,37 +233,6 @@ namespace dw {
                      int32_t line = 0);
 
     /**
-     * 内部断点续传数据推送：转交 TaskManager 深拷贝暂存，由维护线程落库。
-     *
-     * data / size 仅在调用期间有效。
-     */
-    void post_resume_data(const char *engine_key,
-                          dw_protocol_t protocol,
-                          const uint8_t *data,
-                          size_t size);
-
-    /**
-     * 内部任务节点树推送：引擎元数据就绪时构树后经此落库。
-     *
-     * files 为包含文件夹 + 文件的扁平节点数组（仅在调用期间有效，数据由库内深拷）。
-     */
-    void post_task_files(const char *engine_key,
-                         dw_protocol_t protocol,
-                         const dw_file_info_t *files,
-                         int32_t count);
-
-    /**
-     * 内部单文件节点懒创建 / 进度推送：按 (engine_key, file_index) 命中 task_id 后
-     * upsert task_files 一行（不存在则插入下载中占位，存在则仅上提 downloaded_bytes / size）。
-     * HTTP 探测定名后零碎进度 / BT 元数据外的 per-file 进度均走此路径。
-     */
-    void post_task_file_update(const char *engine_key,
-                               dw_protocol_t protocol,
-                               int32_t file_index,
-                               int64_t downloaded_bytes,
-                               int64_t total_size);
-
-    /**
      * 内部唯一名上调：引擎在元数据就绪 / 探测出名时请求定名。
      *
      * 内部转 TaskManager::resolve_and_record_name：持锁以磁盘为唯一真相源抢占唯一 wrapper 名
@@ -256,18 +247,6 @@ namespace dw {
                                     const char *dir,
                                     const char *wrapper_name,
                                     const char *inner_name);
-
-    /* ================================================================== */
-    /*                          引擎事件投递                              */
-    /* ================================================================== */
-
-    /**
-     * 引擎事件投递：经 Boost.Asio io_context::post 投递到 B 线程消费。
-     *
-     * 引擎 alert 线程调用，线程安全。事件经值语义拷贝后投递，调用方无需保持数据存活。
-     * files 中各节点的字符串字段由调用方释放（投递前已完成深拷贝）。
-     */
-    void post_engine_event(EngineEvent event);
 
     /**
      * 格式化日志输出（内部）。

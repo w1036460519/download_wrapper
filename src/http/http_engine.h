@@ -31,7 +31,7 @@ public:
      * 初始化引擎。
      * @return 0=成功，-1=失败。
      */
-    int32_t init(const dw_config_t* cfg) override;
+    int32_t init(const dw_config_t* cfg, TaskManager* task_manager) override;
 
     /**
      * 销毁引擎，释放所有资源。

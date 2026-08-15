@@ -83,45 +83,6 @@ void log_message(dw_log_level_t level,
     }
 }
 
-void post_resume_data(const char*    engine_key,
-                      dw_protocol_t  protocol,
-                      const uint8_t* data,
-                      size_t         size) {
-    if (!g_downloader || !engine_key) {
-        return;
-    }
-    // resume_data 由库内 SQLite 持久化：内部用引擎键（HTTP=url，BT=info_hash）定位。
-    if (g_downloader->task_manager) {
-        g_downloader->task_manager->on_resume_data(engine_key, protocol, data, size);
-    }
-}
-
-void post_task_files(const char*           engine_key,
-                     dw_protocol_t         protocol,
-                     const dw_file_info_t* files,
-                     int32_t               count) {
-    if (!g_downloader || !engine_key || !files || count <= 0) {
-        return;
-    }
-    // 节点树由引擎构好、经此汇入库内 SQLite 持久化（仅内部通道，不对外回调）。
-    if (g_downloader->task_manager) {
-        g_downloader->task_manager->on_task_files(engine_key, protocol, files, count);
-    }
-}
-
-void post_task_file_update(const char*   engine_key,
-                           dw_protocol_t protocol,
-                           int32_t       file_index,
-                           int64_t       downloaded_bytes,
-                           int64_t       total_size) {
-    if (!g_downloader || !engine_key) return;
-    // 按需 upsert：alert 线程上调锁 mtx_ 与现有 on_task_files 同模式，无死锁。
-    if (g_downloader->task_manager) {
-        g_downloader->task_manager->on_task_file_update(engine_key, protocol, file_index,
-                                                        downloaded_bytes, total_size);
-    }
-}
-
 std::string request_unique_name(const char*   engine_key,
                                 dw_protocol_t protocol,
                                 const char*   dir,
@@ -137,11 +98,6 @@ std::string request_unique_name(const char*   engine_key,
                                                                   wrapper_name, inner_name, false);
     }
     return wrapper_name;
-}
-
-void post_engine_event(EngineEvent event) {
-    if (!g_downloader || !g_downloader->task_manager) return;
-    g_downloader->task_manager->on_engine_event(std::move(event));
 }
 
 } // namespace dw
@@ -174,32 +130,35 @@ DW_API int32_t dw_init(const dw_config_t* cfg) {
         dw::g_downloader->config = *cfg;
     }
 
-    dw::g_downloader->http_engine    = std::make_unique<dw::HttpEngine>();
-    dw::g_downloader->torrent_engine = std::make_unique<dw::TorrentEngine>();
-
-    if (dw::g_downloader->http_engine->init(cfg) != 0) {
-        DW_LOG(DW_LOG_ERROR, "失败: HTTP 引擎初始化失败", "");
-        return -1;
-    }
-    if (dw::g_downloader->torrent_engine->init(cfg) != 0) {
-        dw::g_downloader->http_engine->destroy();
-        DW_LOG(DW_LOG_ERROR, "失败: BT 引擎初始化失败", "");
-        return -1;
-    }
-
-    dw::g_downloader->initialized.store(true);
-
     // 启动任务中枢：打开 SQLite、加载注册表、启动事件驱动调度线程。
+    // 先于引擎初始化，以便引擎可持有 task_manager 指针用于事件投递。
     dw::g_downloader->task_manager = std::make_unique<dw::TaskManager>();
-    dw::g_downloader->task_manager->set_engines(
-        dw::g_downloader->http_engine.get(),
-        dw::g_downloader->torrent_engine.get());
-    dw::g_downloader->task_manager->set_progress_cb(dw::g_downloader->progress_cb);
     if (dw::g_downloader->task_manager->start(dw::g_downloader->config) != 0) {
         DW_LOG(DW_LOG_ERROR, "失败: TaskManager 启动失败", "");
         dw::g_downloader->task_manager.reset();
         return -1;
     }
+
+    dw::g_downloader->http_engine    = std::make_unique<dw::HttpEngine>();
+    dw::g_downloader->torrent_engine = std::make_unique<dw::TorrentEngine>();
+
+    if (dw::g_downloader->http_engine->init(cfg, dw::g_downloader->task_manager.get()) != 0) {
+        DW_LOG(DW_LOG_ERROR, "失败: HTTP 引擎初始化失败", "");
+        return -1;
+    }
+    if (dw::g_downloader->torrent_engine->init(cfg, dw::g_downloader->task_manager.get()) != 0) {
+        dw::g_downloader->http_engine->destroy();
+        DW_LOG(DW_LOG_ERROR, "失败: BT 引擎初始化失败", "");
+        return -1;
+    }
+
+    // 引擎初始化完成后，注入引擎指针到 TaskManager。
+    dw::g_downloader->task_manager->set_engines(
+        dw::g_downloader->http_engine.get(),
+        dw::g_downloader->torrent_engine.get());
+    dw::g_downloader->task_manager->set_progress_cb(dw::g_downloader->progress_cb);
+
+    dw::g_downloader->initialized.store(true);
 
     DW_LOG(DW_LOG_INFO, "初始化完成", "");
     return 0;

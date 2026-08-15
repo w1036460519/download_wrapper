@@ -14,6 +14,7 @@
 
 #include "torrent/torrent_engine.h"
 
+#include "core/task_manager.h"
 #include "internal/downloader_internal.h"
 #include "utils/string_util.h"
 #include "utils/time_util.h"
@@ -58,6 +59,8 @@ namespace dw {
         // BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文。
         // 默认 3.0（下载:上传=1:3）；init 从 cfg->seed_ratio_limit 读取（0=默认，<0=永久做种）。
         double g_seed_ratio_limit = 3.0;
+        // 事件投递目标
+        class TaskManager* g_task_manager = nullptr;
 
         // 从 info_hash_t 提取 hex（优先 v2，回退 v1）
         std::string info_hash_hex(const lt::info_hash_t &ih) {
@@ -160,7 +163,7 @@ namespace dw {
                     const std::string key = info_hash_hex(s.handle);
                     if (key.empty()) continue;
                     EngineEvent ev = make_status_update_event(s, key);
-                    post_engine_event(std::move(ev));
+                    if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
                 }
             }
             // 添加任务
@@ -170,17 +173,19 @@ namespace dw {
                     // 添加任务失败
                     DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "添加失败: %s", at->error.message().c_str());
                     if (key.empty()) return;
-                    post_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
-                    });
+                    if (g_task_manager) {
+                        g_task_manager->on_engine_event(EngineEvent{
+                            .type = EngineEventType::DOWNLOAD_FAILED,
+                            .engine_key = key,
+                            .protocol = DW_PROTOCOL_TORRENT
+                        });
+                    }
                 } else if (at->handle.is_valid()) {
                     // 添加任务成功
                     DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "添加成功");
                     if (const lt::torrent_status st = at->handle.status(); st.has_metadata) {
                         if (EngineEvent ev = build_parsed_event(at->handle); !ev.engine_key.empty()) {
-                            post_engine_event(std::move(ev));
+                            if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
                         }
                     }
                 }
@@ -190,7 +195,7 @@ namespace dw {
                 const std::string key = info_hash_hex(mr->handle);
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "元数据就绪");
                 if (EngineEvent ev = build_parsed_event(mr->handle); !ev.engine_key.empty()) {
-                    post_engine_event(std::move(ev));
+                    if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
                 }
             }
             // 下载完成
@@ -198,22 +203,26 @@ namespace dw {
                 const std::string key = info_hash_hex(tf->handle);
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "下载完成");
                 if (key.empty()) return;
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DOWNLOAD_COMPLETED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_COMPLETED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT
+                    });
+                }
             }
             // 任务错误
             else if (const auto *te = lt::alert_cast<lt::torrent_error_alert>(a)) {
                 const std::string key = info_hash_hex(te->handle);
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "下载错误: %s", te->error.message().c_str());
                 if (key.empty()) return;
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DOWNLOAD_FAILED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_FAILED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT
+                    });
+                }
             }
             // 文件错误
             else if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
@@ -221,11 +230,13 @@ namespace dw {
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "文件错误 file: %s, msg: %s, errno: %d",
                             fe->filename(), fe->error.message().c_str(), fe->error.value());
                 if (key.empty()) return;
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DOWNLOAD_FAILED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_FAILED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT
+                    });
+                }
             }
             // 断点续传数据就绪
             else if (const auto *rd = lt::alert_cast<lt::save_resume_data_alert>(a)) {
@@ -240,7 +251,7 @@ namespace dw {
                         ev.protocol = DW_PROTOCOL_TORRENT;
                         ev.resume_data.assign(reinterpret_cast<const uint8_t *>(buf.data()),
                                               reinterpret_cast<const uint8_t *>(buf.data()) + buf.size());
-                        post_engine_event(std::move(ev));
+                        if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
                     }
                 } catch (const std::exception &e) {
                     DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "断点续传数据处理失败: %s", e.what());
@@ -252,7 +263,7 @@ namespace dw {
                 if (key.empty()) return;
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "存储路径迁移完成 路径: %s", sm->storage_path());
                 if (EngineEvent ev = build_parsed_event(sm->handle); !ev.engine_key.empty()) {
-                    post_engine_event(std::move(ev));
+                    if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
                 }
             }
             // 存储路径迁失败
@@ -261,57 +272,67 @@ namespace dw {
                 if (key.empty()) return;
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "存储路径迁移失败 errno: %d, msg: %s",
                             smf->error.value(), smf->error.message().c_str());
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DOWNLOAD_FAILED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_FAILED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT
+                    });
+                }
             }
             // 暂停
             else if (lt::alert_cast<lt::torrent_paused_alert>(a)) {
                 const std::string key = info_hash_hex(lt::alert_cast<lt::torrent_paused_alert>(a)->handle);
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "暂停");
                 if (key.empty()) return;
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::BT_PAUSED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::BT_PAUSED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT
+                    });
+                }
             }
             // 恢复
             else if (lt::alert_cast<lt::torrent_resumed_alert>(a)) {
                 const std::string key = info_hash_hex(lt::alert_cast<lt::torrent_resumed_alert>(a)->handle);
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "恢复");
                 if (key.empty()) return;
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::BT_RESUMED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::BT_RESUMED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT
+                    });
+                }
             }
             // 任务已从 session 移除（remove_torrent 不带 delete_files 收敛）
             else if (const auto *tr = lt::alert_cast<lt::torrent_removed_alert>(a)) {
                 const std::string key = info_hash_hex(tr->info_hashes);
                 if (key.empty()) return;
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "任务已从 session 移除");
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DELETED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT,
-                    .delete_files = 0 // 不删文件
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DELETED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .delete_files = 0 // 不删文件
+                    });
+                }
             }
             // 任务文件删除完成（remove_torrent 带 delete_files 收敛）
             else if (const auto *td = lt::alert_cast<lt::torrent_deleted_alert>(a)) {
                 const std::string key = info_hash_hex(td->info_hashes);
                 if (key.empty()) return;
                 DW_LOG_TASK(DW_LOG_INFO, key.c_str(), "任务文件删除完成");
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DELETED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT,
-                    .delete_files = 1 // 引擎已删文件，wrapper 删包层目录
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DELETED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .delete_files = 1 // 引擎已删文件，wrapper 删包层目录
+                    });
+                }
             }
             // 任务文件删除失败
             else if (const auto *tdf = lt::alert_cast<lt::torrent_delete_failed_alert>(a)) {
@@ -319,11 +340,13 @@ namespace dw {
                 if (key.empty()) return;
                 DW_LOG_TASK(DW_LOG_ERROR, key.c_str(), "任务文件删除失败: %s",
                             tdf->error.message().c_str());
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DOWNLOAD_FAILED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_FAILED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT
+                    });
+                }
             }
         }
 
@@ -444,7 +467,7 @@ namespace dw {
         }
     }
 
-    int32_t TorrentEngine::init(const dw_config_t *cfg) {
+    int32_t TorrentEngine::init(const dw_config_t *cfg, TaskManager* task_manager) {
         if (initialized_) {
             return 0;
         }
@@ -488,6 +511,7 @@ namespace dw {
             return -1;
         }
 
+        g_task_manager = task_manager;
         g_running.store(true);
         g_alert_thread = std::thread(alert_loop);
 
@@ -507,6 +531,7 @@ namespace dw {
         }
         g_session.reset();
 
+        g_task_manager = nullptr;
         initialized_ = false;
         DW_LOG_SYS(DW_LOG_INFO, "销毁BT引擎完成");
     }
@@ -699,11 +724,13 @@ namespace dw {
                 return -1;
             }
             // 重复操作补发恢复事件
-            post_engine_event(EngineEvent{
-                .type = EngineEventType::BT_RESUMED,
-                .engine_key = key,
-                .protocol = DW_PROTOCOL_TORRENT
-            });
+            if (g_task_manager) {
+                g_task_manager->on_engine_event(EngineEvent{
+                    .type = EngineEventType::BT_RESUMED,
+                    .engine_key = key,
+                    .protocol = DW_PROTOCOL_TORRENT
+                });
+            }
         }
         set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
         return 0;
@@ -733,11 +760,13 @@ namespace dw {
             }
         }
         // 重复操作补发暂停事件
-        post_engine_event(EngineEvent{
-            .type = EngineEventType::BT_PAUSED,
-            .engine_key = key,
-            .protocol = DW_PROTOCOL_TORRENT
-        });
+        if (g_task_manager) {
+            g_task_manager->on_engine_event(EngineEvent{
+                .type = EngineEventType::BT_PAUSED,
+                .engine_key = key,
+                .protocol = DW_PROTOCOL_TORRENT
+            });
+        }
         set_result(out_result, task_id, DW_REASON_NONE, nullptr);
         return 0;
     }
@@ -770,12 +799,14 @@ namespace dw {
         }
         // handle 无效：任务不在会话，按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
         // 直接投递 DELETED 事件，wrapper 据此回收资源 + 按标识删文件。
-        post_engine_event(EngineEvent{
-            .type = EngineEventType::DELETED,
-            .engine_key = key,
-            .protocol = DW_PROTOCOL_TORRENT,
-            .delete_files = delete_files
-        });
+        if (g_task_manager) {
+            g_task_manager->on_engine_event(EngineEvent{
+                .type = EngineEventType::DELETED,
+                .engine_key = key,
+                .protocol = DW_PROTOCOL_TORRENT,
+                .delete_files = delete_files
+            });
+        }
         set_result(out_result, task_id, DW_REASON_NONE, nullptr);
         return 0;
     }

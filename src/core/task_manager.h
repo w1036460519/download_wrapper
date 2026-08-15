@@ -115,21 +115,6 @@ namespace dw {
         /// 查询任务当前状态（mtx_ 保护）；任务不存在返回 -1。
         int32_t get_task_status(dw_protocol_t proto, const std::string &natural_key);
 
-        // ---- 回调拦截（post_resume_data 调用） ----
-        /// 持久化 resume_data；命中内存记录返回其 natural_key（供上层回调），非激活任务丢弃返回空串。
-        std::string on_resume_data(const char *engine_key, dw_protocol_t proto, const uint8_t *data, size_t size);
-
-        // ---- 回调拦截（post_task_files 调用） ----
-        /// 引擎元数据就绪推送的节点树：按 engine_key 定位后全量落库。
-        void on_task_files(const char *engine_key, dw_protocol_t proto,
-                           const dw_file_info_t *files, int32_t count);
-
-        // ---- 回调拦截（post_task_file_update 调用） ----
-        /// 引擎按需推送单文件进度：按 engine_key 定位后单条 upsert task_files。
-        /// 元数据（name/ext/offset）保持空，全量 save_task_files 时由引擎补齐。
-        void on_task_file_update(const char *engine_key, dw_protocol_t proto,
-                                 int32_t file_index, int64_t downloaded_bytes, int64_t total_size);
-
         // ---- 引擎事件消费（Boost.Asio 事件投递入口） ----
         /// 引擎 alert 经 Boost.Asio io_context::post 投递到此，B 线程消费。
         /// 事件经值语义拷贝后投递，线程安全。
@@ -279,10 +264,9 @@ namespace dw {
         void register_task(TaskRecord task_record);
 
         // 按 natural_key 查询任务：内存优先，未命中则从 DB 加载并注册入内存。
-        // 成功返回 true，同时填充 out_record；任务不存在返回 false。持 mtx_ 调用。
-        bool load_task_record_locked(const std::string &client_id, dw_protocol_t proto,
-                                     const std::string &natural_key,
-                                     TaskRecord &out_record);
+        // 成功返回内存中任务的指针（可直接修改）；任务不存在返回 nullptr。持 mtx_ 调用。
+        TaskRecord *load_task_record_locked(const std::string &client_id, dw_protocol_t proto,
+                                            const std::string &natural_key);
 
         // 注销：清 tasks_，union_id 定位。
         void unregister_task(const std::string &union_id);

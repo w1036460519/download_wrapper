@@ -13,6 +13,7 @@
 
 #include "http/http_engine_internal.h"
 
+#include "core/task_manager.h"
 #include "internal/downloader_internal.h"
 #include "utils/string_util.h"
 #include "utils/time_util.h"
@@ -39,6 +40,7 @@ namespace dw {
         std::unordered_map<std::string, std::unique_ptr<dl_task_ctx> > g_tasks;
         std::atomic<bool> g_exit_flag{false};
         std::atomic<bool> g_running{false};
+        class TaskManager* g_task_manager = nullptr; // 事件投递目标
 
         namespace internal {
             using dw::utils::format_unix_ms;
@@ -676,7 +678,14 @@ namespace dw {
                     f.status = 0;
                     f.downloaded_bytes = 0;
                     f.play_position_ms = 0;
-                    dw::post_task_files(tCtx->url.c_str(), DW_PROTOCOL_HTTP, &f, 1);
+                    EngineEvent ev;
+                    ev.type = EngineEventType::TASK_FILES;
+                    ev.engine_key = tCtx->url;
+                    ev.protocol = DW_PROTOCOL_HTTP;
+                    ev.files.push_back(f);
+                    if (g_task_manager) {
+                        g_task_manager->on_engine_event(std::move(ev));
+                    }
                 
                     // 内部文件物理路径：save_path / wrapper / raw_filename
                     tCtx->full_file_path =
@@ -859,8 +868,15 @@ namespace dw {
                 if (!tCtx) return;
                 const std::string blob = serialize_resume(tCtx);
                 if (blob.empty()) return;
-                dw::post_resume_data(tCtx->url.c_str(), DW_PROTOCOL_HTTP,
-                                     reinterpret_cast<const uint8_t *>(blob.data()), blob.size());
+                EngineEvent ev;
+                ev.type = EngineEventType::RESUME_DATA;
+                ev.engine_key = tCtx->url;
+                ev.protocol = DW_PROTOCOL_HTTP;
+                ev.resume_data.assign(reinterpret_cast<const uint8_t *>(blob.data()),
+                                      reinterpret_cast<const uint8_t *>(blob.data()) + blob.size());
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(std::move(ev));
+                }
             }
 
             // worker 线程按门槛异步上报 resume：仅支持续传、且总已下载相比上次有推进时触发。
@@ -907,7 +923,9 @@ namespace dw {
                 ev.last_modified = tCtx->last_modified;
                 ev.reason = snap.reason;
                 ev.message = tCtx->message;
-                dw::post_engine_event(std::move(ev));
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(std::move(ev));
+                }
                 // 终态时记录推送时间戳（sweep 据此延迟回收）
                 if (snap.task_status == DW_TASK_STATUS_COMPLETED || snap.task_status == DW_TASK_STATUS_ERROR) {
                     tCtx->terminal_pushed_at_ms.store(now_unix_ms());

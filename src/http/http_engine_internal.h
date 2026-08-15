@@ -308,12 +308,14 @@ struct dl_task_ctx {
 
 /* ===================== 全局变量（dw::http_engine namespace） ===================== */
 namespace dw {
+    class TaskManager; // 前向声明
     namespace http_engine {
         extern dw_config_t g_cfg;
         extern std::mutex g_map_mtx;
         extern std::unordered_map<std::string, std::unique_ptr<dl_task_ctx> > g_tasks;
         extern std::atomic<bool> g_exit_flag;
         extern std::atomic<bool> g_running;
+        extern TaskManager* g_task_manager; // 事件投递目标
     }
 } /* namespace dw::http_engine */
 

@@ -4,6 +4,7 @@
  */
 
 #include "http/http_engine.h"
+#include "core/task_manager.h"
 #include "http/http_engine_internal.h"
 #include "internal/downloader_internal.h"
 #include "utils/time_util.h"
@@ -67,7 +68,7 @@ namespace dw {
         }
     }
 
-    int32_t HttpEngine::init(const dw_config_t *cfg) {
+    int32_t HttpEngine::init(const dw_config_t *cfg, TaskManager* task_manager) {
         if (!cfg) {
             DW_LOG_SYS(DW_LOG_ERROR, "HTTP init 失败: cfg 为空");
             return -1;
@@ -81,6 +82,7 @@ namespace dw {
             return -1;
         }
 
+        he::g_task_manager = task_manager;
         initialized_ = true;
         DW_LOG_SYS(DW_LOG_INFO, "HTTP 引擎初始化完成");
         return 0;
@@ -119,6 +121,7 @@ namespace dw {
         he::g_cfg = {};
         he::g_running.store(false);
         he::g_exit_flag.store(false);
+        he::g_task_manager = nullptr;
 
         DW_LOG_SYS(DW_LOG_INFO, "HTTP 引擎已销毁");
     }
@@ -349,12 +352,14 @@ namespace dw {
             }
             // 未持有任务：直接发 DELETED 事件，wrapper 据此回收资源 + 删文件。
             DW_LOG_TASK(DW_LOG_INFO, url, "HTTP delete_task 任务不在引擎，直接发 DELETED");
-            post_engine_event(EngineEvent{
-                .type = EngineEventType::DELETED,
-                .engine_key = std::string(url),
-                .protocol = DW_PROTOCOL_HTTP,
-                .delete_files = 1 // HTTP 引擎不直接删文件，由 wrapper 处理
-            });
+            if (he::g_task_manager) {
+                he::g_task_manager->on_engine_event(EngineEvent{
+                    .type = EngineEventType::DELETED,
+                    .engine_key = std::string(url),
+                    .protocol = DW_PROTOCOL_HTTP,
+                    .delete_files = 1 // HTTP 引擎不直接删文件，由 wrapper 处理
+                });
+            }
             return 0;
         } catch (const std::exception &e) {
             DW_LOG_SYS(DW_LOG_ERROR, "HTTP delete_task exception: %s", e.what());
@@ -456,12 +461,14 @@ namespace dw {
                                  : "终态回收 HTTP 上下文 url=%s", url.c_str());
             // 删除中任务：回收完成后发 DELETED 事件，wrapper 据此回收资源 + 删文件。
             if (deleting) {
-                post_engine_event(EngineEvent{
-                    .type = EngineEventType::DELETED,
-                    .engine_key = url,
-                    .protocol = DW_PROTOCOL_HTTP,
-                    .delete_files = 1 // HTTP 引擎不直接删文件，由 wrapper 处理
-                });
+                if (he::g_task_manager) {
+                    he::g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DELETED,
+                        .engine_key = url,
+                        .protocol = DW_PROTOCOL_HTTP,
+                        .delete_files = 1 // HTTP 引擎不直接删文件，由 wrapper 处理
+                    });
+                }
             }
         }
     }

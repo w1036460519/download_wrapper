@@ -4,7 +4,7 @@
  *
  * 设计要点：
  *   - 纯虚方法为各引擎必须实现的任务生命周期能力；
- *   - 进度推送由引擎经 post_engine_event 投递 STATUS_UPDATE 事件（事件驱动），
+ *   - 进度推送由引擎经 task_manager_->on_engine_event 投递事件（事件驱动），
  *     B 线程消费后写入 TaskRecord 内存，A 线程下一拍直接从 TaskRecord 字段采集；
  *   - post_updates 为带默认空实现的节拍钩子：Torrent 引擎覆写（触发
  *     post_torrent_updates 刷新 + 续传检查点），HTTP 引擎无需实现；
@@ -21,6 +21,8 @@
 
 namespace dw {
 
+class TaskManager; // 前向声明
+
 /**
  * 下载引擎抽象接口（HttpEngine / TorrentEngine 实现）。
  */
@@ -28,8 +30,8 @@ class IDownloadEngine {
 public:
     virtual ~IDownloadEngine() = default;
 
-    /// 初始化引擎。@return 0=成功，-1=失败。
-    virtual int32_t init(const dw_config_t* cfg) = 0;
+    /// 初始化引擎。task_manager 用于事件投递。@return 0=成功，-1=失败。
+    virtual int32_t init(const dw_config_t* cfg, TaskManager* task_manager) = 0;
 
     /// 销毁引擎，释放所有资源。
     virtual void destroy() = 0;
