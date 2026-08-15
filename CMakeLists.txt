@@ -22,7 +22,7 @@ find_package(unofficial-sqlite3 CONFIG REQUIRED)
 # Boost.Beast / Boost.Asio 为 playback_proxy 直接依赖（header-only），
 # Boost.URL 为 URL 解析库（需链接），经 vcpkg 安装后通过 libtorrent 依赖链可用。
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
-find_package(Boost REQUIRED COMPONENTS url)
+find_package(Boost REQUIRED COMPONENTS url json)
 
 if(WIN32)
     # NOMINMAX：阻止 windows.h 定义 min/max 宏（经 curl 头传入），否则会撕碎
@@ -82,6 +82,7 @@ target_link_libraries(download_wrapper
         LibtorrentRasterbar::torrent-rasterbar
         unofficial::sqlite3::sqlite3
         Boost::url
+        Boost::json
 )
 
 target_compile_definitions(download_wrapper PRIVATE DOWNLOAD_WRAPPER_BUILD)

@@ -32,15 +32,15 @@ void do_init_singleton() {
     g_downloader = std::make_unique<dw_downloader>();
 }
 
-/// C ABI 的 dw_task_key_t 转内部 TaskKey。安全起见：key 为空时返回全零 TaskKey，
-/// 业务侧需对查表结果作“命中/未命中”判别。
-TaskKey make_task_key(const dw_task_key_t *key) {
-    TaskKey k;
-    if (!key || !key->natural_key) return k;
-    k.client_id = g_downloader ? g_downloader->task_manager->client_id() : std::string();
-    k.key_type = static_cast<TaskKeyType>(key->key_type);
-    k.natural_key = key->natural_key;
-    return k;
+/// C ABI 的 dw_task_key_t 提取 natural_key。key 为空或 natural_key 为 NULL 返回空串。
+std::string natural_key_of(const dw_task_key_t *key) {
+    if (!key || !key->natural_key) return "";
+    return key->natural_key;
+}
+
+/// dw_key_type_t 推导 dw_protocol_t：LOCAL 仅内存态迁移，无引擎对应，调用方应早返回。
+dw_protocol_t protocol_of_key_type(int32_t key_type) {
+    return key_type == DW_KEY_TYPE_BT ? DW_PROTOCOL_TORRENT : DW_PROTOCOL_HTTP;
 }
 
 /// 拷贝 dw_task_key_t 的 natural_key 到 out_result.key.natural_key。供控制操作同步返回。
@@ -358,14 +358,13 @@ DW_API int32_t dw_pause_task(const dw_task_key_t*  key,
     out_result->key.natural_key = nullptr;
 
     // 协议由 key_type 推导：HTTP/BT 走引擎，LOCAL 仅为内存态迁移。
-    const dw::TaskKey task_key = dw::make_task_key(key);
     if (key && key->key_type == DW_KEY_TYPE_LOCAL) {
         // LOCAL 任务无引擎 context：仅复制 key 返回。
         return dw::dup_submit_key(out_result, key) == 0 ? 0 : -1;
     }
-    const dw_protocol_t proto =
-        key && key->key_type == DW_KEY_TYPE_BT ? DW_PROTOCOL_TORRENT : DW_PROTOCOL_HTTP;
-    const int32_t rc = d->task_manager->pause(proto, task_key, out_result);
+    const dw_protocol_t proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const std::string nk = dw::natural_key_of(key);
+    const int32_t rc = d->task_manager->pause(proto, nk, out_result);
     if (rc != 0) {
         out_result->code = DW_REASON_ERROR;
         return rc;
@@ -392,10 +391,9 @@ DW_API int32_t dw_resume_task(const dw_task_key_t* key,
     out_result->key.natural_key = nullptr;
 
     // 协议仅在传递到引擎时才需要；resume 本身仅改内存态与触发重调度。
-    const dw::TaskKey task_key = dw::make_task_key(key);
-    const dw_protocol_t proto =
-        key && key->key_type == DW_KEY_TYPE_BT ? DW_PROTOCOL_TORRENT : DW_PROTOCOL_HTTP;
-    const int32_t rc = d->task_manager->resume(proto, task_key, out_result);
+    const dw_protocol_t proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const std::string nk = dw::natural_key_of(key);
+    const int32_t rc = d->task_manager->resume(proto, nk, out_result);
     if (rc != 0) {
         out_result->code = DW_REASON_ERROR;
         return rc;
@@ -424,7 +422,8 @@ DW_API int32_t dw_delete_task(const dw_task_key_t* key,
 
     // LOCAL 任务（扫描发现的本地文件）走专门的删除路径，不走引擎 + 任务中枢。
     if (key && key->key_type == DW_KEY_TYPE_LOCAL) {
-        const int32_t rc = d->task_manager->delete_local_entry(dw::make_task_key(key));
+        const dw_protocol_t local_proto = DW_PROTOCOL_HTTP; // LOCAL 无引擎，proto 仅占位
+        const int32_t rc = d->task_manager->delete_local_entry(local_proto, dw::natural_key_of(key));
         if (rc != 0) {
             out_result->code = DW_REASON_ERROR;
             return rc;
@@ -432,10 +431,9 @@ DW_API int32_t dw_delete_task(const dw_task_key_t* key,
         return dw::dup_submit_key(out_result, key) == 0 ? 0 : -1;
     }
 
-    const dw::TaskKey task_key = dw::make_task_key(key);
-    const dw_protocol_t proto =
-        key && key->key_type == DW_KEY_TYPE_BT ? DW_PROTOCOL_TORRENT : DW_PROTOCOL_HTTP;
-    const int32_t rc = d->task_manager->remove(proto, task_key, delete_files, out_result);
+    const dw_protocol_t proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const std::string nk = dw::natural_key_of(key);
+    const int32_t rc = d->task_manager->remove(proto, nk, delete_files, out_result);
     if (rc != 0) {
         out_result->code = DW_REASON_ERROR;
         return rc;
@@ -479,9 +477,10 @@ DW_API char* dw_info_hash_to_magnet(const dw_task_key_t* key) {
     }
     // 按任务键回读 info_hash（BT 的 natural_key 即 info_hash）。
     std::string info_hash;
-    if (!d->task_manager->engine_key_of(dw::make_task_key(key), info_hash)) {
+    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    if (!d->task_manager->engine_key_of(proto, dw::natural_key_of(key), info_hash)) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 key_type=%d natural_key=%s",
-                key->key_type, key->natural_key ? key->natural_key : "(null)");
+                key->key_type, key->natural_key ? key->natural_key : "");
         return nullptr;
     }
     return dw::TorrentEngine::info_hash_to_magnet(info_hash.c_str());
@@ -522,7 +521,8 @@ DW_API int32_t dw_get_file_list(const dw_task_key_t* key,
     *out_count = 0;
 
     // 从 task_files 表读取（文件元数据已由 PARSED 事件入库，downloaded_bytes 由周期快照更新）。
-    const auto files = d->task_manager->load_files(dw::make_task_key(key));
+    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    const auto files = d->task_manager->load_files(proto, dw::natural_key_of(key));
     if (files.empty()) {
         return -1;
     }
@@ -557,10 +557,11 @@ DW_API int32_t dw_get_file_ranges(const dw_task_key_t*  key,
     *out_ranges = nullptr;
     *out_count  = 0;
 
-    const dw::TaskKey task_key = dw::make_task_key(key);
+    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    const std::string nk = dw::natural_key_of(key);
 
     // ---- 1. 优先读内存缓存（B 线程周期从引擎拉取更新） ----
-    std::vector<dw_byte_range_t> vec = d->task_manager->get_cached_segments(task_key, file_index);
+    std::vector<dw_byte_range_t> vec = d->task_manager->get_cached_segments(proto, nk, file_index);
 
     if (!vec.empty()) {
         // 缓存命中，直接返回
@@ -575,7 +576,7 @@ DW_API int32_t dw_get_file_ranges(const dw_task_key_t*  key,
     }
 
     // ---- 2. 缓存为空：按任务状态决定行为 ----
-    const int32_t status = d->task_manager->get_task_status(task_key);
+    const int32_t status = d->task_manager->get_task_status(proto, nk);
     if (status < 0) {
         // 任务不存在
         return 2;
@@ -591,7 +592,7 @@ DW_API int32_t dw_get_file_ranges(const dw_task_key_t*  key,
     }
 
     // ---- 3. 非下载中：回退 DB 快照（静态数据） ----
-    vec = d->task_manager->load_segments(task_key, file_index);
+    vec = d->task_manager->load_segments(proto, nk, file_index);
     if (vec.empty()) {
         return 2; // 无数据且不会增长
     }
@@ -627,15 +628,19 @@ DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
     *out_path = nullptr;
     *out_size = -1;
 
-    const dw::TaskKey task_key = dw::make_task_key(key);
+    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    const std::string nk = dw::natural_key_of(key);
 
     // 持锁快照任务记录（save_path / filename / protocol / total_size）
     dw::TaskRecord rec;
     {
         std::lock_guard<std::mutex> lock(d->task_manager->get_mutex());
-        if (!d->task_manager->get_store().load_by_task_key(task_key, rec)) {
+        if (!d->task_manager->get_store().load_by_natural_key(
+                d->task_manager->client_id(),
+                static_cast<dw::TaskKeyType>(key->key_type),
+                nk, rec)) {
             DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 key_type=%d natural_key=%s",
-                    key->key_type, key->natural_key ? key->natural_key : "(null)");
+                    key->key_type, key->natural_key ? key->natural_key : "");
             return -1;
         }
     }
@@ -650,7 +655,7 @@ DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
 
     if (rec.protocol == DW_PROTOCOL_TORRENT && file_index > 0) {
         // BT 多文件：经 task_files 表按 file_index 查 name（name 已含完整相对路径）
-        auto files = d->task_manager->load_files(task_key);
+        auto files = d->task_manager->load_files(proto, nk);
         for (const auto& f : files) {
             if (f.index == file_index) {
                 if (f.name && f.name[0]) {
@@ -670,7 +675,7 @@ DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
 
     if (file_path.empty()) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 无法构建文件路径 key_type=%d natural_key=%s fi=%d",
-                key->key_type, key->natural_key ? key->natural_key : "(null)", file_index);
+                key->key_type, key->natural_key ? key->natural_key : "", file_index);
         return -1;
     }
 
@@ -702,7 +707,8 @@ DW_API int32_t dw_set_playing_file(const dw_task_key_t*  key,
     out_result->key.natural_key = nullptr;
 
     // 仅写播放标识，由调度器统一处理任务准入与 piece deadline 设置。
-    if (!d->task_manager->set_playing(dw::make_task_key(key), file_index, byte_offset)) {
+    const dw_protocol_t play_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    if (!d->task_manager->set_playing(play_proto, dw::natural_key_of(key), file_index, byte_offset)) {
         out_result->code = DW_REASON_ERROR;
         return -1;
     }
@@ -723,7 +729,8 @@ DW_API int32_t dw_set_play_position(const dw_task_key_t*  key,
         return -1;
     }
     // 播放进度直落 task_store，与协议无关。
-    d->task_manager->set_play_position(dw::make_task_key(key), file_index, position_ms);
+    const dw_protocol_t pp_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    d->task_manager->set_play_position(pp_proto, dw::natural_key_of(key), file_index, position_ms);
     out_result->code    = DW_REASON_NONE;
     out_result->message = nullptr;
     out_result->key.key_type = key ? key->key_type : DW_KEY_TYPE_HTTP;
@@ -742,7 +749,8 @@ DW_API int32_t dw_get_play_position(const dw_task_key_t* key,
         if (out_position_ms) *out_position_ms = 0;
         return -1;
     }
-    *out_position_ms = d->task_manager->get_play_position(dw::make_task_key(key), file_index);
+    const dw_protocol_t gp_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    *out_position_ms = d->task_manager->get_play_position(gp_proto, dw::natural_key_of(key), file_index);
     return 0;
 }
 
@@ -773,7 +781,8 @@ DW_API int32_t dw_set_task_priority(const dw_task_key_t* key, int32_t priority) 
             d, d ? d->initialized.load() : 0, key);
         return -1;
     }
-    return d->task_manager->set_priority(dw::make_task_key(key), priority);
+    const dw_protocol_t sp_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    return d->task_manager->set_priority(sp_proto, dw::natural_key_of(key), priority);
 }
 
 /* ------------------------------------------------------------------ */
@@ -793,8 +802,9 @@ DW_API int32_t dw_load_task_files(const dw_task_key_t* key,
         if (out_count) *out_count = 0;
         return -1;
     }
-    // 从 task_files 表按 TaskKey 关联加载（自然键入表外键）。
-    auto file_vec = d->task_manager->load_files(dw::make_task_key(key));
+    // 从 task_files 表按复合键关联加载（自然键入表外键）。
+    const dw_protocol_t lf_proto = dw::protocol_of_key_type(key->key_type);
+    auto file_vec = d->task_manager->load_files(lf_proto, dw::natural_key_of(key));
     if (file_vec.empty()) {
         *out_files = nullptr;
         *out_count = 0;
@@ -868,7 +878,8 @@ DW_API int32_t dw_delete_local_entry(const dw_task_key_t* key) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未初始化或参数非法");
         return -1;
     }
-    return d->task_manager->delete_local_entry(dw::make_task_key(key));
+    const dw_protocol_t dl_proto = dw::protocol_of_key_type(key->key_type);
+    return d->task_manager->delete_local_entry(dl_proto, dw::natural_key_of(key));
 }
 
 /* ------------------------------------------------------------------ */

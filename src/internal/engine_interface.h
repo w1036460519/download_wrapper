@@ -38,15 +38,24 @@ public:
     virtual int32_t add_task(const dw_task_params_t* params,
                              dw_submit_result_t*     out_result) = 0;
 
+    /// 恢复单个下载任务（调度器准入时调用）。
+    /// 双行为：handle 存在则直接恢复下载；handle 不存在则用 resume_data/参数重建。
+    /// 重建失败时任务进入 ERROR 状态。
+    virtual int32_t resume_task(const dw_task_params_t* params,
+                                dw_submit_result_t*     out_result) = 0;
+
     /// 暂停单个下载任务（id 为引擎键：HTTP=url，BT=info_hash）。
     virtual int32_t pause_task(const char*         id,
                                dw_submit_result_t* out_result) = 0;
 
-    /// 删除单个下载任务（异步语义，两协议统一模型）：仅释放/移除运行时资源
-    /// 并置标记，不涉及落盘文件；文件删除由 TaskManager 在 task_released
-    /// 确认资源释放后按配置执行。
-    /// @return 0=引擎已接管释放；1=引擎未持有该任务（无运行时资源）；-1=错误。
+    /// 删除单个下载任务（事件驱动模型）：
+    ///   - handle 有效 → remove_torrent(delete_files)，后续由 torrent_removed_alert /
+    ///     torrent_deleted_alert 触发 DELETED 事件；
+    ///   - handle 无效 → 按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
+    /// wrapper 收到 DELETED 事件后回收资源、清理数据。
+    /// @return 0=引擎已接管；-1=错误。
     virtual int32_t delete_task(const char*         id,
+                                int32_t             delete_files,
                                 dw_submit_result_t* out_result) = 0;
 
     /// 查询任务运行时资源是否已全部释放（线程已 join、文件/存储句柄已关闭）。

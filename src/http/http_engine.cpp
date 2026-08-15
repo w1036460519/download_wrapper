@@ -130,9 +130,9 @@ namespace dw {
                        static_cast<const void *>(params), static_cast<void *>(out_result));
             return -1;
         }
-        DW_LOG_TASK(DW_LOG_DEBUG, params->url, "HTTP add_task 进入");
-
-        const char *url = (params->url && params->url[0]) ? params->url : nullptr;
+        const char *url = dw_task_params_key(params, DW_PROTOCOL_HTTP);
+        DW_LOG_TASK(DW_LOG_DEBUG, url,
+                    "HTTP添加任务: %s", to_string(*params).c_str());
         const char *err = nullptr;
 
         if (!ensure_running()) {
@@ -144,7 +144,7 @@ namespace dw {
         if (!validate_add_input(url, params->save_path, &err)) {
             set_result(out_result, url, DW_REASON_ERROR, nullptr,
                        "validate_add_input failed: url=%s output=%s err=%s",
-                       url ? url : "(null)", params->save_path ? params->save_path : "(null)", err);
+                       url ? url : "", params->save_path ? params->save_path : "", err);
             return -1;
         }
 
@@ -269,11 +269,17 @@ namespace dw {
         return 0;
     }
 
+    int32_t HttpEngine::resume_task(const dw_task_params_t *params,
+                                    dw_submit_result_t *out_result) {
+        // HTTP 无句柄概念，恢复即重新添加（幂等：已存在则继续运行）
+        return add_task(params, out_result);
+    }
+
     int32_t HttpEngine::pause_task(const char *id,
                                    dw_submit_result_t *out_result) {
         if (!id || !*id || !out_result) {
             DW_LOG_SYS(DW_LOG_ERROR, "HTTP pause_task 失败: 入参为空 id=%s out_result=%p",
-                       (id && *id) ? id : "(null)", static_cast<void *>(out_result));
+                       (id && *id) ? id : "", static_cast<void *>(out_result));
             return -1;
         }
         DW_LOG_TASK(DW_LOG_DEBUG, id, "HTTP pause_task 进入");
@@ -312,13 +318,14 @@ namespace dw {
     }
 
     int32_t HttpEngine::delete_task(const char *id,
+                                    const int32_t /*delete_files*/,
                                     dw_submit_result_t *out_result) {
         if (!id || !*id || !out_result) {
             DW_LOG_SYS(DW_LOG_ERROR, "HTTP delete_task 失败: 入参为空 id=%s out_result=%p",
-                       (id && *id) ? id : "(null)", static_cast<void *>(out_result));
+                       (id && *id) ? id : "", static_cast<void *>(out_result));
             return -1;
         }
-        DW_LOG_TASK(DW_LOG_DEBUG, id, "HTTP delete_task 进入");
+        DW_LOG_TASK(DW_LOG_DEBUG, id, "HTTP delete_task");
 
         if (!ensure_running()) {
             set_result(out_result, id, DW_REASON_ERROR, nullptr,
@@ -326,9 +333,7 @@ namespace dw {
             return -1;
         }
 
-        // 删除异步化：仅置取消 + 删除标志立即返回（与 pause 同模式），资源回收由
-        // B 线程 sweep 执行（join/析构关句柄）；文件删除归 TaskManager，经
-        // task_released 确认 ctx 回收（句柄已关闭）后按配置执行。
+        // 置取消 + 删除标志，sweep 回收后发 DELETED 事件。
         try {
             const char *url = id;
             bool hit = false;
@@ -342,11 +347,18 @@ namespace dw {
             }
             set_result(out_result, url, DW_REASON_NONE, nullptr, nullptr);
             if (hit) {
-                DW_LOG_TASK(DW_LOG_INFO, url, "HTTP delete_task 已标记（待 sweep 回收）");
+                DW_LOG_TASK(DW_LOG_INFO, url, "HTTP delete_task 已标记（待 sweep 回收发 DELETED）");
                 return 0;
             }
-            // 未持有任务（暂停 ctx 已回收 / 从未运行）：无运行时资源。
-            return 1;
+            // 未持有任务：直接发 DELETED 事件，wrapper 据此回收资源 + 删文件。
+            DW_LOG_TASK(DW_LOG_INFO, url, "HTTP delete_task 任务不在引擎，直接发 DELETED");
+            post_engine_event(EngineEvent{
+                .type = EngineEventType::DELETED,
+                .engine_key = std::string(url),
+                .protocol = DW_PROTOCOL_HTTP,
+                .delete_files = 1 // HTTP 引擎不直接删文件，由 wrapper 处理
+            });
+            return 0;
         } catch (const std::exception &e) {
             DW_LOG_SYS(DW_LOG_ERROR, "HTTP delete_task exception: %s", e.what());
             return -1;
@@ -430,21 +442,30 @@ namespace dw {
         }
         for (const auto &url: to_reclaim) {
             std::unique_ptr<dl_task_ctx> owned;
+            bool deleting = false;
             {
                 std::lock_guard<std::mutex> lk(he::g_map_mtx);
                 const auto it = he::g_tasks.find(url);
                 if (it == he::g_tasks.end()) continue;
                 owned = std::move(it->second); // 移出 map，脱离全局可见
                 he::g_tasks.erase(it);
+                deleting = owned->delete_req.load() == 1;
             }
-            // 锁外 join 已结束的线程并析构 ctx（触发 curl/文件句柄释放；
-            // 删除中任务的文件由 TaskManager 在 task_released 确认后按配置删除）
+            // 锁外 join 已结束的线程并析构 ctx（触发 curl/文件句柄释放）
             if (owned->task_thread.joinable()) owned->task_thread.join();
-            const bool deleting = owned->delete_req.load() == 1;
-            owned.reset(); // 显式析构关闭全部分片文件句柄（Windows 句柄打开期间禁止删除文件）
+            owned.reset(); // 显式析构关闭全部分片文件句柄
             DW_LOG_TASK(DW_LOG_INFO, url.c_str(),
                         deleting ? "删除回收 HTTP 上下文 url=%s"
                                  : "终态回收 HTTP 上下文 url=%s", url.c_str());
+            // 删除中任务：回收完成后发 DELETED 事件，wrapper 据此回收资源 + 删文件。
+            if (deleting) {
+                post_engine_event(EngineEvent{
+                    .type = EngineEventType::DELETED,
+                    .engine_key = url,
+                    .protocol = DW_PROTOCOL_HTTP,
+                    .delete_files = 1 // HTTP 引擎不直接删文件，由 wrapper 处理
+                });
+            }
         }
     }
 } // namespace dw

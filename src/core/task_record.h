@@ -31,66 +31,59 @@ inline const char* to_string(TaskKeyType t) {
     case TaskKeyType::HTTP:  return "HTTP";
     case TaskKeyType::BT:    return "BT";
     case TaskKeyType::LOCAL: return "LOCAL";
+    default: return "UNKNOWN";
     }
-    return "UNKNOWN";
 }
-
-/**
- * 任务唯一键：(clientId, key_type, natural_key) 三元组。
- *
- * - clientId：App 启动时注入（UUIDv4，SharedPreferences 持久化）。
- *   本地任务也强制填写本机 clientId；远程同步场景下保留远端 clientId 用于多客户端隔离。
- * - key_type：协议 / 来源类别，决定 natural_key 字段语义。
- * - natural_key：业务自然键。HTTP 取 url，BT 取 info_hash，本地任务取 content_root。
- *
- * 作为 std::unordered_map 的 key，必须定义 hash + 相等。
- */
-struct TaskKey {
-    std::string client_id;
-    TaskKeyType key_type = TaskKeyType::HTTP;
-    std::string natural_key;
-
-    bool operator==(const TaskKey& o) const noexcept {
-        return key_type == o.key_type &&
-               client_id == o.client_id &&
-               natural_key == o.natural_key;
-    }
-};
-
-struct TaskKeyHash {
-    size_t operator()(const TaskKey& k) const noexcept {
-        // 三段独立 hash 后折叠，避免单段被覆盖到同一桶
-        const size_t h1 = std::hash<std::string>{}(k.client_id);
-        const size_t h2 = std::hash<int>{}(static_cast<int>(k.key_type));
-        const size_t h3 = std::hash<std::string>{}(k.natural_key);
-        size_t h = h1;
-        h ^= h2 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        h ^= h3 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        return h;
-    }
-};
 
 /**
  * 任务记录：注册表内存态 = 来源参数（恢复/晋升重建用）+ 最新快照 + 队列元数据。
  *
- * 主键为 TaskKey，原 task_id 字段已移除。
+ * 主键为 (client_id, key_type) + 按类型散布到 url/info_hash/content_root 的原始标识。
+ * open_id() 按 "type|raw_key" 格式派生，同时为 tasks_ map 键。
  */
 struct TaskRecord {
-    // 主键（同时为 PK 与内存 map 的 key）
-    TaskKey     task_key;
+    // 主键（DB PK = client_id + key_type + natural_key 列；内存无冗余字段）
+    std::string   client_id;    // App 启动时注入（UUIDv4）；本机任务恒 = TaskManager::client_id_
+    TaskKeyType   key_type   = TaskKeyType::HTTP; // 决定原始标识落哪个字段
 
     // 协议标识（冗余 key_type 但便于 switch；HTTP/BT 由 key_type 决定）
     dw_protocol_t protocol = DW_PROTOCOL_HTTP;
+
+    // ---- 任务标识访问器 ----
+    // 原始标识：按 key_type 取 url / info_hash / content_root（不额外存储，避免冗余）。
+    const std::string& raw_key() const noexcept {
+        switch (key_type) {
+        case TaskKeyType::BT:    return info_hash;
+        case TaskKeyType::LOCAL: return content_root;
+        default:                 return url;
+        }
+    }
+    std::string& raw_key() noexcept {
+        switch (key_type) {
+        case TaskKeyType::BT:    return info_hash;
+        case TaskKeyType::LOCAL: return content_root;
+        default:                 return url;
+        }
+    }
+    // OpenID：本机唯一，格式 "type|raw_key"（如 "HTTP|https://..."、"BT|abc123"）。
+    // 同时为 tasks_ map 键。
+    std::string open_id() const {
+        return std::string(to_string(key_type)) + '|' + raw_key();
+    }
+    // UnionID：跨客户端全局唯一，格式 "client_id|type|raw_key"。
+    std::string union_id() const {
+        return client_id + '|' + open_id();
+    }
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
     std::string              save_path;     // 用户指定的保存目录（固定不变）
     std::string              content_root;  // save_path 下的实际根目录名（物理路径 = save_path/content_root）
                                              // BT PARSED 时由文件结构分析确定；HTTP 由定名流程写入。
                                              // 空 = 尚未定名（PARSED 前）。
-                                             // 本地任务的 natural_key 也指向此字段。
+                                             // 本地任务的 raw_key 也指向此字段。
     std::string              filename;      // content_root 内的主文件名（含后缀），BT 多文件任务可空
-    std::string              url;           // HTTP 身份 + 下载地址（同时为 natural_key）
-    std::string              info_hash;     // BT 身份（同时为 natural_key），HTTP 该字段为空
+    std::string              url;           // HTTP 身份 + 下载地址（HTTP 时 raw_key 指向此字段）
+    std::string              info_hash;     // BT 身份（BT 时 raw_key 指向此字段），HTTP 该字段为空
     std::string              magnet_link;   // BT
     std::string              torrent_file;  // BT
     std::string              name;          // 任务显示名称（种子原始名 / HTTP 原始文件名；STATUS_UPDATE 可更新）

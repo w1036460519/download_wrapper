@@ -40,10 +40,17 @@ public:
     void destroy() override;
 
     /**
-     * 添加单个 BT 下载任务。
+     * 添加单个 BT 下载任务（不含 resume_data，仅创建 handle）。
      */
     int32_t add_task(const dw_task_params_t* params,
                      dw_submit_result_t*     out_result) override;
+
+    /**
+     * 恢复单个 BT 下载任务（调度器准入时调用）。
+     * 双行为：handle 存在则直接恢复下载；handle 不存在则用 resume_data/参数重建。
+     */
+    int32_t resume_task(const dw_task_params_t* params,
+                        dw_submit_result_t*     out_result) override;
 
     /**
      * 暂停单个 BT 下载任务。
@@ -52,12 +59,14 @@ public:
                        dw_submit_result_t* out_result) override;
 
     /**
-     * 删除单个 BT 下载任务：仅移出 session 释放运行时资源（存储句柄由 disk-io
-     * 线程异步关闭），不涉及落盘文件；文件删除由 TaskManager 在 task_released
-     * 确认后按配置执行。
-     * 返回 0=已接管释放；1=未持有该任务（无运行时资源）；-1=错误。
+     * 删除单个 BT 下载任务（事件驱动模型）：
+     *   - handle 有效 → remove_torrent(delete_files)，后续由 torrent_removed_alert /
+     *     torrent_deleted_alert 触发 DELETED 事件；
+     *   - handle 无效 → 按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
+     * @return 0=引擎已接管；-1=错误。
      */
     int32_t delete_task(const char*         task_id,
+                        int32_t             delete_files,
                         dw_submit_result_t* out_result) override;
 
     /**

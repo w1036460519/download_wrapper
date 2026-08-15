@@ -45,17 +45,24 @@ public:
                      dw_submit_result_t*     out_result) override;
 
     /**
+     * 恢复单个 HTTP 下载任务（HTTP 无句柄概念，委托 add_task）。
+     */
+    int32_t resume_task(const dw_task_params_t* params,
+                        dw_submit_result_t*     out_result) override;
+
+    /**
      * 暂停单个 HTTP 下载任务。
      */
     int32_t pause_task(const char*         id,
                        dw_submit_result_t* out_result) override;
 
     /**
-     * 删除单个 HTTP 下载任务：仅置取消 + 删除标志立即返回，资源回收由 sweep
-     * 执行，不涉及落盘文件（文件删除归 TaskManager）。
-     * 返回 0=已接管释放；1=未持有该任务（无运行时资源）；-1=错误。
+     * 删除单个 HTTP 下载任务（事件驱动模型）：
+     * 置取消 + 删除标志，sweep 回收后发 DELETED 事件通知 wrapper。
+     * @return 0=引擎已接管；-1=错误。
      */
     int32_t delete_task(const char*         id,
+                        int32_t             delete_files,
                         dw_submit_result_t* out_result) override;
 
     /**

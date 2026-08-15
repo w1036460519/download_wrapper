@@ -9,6 +9,7 @@
     "boost-beast",
     "boost-url",
     "boost-algorithm",
+    "boost-json",
     {
       "name": "libtorrent",
       "default-features": false

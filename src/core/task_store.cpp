@@ -42,11 +42,11 @@ namespace dw {
             return p;
         }
 
-        /// 从查询行填充 TaskRecord（load_active / load_by_url / load_by_info_hash / load_by_task_key 共用，列序须与 SELECT 一致）。
+        /// 从查询行填充 TaskRecord（load_active / load_by_natural_key 共用，列序须与 SELECT 一致）。
         void fill_record(sqlite3_stmt *st, TaskRecord &r) {
-            r.task_key.client_id  = col_text(st, 0);
-            r.task_key.key_type   = static_cast<TaskKeyType>(sqlite3_column_int(st, 1));
-            r.task_key.natural_key = col_text(st, 2);
+            r.client_id  = col_text(st, 0);
+            r.key_type   = static_cast<TaskKeyType>(sqlite3_column_int(st, 1));
+            // 列 2 = natural_key（DB 列保留，内存不存；url/info_hash/content_root 已含同等数据）
             r.protocol = static_cast<dw_protocol_t>(sqlite3_column_int(st, 3));
             r.name = col_text(st, 4);
             r.save_path = col_text(st, 5);
@@ -195,7 +195,7 @@ namespace dw {
         sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
     }
 
-    std::vector<TaskRecord> TaskStore::load_active() {
+    std::vector<TaskRecord> TaskStore::load_active(const std::string &client_id) {
         // 载入排队 / 活跃任务（DOWNLOADING=0, QUEUED=4, RESOLVING=5, PARSED=6）；
         // 暂停(1)/完成(2)/错误(3) 留库，按需回读，减小常驻内存。
         std::vector<TaskRecord> out;
@@ -204,9 +204,10 @@ namespace dw {
                 "       torrent_file, trackers, file_indexes, priority,"
                 "       status, progress, total_size, total_done, support_range, etag,"
                 "       last_modified, created_at, modified_at, source, content_root FROM tasks"
-                "  WHERE status IN (0,4,5,6) AND source=0;";
+                "  WHERE client_id=? AND status IN (0,4,5,6) AND source=0;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
 
         while (sqlite3_step(st) == SQLITE_ROW) {
             TaskRecord r;
@@ -267,40 +268,13 @@ namespace dw {
         }
     } // namespace
 
-    bool TaskStore::load_by_url(const std::string &client_id, const std::string &url, TaskRecord &out) {
-        // HTTP 按 (client_id, KEY_TYPE_HTTP, url) 查。业务层据此判重。
-        return load_one_by(db_, client_id, TaskKeyType::HTTP, "url", url, out);
-    }
-
-    bool TaskStore::load_by_info_hash(const std::string &client_id, const std::string &info_hash, TaskRecord &out) {
-        // BT 按 (client_id, KEY_TYPE_BT, info_hash) 查。业务层据此判重。
-        return load_one_by(db_, client_id, TaskKeyType::BT, "info_hash", info_hash, out);
-    }
-
-    bool TaskStore::load_by_content_root(const std::string &client_id, const std::string &content_root, TaskRecord &out) {
-        // 本地任务按 (client_id, KEY_TYPE_LOCAL, content_root) 查。
-        return load_one_by(db_, client_id, TaskKeyType::LOCAL, "content_root", content_root, out);
-    }
-
-    bool TaskStore::load_by_task_key(const TaskKey &key, TaskRecord &out) {
-        const char *sql =
-                "SELECT client_id, key_type, natural_key, protocol, name, save_path, filename, url, info_hash, magnet_link,"
-                "       torrent_file, trackers, file_indexes, priority,"
-                "       status, progress, total_size, total_done, support_range, etag,"
-                "       last_modified, created_at, modified_at, source, content_root"
-                " FROM tasks WHERE client_id=? AND key_type=? AND natural_key=?;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
-        sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
-        bool found = false;
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            fill_record(st, out);
-            found = true;
-        }
-        sqlite3_finalize(st);
-        return found;
+    bool TaskStore::load_by_natural_key(const std::string &client_id, const TaskKeyType key_type,
+                                       const std::string &natural_key, TaskRecord &out) {
+        // key_type 决定 natural_key 落库列：HTTP=url / BT=info_hash / LOCAL=content_root。
+        const char *col = (key_type == TaskKeyType::HTTP)
+                              ? "url"
+                              : (key_type == TaskKeyType::BT) ? "info_hash" : "content_root";
+        return load_one_by(db_, client_id, key_type, col, natural_key, out);
     }
 
     std::vector<TaskRecord> TaskStore::load_tasks_by_save_path(const std::string &save_path) {
@@ -342,7 +316,7 @@ namespace dw {
     }
 
     void TaskStore::insert(TaskRecord &r) {
-        // 新增任务：主键 (client_id, key_type, natural_key) 须在 r.task_key 预填。
+        // 新增任务：主键 (client_id, key_type, natural_key) 须预填；natural_key 由 raw_key() 派生。
         // 同一三元组重入则 PK 冲突报错；add 路径按 (client_id, key_type, url/info_hash/content_root) 预判重。
         // modified_at 默认随 created_at（新增即修改）。
         const int64_t now = now_unix_ms();
@@ -362,9 +336,9 @@ namespace dw {
         const std::string trackers = join_lines(r.trackers);
         const std::string indexes = join_ints(r.file_indexes);
     
-        sqlite3_bind_text(st, 1, r.task_key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(r.task_key.key_type));
-        sqlite3_bind_text(st, 3, r.task_key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, r.client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(r.key_type));
+        sqlite3_bind_text(st, 3, r.raw_key().c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 4, r.protocol);
         sqlite3_bind_text(st, 5, r.name.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 6, r.save_path.c_str(), -1, SQLITE_TRANSIENT);
@@ -433,36 +407,37 @@ namespace dw {
         sqlite3_bind_int64(st, 20, modified_at);
         sqlite3_bind_int(st, 21, r.source);
         sqlite3_bind_text(st, 22, r.content_root.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 23, r.task_key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 24, static_cast<int>(r.task_key.key_type));
-        sqlite3_bind_text(st, 25, r.task_key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 23, r.client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 24, static_cast<int>(r.key_type));
+        sqlite3_bind_text(st, 25, r.raw_key().c_str(), -1, SQLITE_TRANSIENT);
 
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
 
-    void TaskStore::update_status(const TaskKey &key, int32_t status) {
+    void TaskStore::update_status(const std::string &client_id, TaskKeyType key_type,
+                                   const std::string &natural_key, int32_t status) {
         const char *sql = "UPDATE tasks SET status=? WHERE client_id=? AND key_type=? AND natural_key=?;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
         sqlite3_bind_int(st, 1, status);
-        sqlite3_bind_text(st, 2, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 3, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 4, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 3, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 4, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
 
-    void TaskStore::remove(const TaskKey &key) {
+    void TaskStore::remove(const std::string &client_id, TaskKeyType key_type, const std::string &natural_key) {
         // 辅助 lambda：按复合键删除指定表的一行
-        auto del_by_key = [this, &key](const char *table) {
+        auto del_by_key = [this, &client_id, &key_type, &natural_key](const char *table) {
             sqlite3_stmt *st = nullptr;
             const std::string sql = std::string("DELETE FROM ") + table +
                                     " WHERE client_id=? AND key_type=? AND natural_key=?;";
             if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-                sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+                sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_step(st);
                 sqlite3_finalize(st);
             }
@@ -473,23 +448,25 @@ namespace dw {
         del_by_key("file_segments");
     }
 
-    void TaskStore::save_resume(const TaskKey &key,
+    void TaskStore::save_resume(const std::string &client_id, TaskKeyType key_type,
+                                const std::string &natural_key,
                                 const uint8_t *data, size_t size) {
         const char *sql =
                 "INSERT OR REPLACE INTO resume_data (client_id, key_type, natural_key, data, saved_at)"
                 " VALUES (?,?,?,?,?);";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_blob(st, 4, data, static_cast<int>(size), SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 5, now_unix_ms());
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
 
-    std::vector<uint8_t> TaskStore::load_resume(const TaskKey &key) {
+    std::vector<uint8_t> TaskStore::load_resume(const std::string &client_id, TaskKeyType key_type,
+                                              const std::string &natural_key) {
         std::vector<uint8_t> out;
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
@@ -497,9 +474,9 @@ namespace dw {
                 -1, &st, nullptr) != SQLITE_OK) {
             return out;
         }
-        sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st) == SQLITE_ROW) {
             const void *blob = sqlite3_column_blob(st, 0);
             const int n = sqlite3_column_bytes(st, 0);
@@ -512,14 +489,14 @@ namespace dw {
         return out;
     }
 
-    void TaskStore::clear_resume(const TaskKey &key) {
+    void TaskStore::clear_resume(const std::string &client_id, TaskKeyType key_type, const std::string &natural_key) {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
                 "DELETE FROM resume_data WHERE client_id=? AND key_type=? AND natural_key=?;",
                 -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-            sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+            sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_step(st);
             sqlite3_finalize(st);
         }
@@ -527,7 +504,8 @@ namespace dw {
 
     // ---- 任务文件信息 ----
 
-    void TaskStore::save_task_files(const TaskKey &key,
+    void TaskStore::save_task_files(const std::string &client_id, TaskKeyType key_type,
+                                    const std::string &natural_key,
                                     const std::vector<dw_file_info_t> &files) {
         if (files.empty()) return;
 
@@ -538,9 +516,9 @@ namespace dw {
             if (sqlite3_prepare_v2(db_,
                     "DELETE FROM task_files WHERE client_id=? AND key_type=? AND natural_key=?;",
                     -1, &del, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(del, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(del, 2, static_cast<int>(key.key_type));
-                sqlite3_bind_text(del, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(del, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int(del, 2, static_cast<int>(key_type));
+                sqlite3_bind_text(del, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_step(del);
                 sqlite3_finalize(del);
             }
@@ -558,9 +536,9 @@ namespace dw {
 
         for (const auto &f: files) {
             sqlite3_reset(st);
-            sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-            sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+            sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int(st, 4, f.index);
             sqlite3_bind_text(st, 5, f.name ? f.name : "", -1, SQLITE_TRANSIENT);
             if (f.ext) {
@@ -578,7 +556,8 @@ namespace dw {
         sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
     }
 
-    std::vector<dw_file_info_t> TaskStore::load_task_files(const TaskKey &key) {
+    std::vector<dw_file_info_t> TaskStore::load_task_files(const std::string &client_id, TaskKeyType key_type,
+                                                         const std::string &natural_key) {
         std::vector<dw_file_info_t> out;
         // 按 file_index 升序返回扁平文件列表。
         const char *sql =
@@ -587,9 +566,9 @@ namespace dw {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
 
-        sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(st) == SQLITE_ROW) {
             dw_file_info_t f{};
             f.index = sqlite3_column_int(st, 0);
@@ -605,31 +584,33 @@ namespace dw {
         return out;
     }
 
-    void TaskStore::mark_task_files_completed(const TaskKey &key) {
+    void TaskStore::mark_task_files_completed(const std::string &client_id, TaskKeyType key_type,
+                                            const std::string &natural_key) {
         // 任务级 0→2 传播：所有文件节点置完成，不触碰已删除(1)态。
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
                 "UPDATE task_files SET status=2"
                 " WHERE client_id=? AND key_type=? AND natural_key=? AND status<>1;",
                 -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-            sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+            sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_step(st);
             sqlite3_finalize(st);
         }
     }
 
-    void TaskStore::mark_file_completed(const TaskKey &key, int32_t file_index) {
+    void TaskStore::mark_file_completed(const std::string &client_id, TaskKeyType key_type,
+                                      const std::string &natural_key, int32_t file_index) {
         // 单文件 0→2 标记：仅更新下载中态的文件节点，已删除(1) / 已完成(2) 不触碰（幂等）。
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
                 "UPDATE task_files SET status=2"
                 " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=? AND status=0;",
                 -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-            sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+            sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int(st, 4, file_index);
             sqlite3_step(st);
             sqlite3_finalize(st);
@@ -638,7 +619,8 @@ namespace dw {
 
     // ---- 边下边播缓存（已合并到 task_files 表，play_position_ms 字段在同一行）----
     
-    void TaskStore::set_play_position(const TaskKey &key, int32_t file_index, int64_t position_ms) {
+    void TaskStore::set_play_position(const std::string &client_id, TaskKeyType key_type,
+                                    const std::string &natural_key, int32_t file_index, int64_t position_ms) {
         // upsert：仅更新 play_position_ms，不触碰 downloaded_bytes（由引擎独立写）。
         const char *sql =
                 "UPDATE task_files SET play_position_ms=?"
@@ -646,24 +628,25 @@ namespace dw {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
         sqlite3_bind_int64(st, 1, position_ms);
-        sqlite3_bind_text(st, 2, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 3, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 4, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 3, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 4, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 5, file_index);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
     
-    int64_t TaskStore::get_play_position(const TaskKey &key, int32_t file_index) {
+    int64_t TaskStore::get_play_position(const std::string &client_id, TaskKeyType key_type,
+                                       const std::string &natural_key, int32_t file_index) {
         int64_t position_ms = 0;
         const char *sql =
                 "SELECT play_position_ms FROM task_files"
                 " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return position_ms;
-        sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 4, file_index);
         if (sqlite3_step(st) == SQLITE_ROW &&
             sqlite3_column_type(st, 0) != SQLITE_NULL) {
@@ -675,14 +658,16 @@ namespace dw {
     
     // ---- 已下载区间快照（任务未加载进引擎时的播放兌底）----
     
-    void TaskStore::save_segments(const TaskKey &key, int32_t file_index,
+    void TaskStore::save_segments(const std::string &client_id, TaskKeyType key_type,
+                                 const std::string &natural_key, int32_t file_index,
                                  const std::vector<dw_byte_range_t> &segments) {
         // 委托批量接口：单文件区间即只含一个元素的向量
-        save_segments_batch(key, {{file_index, segments}});
+        save_segments_batch(client_id, key_type, natural_key, {{file_index, segments}});
     }
     
     void TaskStore::save_segments_batch(
-            const TaskKey &key,
+            const std::string &client_id, TaskKeyType key_type,
+            const std::string &natural_key,
             const std::vector<std::pair<int32_t, std::vector<dw_byte_range_t>>> &file_segments) {
         sqlite3_exec(db_, "BEGIN;", nullptr, nullptr, nullptr);
     
@@ -694,9 +679,9 @@ namespace dw {
             sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
             return;
         }
-        sqlite3_bind_text(del, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(del, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(del, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(del, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(del, 2, static_cast<int>(key_type));
+        sqlite3_bind_text(del, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(del);
         sqlite3_finalize(del);
     
@@ -712,9 +697,9 @@ namespace dw {
             for (const auto &[file_index, segments] : file_segments) {
                 for (const auto &seg : segments) {
                     sqlite3_reset(st);
-                    sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-                    sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+                    sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
                     sqlite3_bind_int(st, 4, file_index);
                     sqlite3_bind_int64(st, 5, seg.start);
                     sqlite3_bind_int64(st, 6, seg.end);
@@ -727,7 +712,8 @@ namespace dw {
     }
     
     void TaskStore::update_downloaded_bytes(
-            const TaskKey &key,
+            const std::string &client_id, TaskKeyType key_type,
+            const std::string &natural_key,
             const std::vector<std::pair<int32_t, int64_t>> &file_bytes) {
         if (file_bytes.empty()) return;
         sqlite3_exec(db_, "BEGIN;", nullptr, nullptr, nullptr);
@@ -742,9 +728,9 @@ namespace dw {
         for (const auto &[file_index, bytes] : file_bytes) {
             sqlite3_reset(st);
             sqlite3_bind_int64(st, 1, bytes);
-            sqlite3_bind_text(st, 2, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 3, static_cast<int>(key.key_type));
-            sqlite3_bind_text(st, 4, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 3, static_cast<int>(key_type));
+            sqlite3_bind_text(st, 4, natural_key.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int(st, 5, file_index);
             sqlite3_step(st);
         }
@@ -752,7 +738,8 @@ namespace dw {
         sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
     }
     
-    void TaskStore::upsert_task_file(const TaskKey &key, int32_t file_index,
+    void TaskStore::upsert_task_file(const std::string &client_id, TaskKeyType key_type,
+                                     const std::string &natural_key, int32_t file_index,
                                      int64_t downloaded_bytes, int64_t total_size) {
         // 懒创建 / 进度推送二合一：存在则更新下载量与 size（仅在 size>0 且原值较小时上提），
         // 不存在则插入一行占位（name=''、offset=0、status=0）。元数据（name/ext/offset）
@@ -766,9 +753,9 @@ namespace dw {
                 "   size = MAX(size, excluded.size);";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 4, file_index);
         sqlite3_bind_text(st, 5, "", -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 6, total_size > 0 ? total_size : 0);
@@ -777,16 +764,17 @@ namespace dw {
         sqlite3_finalize(st);
     }
     
-    std::vector<dw_byte_range_t> TaskStore::load_segments(const TaskKey &key, int32_t file_index) {
+    std::vector<dw_byte_range_t> TaskStore::load_segments(const std::string &client_id, TaskKeyType key_type,
+                                                        const std::string &natural_key, int32_t file_index) {
         std::vector<dw_byte_range_t> out;
         const char *sql =
                 "SELECT seg_start, seg_end FROM file_segments"
                 " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=? ORDER BY seg_start;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-        sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+        sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 4, file_index);
         while (sqlite3_step(st) == SQLITE_ROW) {
             dw_byte_range_t seg{};
@@ -798,14 +786,14 @@ namespace dw {
         return out;
     }
     
-    void TaskStore::clear_segments(const TaskKey &key) {
+    void TaskStore::clear_segments(const std::string &client_id, TaskKeyType key_type, const std::string &natural_key) {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
                 "DELETE FROM file_segments WHERE client_id=? AND key_type=? AND natural_key=?;",
                 -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, key.client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 2, static_cast<int>(key.key_type));
-            sqlite3_bind_text(st, 3, key.natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 2, static_cast<int>(key_type));
+            sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_step(st);
             sqlite3_finalize(st);
         }
