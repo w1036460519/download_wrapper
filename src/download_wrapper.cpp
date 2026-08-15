@@ -38,26 +38,6 @@ std::string natural_key_of(const dw_task_key_t *key) {
     return key->natural_key;
 }
 
-/// dw_key_type_t 推导 dw_protocol_t：LOCAL 仅内存态迁移，无引擎对应，调用方应早返回。
-dw_protocol_t protocol_of_key_type(int32_t key_type) {
-    return key_type == DW_KEY_TYPE_BT ? DW_PROTOCOL_TORRENT : DW_PROTOCOL_HTTP;
-}
-
-/// 拷贝 dw_task_key_t 的 natural_key 到 out_result.key.natural_key。供控制操作同步返回。
-/// 成功返回 0，失败返回 -1。key 为 NULL 时 out_result.key.natural_key 置 NULL。
-int32_t dup_submit_key(dw_submit_result_t *out_result, const dw_task_key_t *key) {
-    if (!out_result) return -1;
-    out_result->key.key_type = key ? key->key_type : DW_KEY_TYPE_HTTP;
-    out_result->key.natural_key = nullptr;
-    if (key && key->natural_key) {
-        const size_t len = std::strlen(key->natural_key);
-        char *p = static_cast<char *>(std::malloc(len + 1));
-        if (!p) return -1;
-        std::memcpy(p, key->natural_key, len + 1);
-        out_result->key.natural_key = p;
-    }
-    return 0;
-}
 
 } // namespace
 
@@ -354,15 +334,12 @@ DW_API int32_t dw_pause_task(const dw_task_key_t*  key,
     }
     out_result->code    = DW_REASON_NONE;
     out_result->message = nullptr;
-    out_result->key.key_type = key ? key->key_type : DW_KEY_TYPE_HTTP;
-    out_result->key.natural_key = nullptr;
 
     // 协议由 key_type 推导：HTTP/BT 走引擎，LOCAL 仅为内存态迁移。
-    if (key && key->key_type == DW_KEY_TYPE_LOCAL) {
-        // LOCAL 任务无引擎 context：仅复制 key 返回。
-        return dw::dup_submit_key(out_result, key) == 0 ? 0 : -1;
+    if (key && key->protocol == DW_PROTOCOL_LOCAL) {
+        return 0;
     }
-    const dw_protocol_t proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const dw_protocol_t proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     const std::string nk = dw::natural_key_of(key);
     const int32_t rc = d->task_manager->pause(proto, nk, out_result);
     if (rc != 0) {
@@ -387,11 +364,9 @@ DW_API int32_t dw_resume_task(const dw_task_key_t* key,
     }
     out_result->code    = DW_REASON_NONE;
     out_result->message = nullptr;
-    out_result->key.key_type = key ? key->key_type : DW_KEY_TYPE_HTTP;
-    out_result->key.natural_key = nullptr;
 
     // 协议仅在传递到引擎时才需要；resume 本身仅改内存态与触发重调度。
-    const dw_protocol_t proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const dw_protocol_t proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     const std::string nk = dw::natural_key_of(key);
     const int32_t rc = d->task_manager->resume(proto, nk, out_result);
     if (rc != 0) {
@@ -417,21 +392,19 @@ DW_API int32_t dw_delete_task(const dw_task_key_t* key,
     }
     out_result->code    = DW_REASON_NONE;
     out_result->message = nullptr;
-    out_result->key.key_type = key ? key->key_type : DW_KEY_TYPE_HTTP;
-    out_result->key.natural_key = nullptr;
 
     // LOCAL 任务（扫描发现的本地文件）走专门的删除路径，不走引擎 + 任务中枢。
-    if (key && key->key_type == DW_KEY_TYPE_LOCAL) {
+    if (key && key->protocol == DW_PROTOCOL_LOCAL) {
         const dw_protocol_t local_proto = DW_PROTOCOL_HTTP; // LOCAL 无引擎，proto 仅占位
         const int32_t rc = d->task_manager->delete_local_entry(local_proto, dw::natural_key_of(key));
         if (rc != 0) {
             out_result->code = DW_REASON_ERROR;
             return rc;
         }
-        return dw::dup_submit_key(out_result, key) == 0 ? 0 : -1;
+        return 0;
     }
 
-    const dw_protocol_t proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const dw_protocol_t proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     const std::string nk = dw::natural_key_of(key);
     const int32_t rc = d->task_manager->remove(proto, nk, delete_files, out_result);
     if (rc != 0) {
@@ -477,10 +450,10 @@ DW_API char* dw_info_hash_to_magnet(const dw_task_key_t* key) {
     }
     // 按任务键回读 info_hash（BT 的 natural_key 即 info_hash）。
     std::string info_hash;
-    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    const dw_protocol_t proto = key->protocol;
     if (!d->task_manager->engine_key_of(proto, dw::natural_key_of(key), info_hash)) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 key_type=%d natural_key=%s",
-                key->key_type, key->natural_key ? key->natural_key : "");
+                key->protocol, key->natural_key ? key->natural_key : "");
         return nullptr;
     }
     return dw::TorrentEngine::info_hash_to_magnet(info_hash.c_str());
@@ -521,7 +494,7 @@ DW_API int32_t dw_get_file_list(const dw_task_key_t* key,
     *out_count = 0;
 
     // 从 task_files 表读取（文件元数据已由 PARSED 事件入库，downloaded_bytes 由周期快照更新）。
-    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    const dw_protocol_t proto = key->protocol;
     const auto files = d->task_manager->load_files(proto, dw::natural_key_of(key));
     if (files.empty()) {
         return -1;
@@ -557,7 +530,7 @@ DW_API int32_t dw_get_file_ranges(const dw_task_key_t*  key,
     *out_ranges = nullptr;
     *out_count  = 0;
 
-    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    const dw_protocol_t proto = key->protocol;
     const std::string nk = dw::natural_key_of(key);
 
     // ---- 1. 优先读内存缓存（B 线程周期从引擎拉取更新） ----
@@ -628,7 +601,7 @@ DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
     *out_path = nullptr;
     *out_size = -1;
 
-    const dw_protocol_t proto = dw::protocol_of_key_type(key->key_type);
+    const dw_protocol_t proto = key->protocol;
     const std::string nk = dw::natural_key_of(key);
 
     // 持锁快照任务记录（save_path / filename / protocol / total_size）
@@ -637,10 +610,10 @@ DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
         std::lock_guard<std::mutex> lock(d->task_manager->get_mutex());
         if (!d->task_manager->get_store().load_by_natural_key(
                 d->task_manager->client_id(),
-                static_cast<dw::TaskKeyType>(key->key_type),
+                static_cast<dw_protocol_t>(key->protocol),
                 nk, rec)) {
             DW_LOGF(DW_LOG_ERROR, "", "失败: 任务不存在 key_type=%d natural_key=%s",
-                    key->key_type, key->natural_key ? key->natural_key : "");
+                    key->protocol, key->natural_key ? key->natural_key : "");
             return -1;
         }
     }
@@ -675,7 +648,7 @@ DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
 
     if (file_path.empty()) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 无法构建文件路径 key_type=%d natural_key=%s fi=%d",
-                key->key_type, key->natural_key ? key->natural_key : "", file_index);
+                key->protocol, key->natural_key ? key->natural_key : "", file_index);
         return -1;
     }
 
@@ -703,17 +676,15 @@ DW_API int32_t dw_set_playing_file(const dw_task_key_t*  key,
         return -1;
     }
     out_result->message = nullptr;
-    out_result->key.key_type = key ? key->key_type : DW_KEY_TYPE_HTTP;
-    out_result->key.natural_key = nullptr;
 
     // 仅写播放标识，由调度器统一处理任务准入与 piece deadline 设置。
-    const dw_protocol_t play_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const dw_protocol_t play_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     if (!d->task_manager->set_playing(play_proto, dw::natural_key_of(key), file_index, byte_offset)) {
         out_result->code = DW_REASON_ERROR;
         return -1;
     }
     out_result->code = DW_REASON_NONE;
-    return dw::dup_submit_key(out_result, key) == 0 ? 0 : -1;
+    return 0;
 }
 
 DW_API int32_t dw_set_play_position(const dw_task_key_t*  key,
@@ -729,13 +700,11 @@ DW_API int32_t dw_set_play_position(const dw_task_key_t*  key,
         return -1;
     }
     // 播放进度直落 task_store，与协议无关。
-    const dw_protocol_t pp_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const dw_protocol_t pp_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     d->task_manager->set_play_position(pp_proto, dw::natural_key_of(key), file_index, position_ms);
     out_result->code    = DW_REASON_NONE;
     out_result->message = nullptr;
-    out_result->key.key_type = key ? key->key_type : DW_KEY_TYPE_HTTP;
-    out_result->key.natural_key = nullptr;
-    return dw::dup_submit_key(out_result, key) == 0 ? 0 : -1;
+    return 0;
 }
 
 DW_API int32_t dw_get_play_position(const dw_task_key_t* key,
@@ -749,7 +718,7 @@ DW_API int32_t dw_get_play_position(const dw_task_key_t* key,
         if (out_position_ms) *out_position_ms = 0;
         return -1;
     }
-    const dw_protocol_t gp_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const dw_protocol_t gp_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     *out_position_ms = d->task_manager->get_play_position(gp_proto, dw::natural_key_of(key), file_index);
     return 0;
 }
@@ -781,7 +750,7 @@ DW_API int32_t dw_set_task_priority(const dw_task_key_t* key, int32_t priority) 
             d, d ? d->initialized.load() : 0, key);
         return -1;
     }
-    const dw_protocol_t sp_proto = dw::protocol_of_key_type(key ? key->key_type : DW_KEY_TYPE_HTTP);
+    const dw_protocol_t sp_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
     return d->task_manager->set_priority(sp_proto, dw::natural_key_of(key), priority);
 }
 
@@ -803,7 +772,7 @@ DW_API int32_t dw_load_task_files(const dw_task_key_t* key,
         return -1;
     }
     // 从 task_files 表按复合键关联加载（自然键入表外键）。
-    const dw_protocol_t lf_proto = dw::protocol_of_key_type(key->key_type);
+    const dw_protocol_t lf_proto = key->protocol;
     auto file_vec = d->task_manager->load_files(lf_proto, dw::natural_key_of(key));
     if (file_vec.empty()) {
         *out_files = nullptr;
@@ -878,7 +847,7 @@ DW_API int32_t dw_delete_local_entry(const dw_task_key_t* key) {
         DW_LOGF(DW_LOG_ERROR, "", "失败: 未初始化或参数非法");
         return -1;
     }
-    const dw_protocol_t dl_proto = dw::protocol_of_key_type(key->key_type);
+    const dw_protocol_t dl_proto = key->protocol;
     return d->task_manager->delete_local_entry(dl_proto, dw::natural_key_of(key));
 }
 
@@ -893,11 +862,6 @@ DW_API void dw_submit_result_release(dw_submit_result_t* result) {
     if (result->message) {
         std::free(result->message);
         result->message = nullptr;
-    }
-    if (result->key.natural_key) {
-        // natural_key 为 const char* 但为库内堆分配（malloc 出来），需要 const_cast 释放。
-        std::free(const_cast<char*>(result->key.natural_key));
-        result->key.natural_key = nullptr;
     }
 }
 

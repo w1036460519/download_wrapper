@@ -96,7 +96,7 @@ namespace dw {
         /* 取消所有任务 */
         {
             std::lock_guard<std::mutex> lk(he::g_map_mtx);
-            for (const auto &tCtx: he::g_tasks | std::views::values) {
+            for (const auto &[_, tCtx]: he::g_tasks) {
                 tCtx->cancel_req.store(1);
             }
         }
@@ -104,7 +104,7 @@ namespace dw {
         /* 等待所有任务线程退出 + 清理 */
         {
             std::lock_guard<std::mutex> lk(he::g_map_mtx);
-            for (const auto &tCtx: he::g_tasks | std::views::values) {
+            for (const auto &[_, tCtx]: he::g_tasks) {
                 if (tCtx->task_thread.joinable()) tCtx->task_thread.join();
             }
             he::g_tasks.clear();
@@ -375,7 +375,7 @@ namespace dw {
         // ctx 仍在 map（含删除中待 sweep 回收）即持有线程 / 分片文件句柄，未释放；
         // sweep 移出并析构后（文件全关）方可安全删除落盘文件。
         std::lock_guard<std::mutex> lk(he::g_map_mtx);
-        return !he::g_tasks.contains(id);
+        return he::g_tasks.find(id) == he::g_tasks.end();
     }
 
     std::vector<dw_byte_range_t> HttpEngine::get_file_ranges(const char *id, int32_t /*file_index*/) {
@@ -391,13 +391,13 @@ namespace dw {
             std::lock_guard<std::mutex> slk(tCtx->speed_mtx);
             for (const auto &part: tCtx->parts) {
                 if (part.done > 0) {
-                    ranges.push_back(dw_byte_range_t{.start = part.start, .end = part.start + part.done - 1});
+                    ranges.push_back({part.start, part.start + part.done - 1});
                 }
             }
         }
         if (ranges.size() <= 1) return ranges;
-        std::ranges::sort(ranges,
-                          [](const dw_byte_range_t &a, const dw_byte_range_t &b) { return a.start < b.start; });
+        std::sort(ranges.begin(), ranges.end(),
+                  [](const dw_byte_range_t &a, const dw_byte_range_t &b) { return a.start < b.start; });
         std::vector<dw_byte_range_t> merged;
         merged.push_back(ranges.front());
         for (size_t i = 1; i < ranges.size(); ++i) {

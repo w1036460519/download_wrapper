@@ -24,6 +24,7 @@
 #include <boost/url.hpp>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -65,27 +66,25 @@ static std::atomic<bool>         g_running{false};
 bool parse_range_header(const std::string& value,
                         int64_t& out_start, int64_t& out_end) {
     // 期望格式：bytes=<start>-<end> 或 bytes=<start>-
-    const std::string prefix = "bytes=";
-    if (value.substr(0, prefix.size()) != prefix) return false;
-    auto range_spec = value.substr(prefix.size());
+    constexpr std::string_view prefix = "bytes=";
+    if (value.find(prefix) != 0) return false;
+    std::string_view range_spec(value.data() + prefix.size(), value.size() - prefix.size());
     auto dash = range_spec.find('-');
-    if (dash == std::string::npos) return false;
+    if (dash == std::string_view::npos) return false;
 
-    try {
-        out_start = std::stoll(range_spec.substr(0, dash));
-    } catch (...) {
+    // 解析 start
+    auto start_sv = range_spec.substr(0, dash);
+    if (start_sv.empty()) return false;
+    if (std::from_chars(start_sv.data(), start_sv.data() + start_sv.size(), out_start).ec != std::errc{})
         return false;
-    }
 
-    auto end_spec = range_spec.substr(dash + 1);
-    if (end_spec.empty()) {
-        out_end = -1; // 开放区间，由 total_size 补齐
+    // 解析 end（开放区间由 total_size 补齐）
+    auto end_sv = range_spec.substr(dash + 1);
+    if (end_sv.empty()) {
+        out_end = -1;
     } else {
-        try {
-            out_end = std::stoll(end_spec);
-        } catch (...) {
+        if (std::from_chars(end_sv.data(), end_sv.data() + end_sv.size(), out_end).ec != std::errc{})
             return false;
-        }
     }
     return true;
 }
@@ -126,7 +125,7 @@ private:
     // key_type_ + natural_key_ 拆分存储：与 C ABI 一致，URL 参数原样透传。
     // type 取值 "http" / "bt"；natural_key 须 URL 编码。
     std::string natural_key_;
-    int     key_type_     = DW_KEY_TYPE_HTTP;
+    int     key_type_     = DW_PROTOCOL_HTTP;
     int     file_index_   = 0;
     int64_t range_start_  = 0;
     int64_t range_end_    = 0;   // 含（闭合区间）；-1 在 handle_request 中已补齐
@@ -170,17 +169,27 @@ private:
         }
         try {
             const std::string type_str((*type_it).value);
-            if (type_str == "http") key_type_ = DW_KEY_TYPE_HTTP;
-            else if (type_str == "bt") key_type_ = DW_KEY_TYPE_BT;
+            if (type_str == "http") key_type_ = DW_PROTOCOL_HTTP;
+            else if (type_str == "bt") key_type_ = DW_PROTOCOL_TORRENT;
             else {
                 send_error(http::status::bad_request, "Invalid type parameter");
                 return;
             }
             natural_key_ = std::string((*key_it).value);
-            file_index_  = std::stoi(std::string((*file_it).value));
         } catch (...) {
             send_error(http::status::bad_request, "Invalid type/key/file parameter");
             return;
+        }
+        // file 参数用 from_chars 解析，零分配且无异常
+        {
+            const std::string file_str((*file_it).value);
+            int val = 0;
+            auto [ptr, ec] = std::from_chars(file_str.data(), file_str.data() + file_str.size(), val);
+            if (ec != std::errc{} || ptr != file_str.data() + file_str.size()) {
+                send_error(http::status::bad_request, "Invalid type/key/file parameter");
+                return;
+            }
+            file_index_ = val;
         }
 
         // ---- 解析 Range 头 ----
@@ -197,7 +206,7 @@ private:
 
         // ---- 获取文件路径与总大小 ----
         const dw_task_key_t task_key{
-            static_cast<dw_key_type_t>(key_type_), natural_key_.c_str()};
+            static_cast<dw_protocol_t>(key_type_), natural_key_.c_str()};
         char*    raw_path = nullptr;
         int64_t  file_size = -1;
         if (dw_get_task_file_info(&task_key,
@@ -253,7 +262,7 @@ private:
 
         // ---- 查询已下载分段（优先缓存，按状态区分） ----
         const dw_task_key_t task_key{
-            static_cast<dw_key_type_t>(key_type_), natural_key_.c_str()};
+            static_cast<dw_protocol_t>(key_type_), natural_key_.c_str()};
         dw_byte_range_t* ranges     = nullptr;
         int32_t          range_count = 0;
         const int32_t rc = dw_get_file_ranges(&task_key,
@@ -558,7 +567,7 @@ const char* dw_proxy_get_url(const dw_task_key_t* key, int file_index) {
     }
     static thread_local std::string url;
     const char *type_str =
-        key->key_type == DW_KEY_TYPE_BT ? "bt" : "http";
+        key->protocol == DW_PROTOCOL_TORRENT ? "bt" : "http";
     url = "http://127.0.0.1:" + std::to_string(dw::playback::g_port) +
           "/file?type=" + type_str +
           "&key=" + key->natural_key +

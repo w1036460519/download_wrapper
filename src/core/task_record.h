@@ -17,58 +17,47 @@
 
 namespace dw {
 
-/**
- * 任务键类型：决定 natural_key 的语义。同步用作 SQLite 库内 key_type 列。
- */
-enum class TaskKeyType : int32_t {
-    HTTP  = 0,  // natural_key = url
-    BT    = 1,  // natural_key = info_hash
-    LOCAL = 2,  // natural_key = content_root（本地文件任务；filepath 不变只删不挪）
-};
-
-inline const char* to_string(TaskKeyType t) {
-    switch (t) {
-    case TaskKeyType::HTTP:  return "HTTP";
-    case TaskKeyType::BT:    return "BT";
-    case TaskKeyType::LOCAL: return "LOCAL";
-    default: return "UNKNOWN";
+/// dw_protocol_t 可读名（供 open_id / 日志使用）。
+inline const char* to_string(dw_protocol_t p) {
+    switch (p) {
+    case DW_PROTOCOL_HTTP:    return "HTTP";
+    case DW_PROTOCOL_TORRENT: return "BT";
+    case DW_PROTOCOL_LOCAL:   return "LOCAL";
+    default:                  return "UNKNOWN";
     }
 }
 
 /**
  * 任务记录：注册表内存态 = 来源参数（恢复/晋升重建用）+ 最新快照 + 队列元数据。
  *
- * 主键为 (client_id, key_type) + 按类型散布到 url/info_hash/content_root 的原始标识。
+ * 主键为 (client_id, protocol) + 按协议散布到 url/info_hash/content_root 的原始标识。
  * open_id() 按 "type|raw_key" 格式派生，同时为 tasks_ map 键。
  */
 struct TaskRecord {
-    // 主键（DB PK = client_id + key_type + natural_key 列；内存无冗余字段）
+    // 主键（DB PK = client_id + key_type 列 + natural_key 列；内存无冗余字段）
     std::string   client_id;    // App 启动时注入（UUIDv4）；本机任务恒 = TaskManager::client_id_
-    TaskKeyType   key_type   = TaskKeyType::HTTP; // 决定原始标识落哪个字段
-
-    // 协议标识（冗余 key_type 但便于 switch；HTTP/BT 由 key_type 决定）
-    dw_protocol_t protocol = DW_PROTOCOL_HTTP;
+    dw_protocol_t protocol = DW_PROTOCOL_HTTP; // 同时决定 DB key_type 列值与原始标识落哪个字段
 
     // ---- 任务标识访问器 ----
-    // 原始标识：按 key_type 取 url / info_hash / content_root（不额外存储，避免冗余）。
+    // 原始标识：按 protocol 取 url / info_hash / content_root（不额外存储，避免冗余）。
     const std::string& raw_key() const noexcept {
-        switch (key_type) {
-        case TaskKeyType::BT:    return info_hash;
-        case TaskKeyType::LOCAL: return content_root;
-        default:                 return url;
+        switch (protocol) {
+        case DW_PROTOCOL_TORRENT: return info_hash;
+        case DW_PROTOCOL_LOCAL:   return content_root;
+        default:                  return url;
         }
     }
     std::string& raw_key() noexcept {
-        switch (key_type) {
-        case TaskKeyType::BT:    return info_hash;
-        case TaskKeyType::LOCAL: return content_root;
-        default:                 return url;
+        switch (protocol) {
+        case DW_PROTOCOL_TORRENT: return info_hash;
+        case DW_PROTOCOL_LOCAL:   return content_root;
+        default:                  return url;
         }
     }
     // OpenID：本机唯一，格式 "type|raw_key"（如 "HTTP|https://..."、"BT|abc123"）。
     // 同时为 tasks_ map 键。
     std::string open_id() const {
-        return std::string(to_string(key_type)) + '|' + raw_key();
+        return std::string(to_string(protocol)) + '|' + raw_key();
     }
     // UnionID：跨客户端全局唯一，格式 "client_id|type|raw_key"。
     std::string union_id() const {

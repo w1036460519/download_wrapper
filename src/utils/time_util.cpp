@@ -4,8 +4,10 @@
  */
 #include "utils/time_util.h"
 
+#include <boost/date_time/posix_time/posix_time.hpp>
 #include <chrono>
-#include <ctime>
+#include <iomanip>
+#include <sstream>
 
 namespace dw::utils {
     int64_t now_unix_ms() {
@@ -14,17 +16,13 @@ namespace dw::utils {
                 .count();
     }
 
-    std::string format_unix_ms(int64_t ms) {
-        const std::time_t sec = static_cast<std::time_t>(ms / 1000);
-        std::tm tm_buf{};
-        // localtime_r 为 POSIX 专有；MSVC 用参数顺序一致的 localtime_s
-#if defined(_WIN32)
-        localtime_s(&tm_buf, &sec);
-#else
-        localtime_r(&sec, &tm_buf);
-#endif
-        char buf[24];
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
-        return std::string(buf);
+    std::string format_unix_ms(const int64_t ms) {
+        using namespace boost::posix_time;
+        const ptime pt(from_time_t(0) + milliseconds(ms));
+        std::ostringstream oss;
+        auto *facet = new time_facet("%Y-%m-%d %H:%M:%S");
+        oss.imbue(std::locale(oss.getloc(), facet));
+        oss << pt << '.' << std::setfill('0') << std::setw(3) << (ms % 1000);
+        return oss.str();
     }
 } // namespace dw::utils

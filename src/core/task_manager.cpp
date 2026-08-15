@@ -9,7 +9,7 @@
  *   - 引擎启动 / 合成回调一律在释放 mtx_ 后执行，规避回调线程重入。
  *
  * 任务主键模型：
- *   - 唯一键 = (client_id, key_type, natural_key) 三元组（client_id 来自 dw_config_t，启动时注入）；
+ *   - 唯一键 = (client_id, protocol, natural_key) 三元组（client_id 来自 dw_config_t，启动时注入）；
  *   - tasks_ 以 natural_key 为 key（仅本机任务，client_id 冗余），API 入口校验隔离非本机请求；
  *   - 引擎回调经 engine_key（= natural_key）直接 O(1) 查表。
  */
@@ -36,11 +36,6 @@ namespace dw {
     using utils::now_unix_ms;
 
     namespace {
-        /// 由协议枚举推导 TaskKeyType。
-        TaskKeyType protocol_to_key_type(const dw_protocol_t proto) {
-            return proto == DW_PROTOCOL_HTTP ? TaskKeyType::HTTP : TaskKeyType::BT;
-        }
-
         /// 由 TaskRecord 推 engine_key：HTTP 取 url，BT 取 info_hash。
         const std::string &engine_key(const TaskRecord &task_record) {
             return task_record.protocol == DW_PROTOCOL_HTTP ? task_record.url : task_record.info_hash;
@@ -120,7 +115,7 @@ namespace dw {
         }
 
         // 活跃任务修改为队列中
-        for (auto &task_record: tasks_ | std::views::values) {
+        for (auto &[_, task_record]: tasks_) {
             if (task_record.status == DW_TASK_STATUS_DOWNLOADING ||
                 task_record.status == DW_TASK_STATUS_RESOLVING) {
                 task_record.status = DW_TASK_STATUS_QUEUED;
@@ -187,20 +182,17 @@ namespace dw {
         // resume_task 双行为：handle 不存在时用 magnet/torrent/info_hash/resume_data 创建；
         // handle 已存在时直接恢复下载。同 key 重复添加 / 库中已存在任务快路仅改状态为 QUEUED。
 
-        std::string out_nk;
         {
             std::unique_lock<std::mutex> lock(mtx_);
             const std::string key = raw_key;
 
-            if (const auto it = tasks_.find(open_id_of(proto, key)); it != tasks_.end()) {
+            if (const auto it = tasks_.find(union_id_of(proto, key)); it != tasks_.end()) {
                 it->second.created_at = now_unix_ms();
                 it->second.synth_notified = false;
                 store_.update(it->second);
-                out_nk = key;
             } else if (TaskRecord task_record;
-                store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), key, task_record)) {
+                store_.load_by_natural_key(client_id_, proto, key, task_record)) {
                 // 历史任务：仅刷新 created_at 用于排序置顶，其余状态保持不变。
-                out_nk = task_record.open_id();
                 task_record.created_at = now_unix_ms();
                 task_record.synth_notified = false;
                 store_.update(task_record);
@@ -208,7 +200,7 @@ namespace dw {
             } else {
                 // 全新任务：构造复合主键三元组（client_id_ 来自 session 配置）
                 task_record.client_id = client_id_;
-                task_record.key_type = protocol_to_key_type(proto);
+                task_record.protocol = proto;
                 task_record.raw_key() = key;
                 task_record.protocol = proto;
                 if (proto == DW_PROTOCOL_TORRENT) task_record.info_hash = key;
@@ -235,7 +227,6 @@ namespace dw {
                 task_record.status = DW_TASK_STATUS_QUEUED;
                 task_record.synth_notified = false;
                 store_.insert(task_record);
-                out_nk = key;
                 register_task(std::move(task_record));
                 schedule_needed_ = true;
             }
@@ -244,8 +235,6 @@ namespace dw {
 
         out->code = DW_REASON_NONE;
         out->message = nullptr;
-        out->key.key_type = proto == DW_PROTOCOL_HTTP ? DW_KEY_TYPE_HTTP : DW_KEY_TYPE_BT;
-        out->key.natural_key = dup_cstr(out_nk);
         return 0;
     }
 
@@ -256,7 +245,7 @@ namespace dw {
         {
             std::lock_guard<std::mutex> lock(mtx_);
             // 仅活跃/排队任务（常驻内存）可暂停；暂停/终态任务视为无效操作。
-            const auto it = tasks_.find(open_id_of(proto, natural_key));
+            const auto it = tasks_.find(union_id_of(proto, natural_key));
             if (it == tasks_.end()) {
                 out->code = DW_REASON_ERROR;
                 out->message = nullptr;
@@ -284,8 +273,6 @@ namespace dw {
 
         out->code = DW_REASON_NONE;
         out->message = nullptr;
-        out->key.key_type = static_cast<dw_key_type_t>(protocol_to_key_type(proto));
-        out->key.natural_key = dup_cstr(natural_key);
         return 0;
     }
 
@@ -301,7 +288,7 @@ namespace dw {
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            if (auto it = tasks_.find(open_id_of(proto, natural_key)); it != tasks_.end()) {
+            if (auto it = tasks_.find(union_id_of(proto, natural_key)); it != tasks_.end()) {
                 // 分支 A/B：内存中已有记录，统一置 QUEUED。
                 TaskRecord &rec = it->second;
                 rec.status = DW_TASK_STATUS_QUEUED;
@@ -311,7 +298,7 @@ namespace dw {
             } else {
                 // 分支 C：从库加载。任务不在内存中，按复合键回读全字段。
                 TaskRecord task_record;
-                if (!store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, task_record)) {
+                if (!store_.load_by_natural_key(client_id_, proto, natural_key, task_record)) {
                     out->code = DW_REASON_ERROR;
                     out->message = nullptr;
                     return -1;
@@ -333,8 +320,6 @@ namespace dw {
 
         out->code = DW_REASON_NONE;
         out->message = nullptr;
-        out->key.key_type = static_cast<dw_key_type_t>(protocol_to_key_type(proto));
-        out->key.natural_key = dup_cstr(natural_key);
         return 0;
     }
 
@@ -344,7 +329,7 @@ namespace dw {
         std::string engine_k;
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            if (const auto it = tasks_.find(open_id_of(proto, natural_key)); it != tasks_.end()) {
+            if (const auto it = tasks_.find(union_id_of(proto, natural_key)); it != tasks_.end()) {
                 engine_k = engine_key(it->second);
                 // 标记删除中，等 DELETED 事件回收。
                 it->second.status = DW_TASK_STATUS_DELETING;
@@ -353,7 +338,7 @@ namespace dw {
             } else {
                 // 任务不在内存，尝试从 DB 加载。
                 TaskRecord task_record;
-                if (!store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, task_record)) {
+                if (!store_.load_by_natural_key(client_id_, proto, natural_key, task_record)) {
                     out->code = DW_REASON_ERROR;
                     out->message = nullptr;
                     return -1;
@@ -363,7 +348,7 @@ namespace dw {
                 task_record.status = DW_TASK_STATUS_DELETING;
                 task_record.dirty = true;
                 store_.update(task_record);
-                tasks_[open_id_of(proto, natural_key)] = std::move(task_record);
+                tasks_[union_id_of(proto, natural_key)] = std::move(task_record);
             }
         }
 
@@ -382,21 +367,19 @@ namespace dw {
 
         out->code = DW_REASON_NONE;
         out->message = nullptr;
-        out->key.key_type = static_cast<dw_key_type_t>(protocol_to_key_type(proto));
-        out->key.natural_key = dup_cstr(natural_key);
         return 0;
     }
 
     int32_t TaskManager::set_priority(dw_protocol_t proto, const std::string &natural_key, const int32_t priority) {
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            if (const auto it = tasks_.find(open_id_of(proto, natural_key));
+            if (const auto it = tasks_.find(union_id_of(proto, natural_key));
                 it != tasks_.end()) {
                 it->second.priority = priority;
                 store_.update(it->second);
             } else {
                 TaskRecord task_record;
-                if (!store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, task_record)) return -1;
+                if (!store_.load_by_natural_key(client_id_, proto, natural_key, task_record)) return -1;
                 task_record.priority = priority;
                 store_.update(task_record);
             }
@@ -408,25 +391,25 @@ namespace dw {
 
     bool TaskManager::engine_key_of(dw_protocol_t proto, const std::string &natural_key, std::string &out_key) {
         std::lock_guard<std::mutex> lock(mtx_);
-        if (const auto it = tasks_.find(open_id_of(proto, natural_key)); it != tasks_.end()) {
+        if (const auto it = tasks_.find(union_id_of(proto, natural_key)); it != tasks_.end()) {
             out_key = engine_key(it->second);
             return true;
         }
         TaskRecord task_record;
-        if (!store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, task_record)) return false;
+        if (!store_.load_by_natural_key(client_id_, proto, natural_key, task_record)) return false;
         out_key = engine_key(task_record);
         return true;
     }
 
     bool TaskManager::engine_ref_of(dw_protocol_t proto, const std::string &natural_key, std::string &out_key, dw_protocol_t &out_proto) {
         std::lock_guard<std::mutex> lock(mtx_);
-        if (const auto it = tasks_.find(open_id_of(proto, natural_key)); it != tasks_.end()) {
+        if (const auto it = tasks_.find(union_id_of(proto, natural_key)); it != tasks_.end()) {
             out_key = engine_key(it->second);
             out_proto = it->second.protocol;
             return true;
         }
         TaskRecord task_record;
-        if (!store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, task_record)) return false;
+        if (!store_.load_by_natural_key(client_id_, proto, natural_key, task_record)) return false;
         out_key = engine_key(task_record);
         out_proto = task_record.protocol;
         return true;
@@ -434,17 +417,17 @@ namespace dw {
 
     void TaskManager::set_play_position(dw_protocol_t proto, const std::string &natural_key, const int32_t file_index, const int64_t position_ms) {
         std::lock_guard<std::mutex> lock(mtx_);
-        store_.set_play_position(client_id_, protocol_to_key_type(proto), natural_key, file_index, position_ms);
+        store_.set_play_position(client_id_, proto, natural_key, file_index, position_ms);
     }
 
     int64_t TaskManager::get_play_position(dw_protocol_t proto, const std::string &natural_key, const int32_t file_index) {
         std::lock_guard<std::mutex> lock(mtx_);
-        return store_.get_play_position(client_id_, protocol_to_key_type(proto), natural_key, file_index);
+        return store_.get_play_position(client_id_, proto, natural_key, file_index);
     }
 
     std::vector<dw_byte_range_t> TaskManager::load_segments(dw_protocol_t proto, const std::string &natural_key, const int32_t file_index) {
         std::lock_guard<std::mutex> lock(mtx_);
-        return store_.load_segments(client_id_, protocol_to_key_type(proto), natural_key, file_index);
+        return store_.load_segments(client_id_, proto, natural_key, file_index);
     }
 
     /* ================================================================== */
@@ -456,7 +439,7 @@ namespace dw {
         if (!engine_key || !data || size == 0) return "";
         std::lock_guard<std::mutex> lock(mtx_);
         const std::string ek = engine_key;
-        if (const auto it = tasks_.find(open_id_of(proto, ek)); it != tasks_.end()) {
+        if (const auto it = tasks_.find(union_id_of(proto, ek)); it != tasks_.end()) {
             // 常规路径：任务在内存中，暂存 pending_resume，由 B 线程 flush_dirty_locked 落库。
             it->second.pending_resume.assign(reinterpret_cast<const char *>(data), size);
             return it->second.open_id();
@@ -464,9 +447,9 @@ namespace dw {
         // 兜底路径：任务已从内存逐出（如完成移出后 resume 晚到）。不重新加载入内存，
         // 查库确认记录仍存在则直接落库；库中也不存在（已删除）则丢弃不处理。
         TaskRecord task_record;
-        const bool found = store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), ek, task_record);
+        const bool found = store_.load_by_natural_key(client_id_, proto, ek, task_record);
         if (!found) return {};
-        store_.save_resume(task_record.client_id, task_record.key_type, task_record.raw_key(), data, size);
+        store_.save_resume(task_record.client_id, task_record.protocol, task_record.raw_key(), data, size);
         return task_record.open_id();
     }
 
@@ -477,17 +460,17 @@ namespace dw {
         const std::string ek = engine_key;
         // 内存命中即直接落库；未命中则回落 DB 确认记录后落库。
         std::string nk;
-        if (const auto it = tasks_.find(open_id_of(proto, ek)); it != tasks_.end()) {
+        if (const auto it = tasks_.find(union_id_of(proto, ek)); it != tasks_.end()) {
             nk = it->second.open_id();
         } else {
             TaskRecord task_record;
-            const bool found = store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), ek, task_record);
+            const bool found = store_.load_by_natural_key(client_id_, proto, ek, task_record);
             if (found) nk = task_record.open_id();
         }
         if (nk.empty()) return; // 非已知任务，丢弃
         // 浅拷贝为 vector（仅拷贝指针，字符串所有权仍属调用方），库内自行深拷落库。
         const std::vector<dw_file_info_t> file_vec(files, files + count);
-        store_.save_task_files(client_id_, protocol_to_key_type(proto), nk, file_vec);
+        store_.save_task_files(client_id_, proto, nk, file_vec);
     }
 
     void TaskManager::on_task_file_update(const char *engine_key, const dw_protocol_t proto,
@@ -496,15 +479,15 @@ namespace dw {
         std::lock_guard<std::mutex> lock(mtx_);
         const std::string ek = engine_key;
         std::string nk;
-        if (const auto it = tasks_.find(open_id_of(proto, ek)); it != tasks_.end()) {
+        if (const auto it = tasks_.find(union_id_of(proto, ek)); it != tasks_.end()) {
             nk = it->second.open_id();
         } else {
             TaskRecord task_record;
-            const bool found = store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), ek, task_record);
+            const bool found = store_.load_by_natural_key(client_id_, proto, ek, task_record);
             if (found) nk = task_record.open_id();
         }
         if (nk.empty()) return; // 非已知任务，丢弃
-        store_.upsert_task_file(client_id_, protocol_to_key_type(proto), nk, file_index, downloaded_bytes, total_size);
+        store_.upsert_task_file(client_id_, proto, nk, file_index, downloaded_bytes, total_size);
     }
 
     /* ================================================================== */
@@ -546,7 +529,7 @@ namespace dw {
                 std::lock_guard<std::mutex> lock(mtx_);
 
                 // 查找任务（engine_key = natural_key，直接查表）。
-                const auto it = tasks_.find(open_id_of(event.protocol, key));
+                const auto it = tasks_.find(union_id_of(event.protocol, key));
                 if (it == tasks_.end()) {
                     DW_LOGF(DW_LOG_ERROR, "", "PARSED 但任务不在内存 key=%s", key.c_str());
                     return;
@@ -561,7 +544,7 @@ namespace dw {
                 // ---- 快路：content_root 已设定（storage_moved_alert 触发的重复 PARSED）----
                 if (!rec.content_root.empty()) {
                     if (!event.files.empty()) {
-                        store_.save_task_files(rec.client_id, rec.key_type, rec.raw_key(), event.files);
+                        store_.save_task_files(rec.client_id, rec.protocol, rec.raw_key(), event.files);
                     }
                     if (rec.status == DW_TASK_STATUS_RESOLVING) {
                         rec.status = DW_TASK_STATUS_PARSED;
@@ -648,7 +631,7 @@ namespace dw {
                         (void) utils::acquire_wrapper_name(event.save_path, base_name, nullptr);
                     }
                     if (!event.files.empty()) {
-                        store_.save_task_files(rec.client_id, rec.key_type, rec.raw_key(), event.files);
+                        store_.save_task_files(rec.client_id, rec.protocol, rec.raw_key(), event.files);
                     }
                     // 状态守卫：仅 RESOLVING → PARSED。
                     if (rec.status == DW_TASK_STATUS_RESOLVING) {
@@ -676,7 +659,7 @@ namespace dw {
             case EngineEventType::DOWNLOAD_FAILED: {
                 // 下载失败（通用）：转 ERROR。
                 std::lock_guard<std::mutex> lock(mtx_);
-                const auto it = tasks_.find(open_id_of(event.protocol, key));
+                const auto it = tasks_.find(union_id_of(event.protocol, key));
                 if (it == tasks_.end()) {
                     DW_LOGF(DW_LOG_ERROR, "", "DOWNLOAD_FAILED 但任务不在内存 key=%s", key.c_str());
                     return;
@@ -693,7 +676,7 @@ namespace dw {
             case EngineEventType::DOWNLOAD_COMPLETED: {
                 // 下载完成：迁 COMPLETED 状态。
                 std::lock_guard<std::mutex> lock(mtx_);
-                const auto it = tasks_.find(open_id_of(event.protocol, key));
+                const auto it = tasks_.find(union_id_of(event.protocol, key));
                 if (it == tasks_.end()) {
                     DW_LOGF(DW_LOG_ERROR, "", "DOWNLOAD_COMPLETED 但任务不在内存 key=%s", key.c_str());
                     return;
@@ -709,7 +692,7 @@ namespace dw {
                 // 终态判断由 progress>=1.0（BT 完成）或 DOWNLOAD_FAILED 事件提供；PAUSED/RESUMED
                 // 由独立 BT_PAUSED/BT_RESUMED 事件负责迁移。
                 std::lock_guard<std::mutex> lock(mtx_);
-                const auto it = tasks_.find(open_id_of(event.protocol, key));
+                const auto it = tasks_.find(union_id_of(event.protocol, key));
                 if (it == tasks_.end()) {
                     DW_LOGF(DW_LOG_DEBUG, "", "STATUS_UPDATE 任务不在内存 key=%s", key.c_str());
                     return;
@@ -765,7 +748,7 @@ namespace dw {
                     return;
                 }
                 std::lock_guard<std::mutex> lock(mtx_);
-                if (const auto it = tasks_.find(open_id_of(event.protocol, key)); it != tasks_.end()) {
+                if (const auto it = tasks_.find(union_id_of(event.protocol, key)); it != tasks_.end()) {
                     // 常规路径：任务在内存中，暂存 pending_resume
                     it->second.pending_resume.assign(
                         reinterpret_cast<const char *>(event.resume_data.data()),
@@ -774,9 +757,9 @@ namespace dw {
                 }
                 // 兜底路径：任务已从内存逐出（如完成移出后 resume 晚到），直接落库
                 TaskRecord task_record;
-                const bool found = store_.load_by_natural_key(client_id_, protocol_to_key_type(event.protocol), key, task_record);
+                const bool found = store_.load_by_natural_key(client_id_, event.protocol, key, task_record);
                 if (found) {
-                    store_.save_resume(task_record.client_id, task_record.key_type, task_record.raw_key(), event.resume_data.data(),
+                    store_.save_resume(task_record.client_id, task_record.protocol, task_record.raw_key(), event.resume_data.data(),
                                        event.resume_data.size());
                 }
                 break;
@@ -784,7 +767,7 @@ namespace dw {
             case EngineEventType::BT_PAUSED: {
                 // BT 暂停生效：状态机迁 PAUSED。状态守卫仅允许活跃态迁入，避免重复帧覆盖。
                 std::lock_guard<std::mutex> lock(mtx_);
-                if (const auto it = tasks_.find(open_id_of(event.protocol, key)); it != tasks_.end()) {
+                if (const auto it = tasks_.find(union_id_of(event.protocol, key)); it != tasks_.end()) {
                     TaskRecord &rec = it->second;
                     if (rec.status == DW_TASK_STATUS_DOWNLOADING ||
                         rec.status == DW_TASK_STATUS_QUEUED ||
@@ -803,7 +786,7 @@ namespace dw {
                 // BT 恢复生效：状态机迁 QUEUED 等待 run_schedule 准入，任务进入正常调度路径。
                 // PAUSED 迁 QUEUED 为常规路径；如任务已被外部制以 COMPLETED/ERROR 则不覆盖。
                 std::lock_guard<std::mutex> lock(mtx_);
-                if (const auto it = tasks_.find(open_id_of(event.protocol, key)); it != tasks_.end()) {
+                if (const auto it = tasks_.find(union_id_of(event.protocol, key)); it != tasks_.end()) {
                     TaskRecord &rec = it->second;
                     if (rec.status == DW_TASK_STATUS_PAUSED) {
                         rec.status = DW_TASK_STATUS_QUEUED;
@@ -819,7 +802,7 @@ namespace dw {
             case EngineEventType::DELETED: {
                 // 任务已从引擎移除：回收资源 + 清理数据 + 按标识删包层目录。
                 std::lock_guard<std::mutex> lock(mtx_);
-                const auto it = tasks_.find(open_id_of(event.protocol, key));
+                const auto it = tasks_.find(union_id_of(event.protocol, key));
                 if (it == tasks_.end()) {
                     DW_LOGF(DW_LOG_ERROR, "", "DELETED 但任务不在内存 key=%s", key.c_str());
                     return;
@@ -828,8 +811,8 @@ namespace dw {
                 const std::string save_path = it->second.save_path;
                 const std::string content_root = it->second.content_root;
                 // 回收内存资源 + 清理 DB。
-                unregister_task(it->second.open_id());
-                store_.remove(it->second.client_id, it->second.key_type, it->second.raw_key());
+                unregister_task(it->second.union_id());
+                store_.remove(it->second.client_id, it->second.protocol, it->second.raw_key());
                 DW_LOGF(DW_LOG_INFO, "", "任务已删除回收完成 key=%s", key.c_str());
                 // 按 delete_files 标识决定是否删包层目录（save_path/content_root）：
                 // 有些任务路径是包了一层的，引擎 remove_torrent 已删内部文件，
@@ -866,12 +849,12 @@ namespace dw {
                                                      const std::string &inner_name, const bool multi_file) {
         if (!engine_key || !engine_key[0] || wrapper_name.empty()) return wrapper_name;
         std::lock_guard<std::mutex> lock(mtx_);
-        if (const auto it = tasks_.find(open_id_of(proto, engine_key)); it != tasks_.end()) {
+        if (const auto it = tasks_.find(union_id_of(proto, engine_key)); it != tasks_.end()) {
             return resolve_and_record_name_locked(it->second, dir, wrapper_name, inner_name, multi_file);
         }
         // 任务未常驻内存（罕见：上调早于登记 / 已被逐出）：回落库定位记录后仍走定名落库。
         TaskRecord task_record;
-        const bool found = store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), engine_key, task_record);
+        const bool found = store_.load_by_natural_key(client_id_, proto, engine_key, task_record);
         if (found) {
             return resolve_and_record_name_locked(task_record, dir, wrapper_name, inner_name, multi_file);
         }
@@ -910,7 +893,7 @@ namespace dw {
         if (unique != wrapper_name) {
             DW_LOGF(DW_LOG_INFO, "", "wrapper 去重定名: '%s' -> '%s/' (dir=%s key=%s)",
                     wrapper_name.c_str(), unique.c_str(), dir.c_str(),
-                    rec.open_id().c_str());
+                    rec.union_id().c_str());
         }
         return unique;
     }
@@ -948,8 +931,8 @@ namespace dw {
         for (int32_t i = 0; i < n; ++i) {
             const TaskRecord &task_record = all[i];
             dw_task_snapshot_t s{};
-            s.key.key_type = static_cast<dw_key_type_t>(task_record.key_type);
-            s.key.natural_key = dup_cstr(task_record.open_id());
+            s.key.protocol = task_record.protocol;
+            s.key.natural_key = dup_cstr(task_record.union_id());
             s.url = dup_cstr(task_record.url);
             s.info_hash = dup_cstr(task_record.info_hash);
             s.protocol = task_record.protocol;
@@ -1018,7 +1001,7 @@ namespace dw {
                     if (!torrent_) {
                         // 引擎不可用：迁 ERROR 释放名额。
                         std::lock_guard<std::mutex> lock(mtx_);
-                        if (auto it2 = tasks_.find(act.rec.open_id()); it2 != tasks_.end()) {
+                        if (auto it2 = tasks_.find(act.rec.union_id()); it2 != tasks_.end()) {
                             it2->second.status = DW_TASK_STATUS_ERROR;
                             it2->second.reason = DW_REASON_ERROR;
                             it2->second.message = "下载引擎不可用";
@@ -1036,14 +1019,14 @@ namespace dw {
                                          act.rec.file_indexes.empty() ? nullptr : act.rec.file_indexes.data(),
                                          static_cast<int32_t>(act.rec.file_indexes.size())) == 0);
                     std::lock_guard<std::mutex> lock(mtx_);
-                    if (const auto it = tasks_.find(act.rec.open_id());
+                    if (const auto it = tasks_.find(act.rec.union_id());
                         it != tasks_.end() && it->second.status == DW_TASK_STATUS_PARSED) {
                         if (ok) {
                             it->second.status = DW_TASK_STATUS_DOWNLOADING;
                             it->second.dirty = true;
                             status_changed = true;
                             DW_LOGF(DW_LOG_INFO, "", "任务解析完成转下载 key=%s",
-                                    act.rec.open_id().c_str());
+                                    act.rec.union_id().c_str());
                         } else {
                             it->second.status = DW_TASK_STATUS_ERROR;
                             it->second.reason = DW_REASON_ERROR;
@@ -1053,20 +1036,20 @@ namespace dw {
                             slot_released = true;
                             status_changed = true;
                             DW_LOGF(DW_LOG_ERROR, "", "apply_file_selection 失败 key=%s",
-                                    act.rec.open_id().c_str());
+                                    act.rec.union_id().c_str());
                         }
                     }
                 } else {
                     const bool ok = call_resume_task(act.rec, act.resume);
                     std::lock_guard<std::mutex> lock(mtx_);
-                    if (const auto it = tasks_.find(act.rec.open_id());
+                    if (const auto it = tasks_.find(act.rec.union_id());
                         it != tasks_.end() && it->second.status == DW_TASK_STATUS_RESOLVING) {
                         if (ok) {
                             it->second.status = DW_TASK_STATUS_DOWNLOADING;
                             it->second.dirty = true;
                             status_changed = true;
                             DW_LOGF(DW_LOG_INFO, "", "任务校验通过转下载 key=%s",
-                                    act.rec.open_id().c_str());
+                                    act.rec.union_id().c_str());
                         } else {
                             it->second.status = DW_TASK_STATUS_ERROR;
                             store_.update(it->second);
@@ -1074,7 +1057,7 @@ namespace dw {
                             slot_released = true;
                             status_changed = true;
                             DW_LOGF(DW_LOG_ERROR, "", "任务引擎启动失败 key=%s",
-                                    act.rec.open_id().c_str());
+                                    act.rec.union_id().c_str());
                         }
                     }
                 }
@@ -1095,7 +1078,7 @@ namespace dw {
 
     void TaskManager::collect_progress_locked(std::vector<TaskRecord> &fwd_records,
                                               std::vector<ResolveAction> &resolve_actions) {
-        for (auto &task_record: tasks_ | std::views::values) {
+        for (auto &[_, task_record]: tasks_) {
             // 引擎无 ctx 的合成态（QUEUED/PAUSED）：直接从记录投影合成一帧，一次性去重；
             // 回调唯一出口收归 A 线程，pause()/run_schedule（B 线程）仅置态，不再直接发射。
             if ((task_record.status == DW_TASK_STATUS_QUEUED ||
@@ -1115,7 +1098,7 @@ namespace dw {
             if (task_record.status == DW_TASK_STATUS_RESOLVING &&
                 task_record.protocol == DW_PROTOCOL_HTTP) {
                 resolve_actions.push_back({
-                    task_record, store_.load_resume(task_record.client_id, task_record.key_type, task_record.raw_key())
+                    task_record, store_.load_resume(task_record.client_id, task_record.protocol, task_record.raw_key())
                 });
                 continue;
             }
@@ -1180,7 +1163,7 @@ namespace dw {
 
     void TaskManager::maintenance_persist_locked() {
         std::vector<std::string> to_remove;
-        for (auto &[open_id, task_record]: tasks_) {
+        for (auto &[union_id, task_record]: tasks_) {
             const bool paused = (task_record.status == DW_TASK_STATUS_PAUSED);
             // 初判终态（含引擎驱动的 pending_engine_status 信号）
             const bool terminal = (task_record.status == DW_TASK_STATUS_COMPLETED ||
@@ -1199,22 +1182,22 @@ namespace dw {
                 // 任务级 0→2 传播：完成态任务把其文件节点统一置为完成正常。
                 if (task_record.status == DW_TASK_STATUS_COMPLETED ||
                     task_record.pending_engine_status == DW_TASK_STATUS_COMPLETED) {
-                    store_.mark_task_files_completed(task_record.client_id, task_record.key_type, task_record.raw_key());
+                    store_.mark_task_files_completed(task_record.client_id, task_record.protocol, task_record.raw_key());
                 }
-                to_remove.push_back(open_id);
+                to_remove.push_back(union_id);
             } else if (paused) {
                 if (task_record.protocol == DW_PROTOCOL_HTTP) {
                     // HTTP 暂停态延迟逐出：待引擎 ctx 被 sweep 回收（task_released 确认）后
                     // 再移出内存。此时 worker 已结束并经 post_resume_data 汇入 pending_resume，
                     // 由下方 flush_dirty_locked 落库，规避先逐出导致异步 resume 被 on_resume_data 丢弃。
                     if (!http_ || http_->task_released(engine_key(task_record).c_str())) {
-                        to_remove.push_back(open_id);
+                        to_remove.push_back(union_id);
                     }
                 } else {
                     // BT：handle 常驻 session，无 ctx 回收信号；待记录已落库（!dirty）且
                     // pending_resume 已被 flush 清空后再逐出，尽力保住暂停时续传（晚到的检查点可能丢一次）。
                     if (!task_record.dirty && task_record.pending_resume.empty()) {
-                        to_remove.push_back(open_id);
+                        to_remove.push_back(union_id);
                     }
                 }
             }
@@ -1259,7 +1242,7 @@ namespace dw {
         p.source = rec.source;
         // natural_key 在回调周期内有效（borrowed 指针，与 progress 其他字符串字段一致）；
         // 调用方如需保留须深拷贝。
-        p.key.key_type = (rec.protocol == DW_PROTOCOL_HTTP) ? DW_KEY_TYPE_HTTP : DW_KEY_TYPE_BT;
+        p.key.protocol = (rec.protocol == DW_PROTOCOL_HTTP) ? DW_PROTOCOL_HTTP : DW_PROTOCOL_TORRENT;
         p.key.natural_key = (rec.protocol == DW_PROTOCOL_HTTP) ? rec.url.c_str() : rec.info_hash.c_str();
         p.content_root = rec.content_root.c_str();
         cb(&p);
@@ -1285,7 +1268,7 @@ namespace dw {
         out_key = engine_key(*slowest);
         out_proto = slowest->protocol;
         DW_LOGF(DW_LOG_INFO, "", "播放提优暂停最慢任务 key=%s rate=%.1f",
-                slowest->open_id().c_str(), slowest->download_rate);
+                slowest->union_id().c_str(), slowest->download_rate);
         slowest->status = DW_TASK_STATUS_PAUSED;
         slowest->synth_notified = false;
         slowest->dirty = true;
@@ -1299,9 +1282,9 @@ namespace dw {
         TaskRecord *rec = nullptr;
         TaskRecord loaded;
 
-        if (const auto it = tasks_.find(open_id_of(proto, natural_key)); it != tasks_.end()) {
+        if (const auto it = tasks_.find(union_id_of(proto, natural_key)); it != tasks_.end()) {
             rec = &it->second;
-        } else if (store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, loaded)) {
+        } else if (store_.load_by_natural_key(client_id_, proto, natural_key, loaded)) {
             rec = &loaded;
         } else {
             return false; // 任务不存在
@@ -1338,7 +1321,7 @@ namespace dw {
         // 扫描 playing_file_index >= 0 的任务：
         //   DOWNLOADING 态：收集 PlayingAction 交调用方锁外设 piece deadline；
         //   非 DOWNLOADING 态：若名额已满则暂停最慢任务腾出额度，将播放任务转 RESOLVING 准入。
-        for (auto &[natural_key, task_record]: tasks_) {
+        for (auto &[union_id, task_record]: tasks_) {
             if (task_record.playing_file_index < 0) continue;
             if (task_record.protocol != DW_PROTOCOL_TORRENT) {
                 // HTTP 不支持 piece deadline，清除信号
@@ -1349,7 +1332,7 @@ namespace dw {
             if (task_record.status == DW_TASK_STATUS_DOWNLOADING) {
                 // 已在下载中：收集动作，锁外设 piece deadline
                 playing_actions.push_back({
-                    natural_key, task_record.protocol,
+                    task_record.protocol,
                     engine_key(task_record),
                     task_record.playing_file_index,
                     task_record.playing_byte_offset
@@ -1380,11 +1363,11 @@ namespace dw {
                 TaskRecord copy = task_record;
 
                 lock.unlock();
-                const bool ok = call_resume_task(copy, store_.load_resume(copy.client_id, copy.key_type, copy.raw_key()));
+                const bool ok = call_resume_task(copy, store_.load_resume(copy.client_id, copy.protocol, copy.raw_key()));
                 lock.lock();
 
                 if (!ok) {
-                    if (auto it2 = tasks_.find(copy.open_id()); it2 != tasks_.end()) {
+                    if (auto it2 = tasks_.find(copy.union_id()); it2 != tasks_.end()) {
                         it2->second.status = DW_TASK_STATUS_ERROR;
                         it2->second.reason = DW_REASON_ERROR;
                         it2->second.message = "播放提优准入失败";
@@ -1408,7 +1391,7 @@ namespace dw {
             }
 
             TaskRecord *best = nullptr;
-            for (auto &task_record: tasks_ | std::views::values) {
+            for (auto &[_, task_record]: tasks_) {
                 if (task_record.status != DW_TASK_STATUS_QUEUED) continue;
                 if (!best ||
                     task_record.priority > best->priority ||
@@ -1422,14 +1405,14 @@ namespace dw {
 
             // 拷贝任务记录与续传数据供锁外使用
             TaskRecord copy = *best;
-            std::vector<uint8_t> resume = store_.load_resume(copy.client_id, copy.key_type, copy.raw_key());
+            std::vector<uint8_t> resume = store_.load_resume(copy.client_id, copy.protocol, copy.raw_key());
             lock.unlock();
 
             const bool ok = call_resume_task(copy, resume);
 
             lock.lock();
             if (!ok) {
-                if (auto it = tasks_.find(copy.open_id()); it != tasks_.end()) {
+                if (auto it = tasks_.find(copy.union_id()); it != tasks_.end()) {
                     it->second.status = DW_TASK_STATUS_ERROR;
                     it->second.reason = DW_REASON_ERROR;
                     it->second.message = "调度恢复失败";
@@ -1445,7 +1428,7 @@ namespace dw {
         struct PendingPause {
             dw_protocol_t protocol;
             std::string key; // HTTP=url，BT=info_hash
-            std::string open_id; // tasks_ 键（open_id 格式）
+            std::string union_id; // tasks_ 键（union_id 格式）
         };
         std::vector<PendingPause> to_pause;
         {
@@ -1455,12 +1438,12 @@ namespace dw {
             if (!allowed) {
                 // 闸门关闭：收集所有活跃任务（HTTP + BT），锁外逐任务暂停后回落 QUEUED。
                 // 不再整会话 pause，仅停各任务的载荷传输；session 存活维持连接/心跳。
-                for (const auto &task_record: tasks_ | std::views::values) {
+                for (const auto &[_, task_record]: tasks_) {
                     if (!status_occupies_slot(task_record.status)) continue;
                     to_pause.push_back({
                         task_record.protocol,
                         task_record.protocol == DW_PROTOCOL_HTTP ? task_record.url : task_record.info_hash,
-                        task_record.open_id()
+                        task_record.union_id()
                     });
                 }
             } else {
@@ -1486,7 +1469,7 @@ namespace dw {
         {
             std::lock_guard<std::mutex> lock(mtx_);
             for (const auto &pp: to_pause) {
-                auto it = tasks_.find(pp.open_id);
+                auto it = tasks_.find(pp.union_id);
                 if (it == tasks_.end()) continue;
                 TaskRecord &task_record = it->second;
                 task_record.status = DW_TASK_STATUS_QUEUED;
@@ -1504,12 +1487,12 @@ namespace dw {
 
     std::vector<dw_file_info_t> TaskManager::load_files(dw_protocol_t proto, const std::string &natural_key) {
         std::lock_guard<std::mutex> lock(mtx_);
-        std::vector<dw_file_info_t> files = store_.load_task_files(client_id_, protocol_to_key_type(proto), natural_key);
+        std::vector<dw_file_info_t> files = store_.load_task_files(client_id_, proto, natural_key);
         if (files.empty()) return files;
         // 惰性删除检测：仅对完成态(2)文件 stat 物理路径，缺失则标记为已删除(1)。
         // 物理路径 = save_path / name（save_path 已含包层目录，name 已含完整相对路径）。
         TaskRecord task_record;
-        if (!store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, task_record) || task_record.save_path.empty()) return files;
+        if (!store_.load_by_natural_key(client_id_, proto, natural_key, task_record) || task_record.save_path.empty()) return files;
         std::filesystem::path base(task_record.save_path);
         for (auto &f: files) {
             if (f.status != 2) continue;
@@ -1566,7 +1549,7 @@ namespace dw {
             TaskRecord rec;
             // LOCAL 任务主键：content_root = entry_name
             rec.client_id = client_id_;
-            rec.key_type = TaskKeyType::LOCAL;
+            rec.protocol = DW_PROTOCOL_LOCAL;
             rec.raw_key() = entry_name;
             rec.name = entry_name;
             rec.filename = entry_name;
@@ -1604,8 +1587,8 @@ namespace dw {
         for (int32_t i = 0; i < n; ++i) {
             const TaskRecord &r = new_records[i];
             dw_task_snapshot_t s{};
-            s.key.key_type = static_cast<dw_key_type_t>(r.key_type);
-            s.key.natural_key = dup_cstr(r.open_id());
+            s.key.protocol = r.protocol;
+            s.key.natural_key = dup_cstr(r.union_id());
             s.url = dup_cstr(r.url);
             s.info_hash = dup_cstr(r.info_hash);
             s.protocol = r.protocol;
@@ -1645,7 +1628,7 @@ namespace dw {
             // 构建物理路径：save_path / content_root
             std::filesystem::path physical(std::filesystem::path(t.save_path) / t.content_root);
             if (!std::filesystem::exists(physical, ec)) {
-                store_.update_status(t.client_id, t.key_type, t.raw_key(), DW_TASK_STATUS_INVALIDATED);
+                store_.update_status(t.client_id, t.protocol, t.raw_key(), DW_TASK_STATUS_INVALIDATED);
                 ++invalidated;
             }
         }
@@ -1668,7 +1651,7 @@ namespace dw {
                 std::filesystem::path full_path = std::filesystem::path(t.save_path) / t.content_root;
                 std::filesystem::remove_all(full_path, ec);
                 // 删除 DB 记录
-                store_.remove(t.client_id, t.key_type, t.raw_key());
+                store_.remove(t.client_id, t.protocol, t.raw_key());
             }
         }
         return 0;
@@ -1678,7 +1661,7 @@ namespace dw {
         std::lock_guard<std::mutex> lock(mtx_);
 
         TaskRecord rec;
-        if (!store_.load_by_natural_key(client_id_, protocol_to_key_type(proto), natural_key, rec)) return -1;
+        if (!store_.load_by_natural_key(client_id_, proto, natural_key, rec)) return -1;
 
         // 仅允许删除本地文件任务（source=1）
         if (rec.source != 1) return -1;
@@ -1689,7 +1672,7 @@ namespace dw {
         std::filesystem::remove_all(full_path, ec);
 
         // 删除 DB 记录
-        store_.remove(client_id_, protocol_to_key_type(proto), natural_key);
+        store_.remove(client_id_, proto, natural_key);
         return ec ? -1 : 0;
     }
 
@@ -1747,17 +1730,17 @@ namespace dw {
 
     int32_t TaskManager::active_count_locked() const {
         int32_t n = 0;
-        for (const auto &task_record: tasks_ | std::views::values) {
+        for (const auto &[_, task_record]: tasks_) {
             if (status_occupies_slot(task_record.status)) ++n;
         }
         return n;
     }
 
     void TaskManager::flush_dirty_locked() {
-        for (auto &task_record: tasks_ | std::views::values) {
+        for (auto &[_, task_record]: tasks_) {
             // 保存续传数据
             if (!task_record.pending_resume.empty()) {
-                store_.save_resume(task_record.client_id, task_record.key_type, task_record.raw_key(),
+                store_.save_resume(task_record.client_id, task_record.protocol, task_record.raw_key(),
                                    reinterpret_cast<const uint8_t *>(task_record.pending_resume.data()),
                                    task_record.pending_resume.size());
                 task_record.pending_resume.clear();
@@ -1771,18 +1754,18 @@ namespace dw {
     }
 
     void TaskManager::register_task(TaskRecord task_record) {
-        // tasks_ 以 open_id 为 key，无冗余索引。
-        tasks_[task_record.open_id()] = std::move(task_record);
+        // tasks_ 以 union_id 为 key，无冗余索引。
+        tasks_[task_record.union_id()] = std::move(task_record);
     }
 
-    void TaskManager::unregister_task(const std::string &open_id) {
-        tasks_.erase(open_id);
+    void TaskManager::unregister_task(const std::string &union_id) {
+        tasks_.erase(union_id);
     }
 
     void TaskManager::reset_error_task_for_restart(TaskRecord &task_record) {
         if (task_record.status == DW_TASK_STATUS_ERROR) {
-            store_.clear_resume(task_record.client_id, task_record.key_type, task_record.raw_key());
-            store_.clear_segments(task_record.client_id, task_record.key_type, task_record.raw_key());
+            store_.clear_resume(task_record.client_id, task_record.protocol, task_record.raw_key());
+            store_.clear_segments(task_record.client_id, task_record.protocol, task_record.raw_key());
             if (task_record.protocol == DW_PROTOCOL_HTTP) {
                 task_record.total_done = -1;
                 task_record.progress = -1.0;
@@ -1836,16 +1819,16 @@ namespace dw {
             for (const auto &fr: results) {
                 batch.emplace_back(fr.file_index, fr.ranges);
             }
-            store_.save_segments_batch(task_record.client_id, task_record.key_type, task_record.raw_key(), batch);
+            store_.save_segments_batch(task_record.client_id, task_record.protocol, task_record.raw_key(), batch);
         }
-        store_.update_downloaded_bytes(task_record.client_id, task_record.key_type, task_record.raw_key(), file_bytes);
+        store_.update_downloaded_bytes(task_record.client_id, task_record.protocol, task_record.raw_key(), file_bytes);
 
         // ---- 数据驱动完成检测（仅 DOWNLOADING 态） ----
         if (task_record.status != DW_TASK_STATUS_DOWNLOADING) return;
 
         // 从 task_files 表一次性加载文件大小（B 线程持 mtx_，DB 访问安全）。
         // file_size <= 0 的文件跳过完成判定（HTTP chunked 无总长场景）。
-        const auto all_files = store_.load_task_files(task_record.client_id, task_record.key_type, task_record.raw_key());
+        const auto all_files = store_.load_task_files(task_record.client_id, task_record.protocol, task_record.raw_key());
 
         bool all_complete = true;
         bool any_checkable = false; // 是否有可判定的文件（file_size > 0）
@@ -1864,7 +1847,7 @@ namespace dw {
             }
             any_checkable = true;
             if (is_file_complete(fr.ranges, file_size)) {
-                store_.mark_file_completed(task_record.client_id, task_record.key_type, task_record.raw_key(), fr.file_index);
+                store_.mark_file_completed(task_record.client_id, task_record.protocol, task_record.raw_key(), fr.file_index);
             } else {
                 all_complete = false;
             }
@@ -1874,18 +1857,18 @@ namespace dw {
         if (any_checkable && all_complete) {
             task_record.pending_engine_status = DW_TASK_STATUS_COMPLETED;
             DW_LOGF(DW_LOG_INFO, "", "数据驱动任务完成 key=%s",
-                    task_record.open_id().c_str());
+                    task_record.union_id().c_str());
         }
     }
 
     std::vector<dw_byte_range_t> TaskManager::get_cached_segments(dw_protocol_t proto, const std::string &natural_key, int32_t file_index) {
         // 内存缓存已移除：直接读 DB 最新快照。
-        return store_.load_segments(client_id_, protocol_to_key_type(proto), natural_key, file_index);
+        return store_.load_segments(client_id_, proto, natural_key, file_index);
     }
 
     int32_t TaskManager::get_task_status(dw_protocol_t proto, const std::string &natural_key) {
         std::lock_guard<std::mutex> lock(mtx_);
-        const auto it = tasks_.find(open_id_of(proto, natural_key));
+        const auto it = tasks_.find(union_id_of(proto, natural_key));
         if (it == tasks_.end()) return -1;
         return static_cast<int32_t>(it->second.status);
     }

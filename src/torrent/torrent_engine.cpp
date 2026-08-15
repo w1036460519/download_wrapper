@@ -356,7 +356,8 @@ namespace dw {
             if (lt::aux::from_hex(info_hash, h.data())) {
                 return g_session->find_torrent(h);
             }
-            for (const auto handles = g_session->get_torrents(); const auto &th: handles) {
+            const auto handles = g_session->get_torrents();
+            for (const auto &th: handles) {
                 if (info_hash_hex(th) == info_hash) return th;
             }
             return {};
@@ -736,7 +737,8 @@ namespace dw {
         if (!initialized_ || !g_session) return;
 
         if (g_seed_ratio_limit < 0.0) return;
-        for (const auto handles = g_session->get_torrents(); const auto &handle: handles) {
+        const auto handles = g_session->get_torrents();
+        for (const auto &handle: handles) {
             if (!handle.is_valid()) continue;
             lt::torrent_status s;
             try { s = handle.status(); } catch (...) { continue; }

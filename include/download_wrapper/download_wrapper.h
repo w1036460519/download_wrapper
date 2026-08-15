@@ -46,27 +46,21 @@ extern "C" {
 /*                              枚举定义                              */
 /* ================================================================== */
 
-/** 下载协议类型。 */
+/**
+ * 下载协议类型（同时决定 natural_key 语义与 SQLite key_type 列值）。
+ *
+ *   HTTP    → natural_key = url
+ *   TORRENT → natural_key = info_hash
+ *   LOCAL   → natural_key = content_root（save_path 下的实际根目录名）
+ */
 typedef enum {
-    DW_PROTOCOL_HTTP = 0, /**< HTTP/HTTPS 链接下载。 */
+    DW_PROTOCOL_HTTP    = 0, /**< HTTP/HTTPS 链接下载。 */
     DW_PROTOCOL_TORRENT = 1, /**< BT/Torrent 种子或磁力链接下载。 */
+    DW_PROTOCOL_LOCAL   = 2, /**< 本地文件任务（无引擎对应）。 */
 } dw_protocol_t;
 
 /**
- * 任务键类型：决定 natural_key 字段的语义，并同步 SQLite 库内 key_type 列。
- *
- *   HTTP  → natural_key = url
- *   BT    → natural_key = info_hash
- *   LOCAL → natural_key = content_root（save_path 下的实际根目录名）
- */
-typedef enum {
-    DW_KEY_TYPE_HTTP = 0,
-    DW_KEY_TYPE_BT = 1,
-    DW_KEY_TYPE_LOCAL = 2,
-} dw_key_type_t;
-
-/**
- * 任务唯一键：(key_type, natural_key) 二元组。
+ * 任务唯一键：(protocol, natural_key) 二元组。
  *
  *   - 输入时（函数入参）：natural_key 由调用方持有，调用期间须保持有效。
  *   - 输出时（dw_progress_t / dw_submit_result_t / dw_task_snapshot_t 内嵌 key）：natural_key 由库
@@ -76,7 +70,7 @@ typedef enum {
  * 均取自 session 配置；本机任务不需要每调用携带，多客户端 / 远端任务处理暂未实现。
  */
 typedef struct dw_task_key {
-    dw_key_type_t key_type;
+    dw_protocol_t protocol;
     const char *natural_key;
 } dw_task_key_t;
 
@@ -235,7 +229,7 @@ typedef struct dw_progress {
     /* ===== 扩展字段（追加，保持既有字段偏移） ===== */
 
     int32_t source; /**< 来源：0=本地任务 1=本地文件 2=远程文件。 */
-    dw_task_key_t key; /**< 任务唯一键：key_type + natural_key。natural_key 由库分配。 */
+    dw_task_key_t key; /**< 任务唯一键：protocol + natural_key。natural_key 由库分配。 */
 
     /* ===== HTTP 特有字段 ===== */
 
@@ -320,12 +314,12 @@ static inline const char *dw_task_params_key(const dw_task_params_t *p, dw_proto
  *
  * code：    同步返回码；DW_REASON_NONE 表示成功。
  * message： 错误描述；成功时为 NULL，由库分配并通过 dw_submit_results_release 释放。
- * id：      任务自增 id（上层交互主键）；add 成功回填新建 id，控制操作回显入参 id。
+ *
+ * 任务标识不在此返回：调用方已知入参 key，wrapper 经 dw_progress_cb 推送完整状态。
  */
 typedef struct dw_submit_result {
     dw_reason_t code;
     char *message;
-    dw_task_key_t key; /**< 任务唯一键：add 成功后回填，控制操作回显入参 key。natural_key 由库分配。 */
 } dw_submit_result_t;
 
 /* ------------------------------------------------------------------ */
@@ -556,7 +550,7 @@ DW_API char *dw_torrent_file_to_info_hash(const char *torrent_file_path);
  *
  * 任务必须已存在于 session 中；库内按 key 的 natural_key 回读 info_hash 后调引擎。
  *
- * @param key   任务唯一键（key_type=DW_KEY_TYPE_BT，natural_key=info_hash）。
+ * @param key   任务唯一键（protocol=DW_PROTOCOL_TORRENT，natural_key=info_hash）。
  * @return      成功返回堆分配的磁力链接（调用者 dw_free 释放），失败返回 NULL。
  */
 DW_API char *dw_info_hash_to_magnet(const dw_task_key_t *key);
@@ -782,7 +776,7 @@ DW_API int32_t dw_clear_local_tasks(const char *save_path);
  * 仅 DB + 磁盘清理，不涉及 engine 层。
  * 下载任务（source=0）拒绝，应走 dw_delete_task。
  *
- * @param key  任务唯一键（key_type=DW_KEY_TYPE_LOCAL）。
+ * @param key  任务唯一键（protocol=DW_PROTOCOL_LOCAL）。
  * @return     0=成功，-1=失败（非本地任务或不存在）。
  */
 DW_API int32_t dw_delete_local_entry(const dw_task_key_t *key);

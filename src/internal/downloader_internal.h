@@ -6,6 +6,7 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
+#include "core/task_record.h"
 
 #include <atomic>
 #include <memory>
@@ -92,13 +93,7 @@ namespace dw {
         }
     }
 
-    inline const char *to_string(dw_protocol_t p) {
-        switch (p) {
-            case DW_PROTOCOL_HTTP: return "HTTP";
-            case DW_PROTOCOL_TORRENT: return "TORRENT";
-            default: return "UNKNOWN";
-        }
-    }
+    // to_string(dw_protocol_t) 已定义于 task_record.h
 
     inline const char *to_string(dw_task_status_t s) {
         switch (s) {

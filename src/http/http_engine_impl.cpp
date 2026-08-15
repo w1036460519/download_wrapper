@@ -271,7 +271,7 @@ namespace dw {
                     DW_LOG_TASK(DW_LOG_DEBUG, tCtx->url.c_str(), "[part %d] header: %.*s",
                                 pCtx->index, static_cast<int>(raw.size()), raw.data());
 
-                    if (raw.starts_with("HTTP/")) {
+                    if (raw.find("HTTP/") == 0) {
                         if (const auto sp = raw.find(' '); sp != std::string_view::npos) {
                             if (long code = 0; sv_to_int(raw.substr(sp + 1), code)) {
                                 pCtx->seen_http_code = code;
