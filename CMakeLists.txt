@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(download_wrapper LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -21,9 +21,10 @@ find_package(unofficial-sqlite3 CONFIG REQUIRED)
 # libtorrent 提供 CMake config 包，优先使用 find_package
 # Boost.Beast / Boost.Asio 为 playback_proxy 直接依赖（header-only），
 # Boost.URL 为 URL 解析库（需链接），经 vcpkg 安装后通过 libtorrent 依赖链可用。
-# Boost.date_time 为 time_util 跨平台时间格式化依赖。
+# 时间格式化已改用 C++20 std::format chrono（要求部署目标 ≥ macOS 13.3 / iOS 16.3），
+# Boost.date_time 依赖已移除。
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
-find_package(Boost REQUIRED COMPONENTS url json date_time)
+find_package(Boost REQUIRED COMPONENTS url json)
 
 if(WIN32)
     # NOMINMAX：阻止 windows.h 定义 min/max 宏（经 curl 头传入），否则会撕碎
@@ -35,10 +36,11 @@ endif()
 
 if(APPLE)
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        # 16.3 / 13.3：std::format chrono 时间格式化（time_util）所需 libc++ 符号的最低系统版本。
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-            set(CMAKE_OSX_DEPLOYMENT_TARGET "13" CACHE STRING "最低 iOS 版本")
+            set(CMAKE_OSX_DEPLOYMENT_TARGET "16.3" CACHE STRING "最低 iOS 版本")
         else()
-            set(CMAKE_OSX_DEPLOYMENT_TARGET "12" CACHE STRING "最低 macOS 版本")
+            set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "最低 macOS 版本")
         endif()
     endif()
     # 目标架构由外部传入：macOS CI 分架构编译后用 lipo 合并为 universal binary；
@@ -84,7 +86,6 @@ target_link_libraries(download_wrapper
         unofficial::sqlite3::sqlite3
         Boost::url
         Boost::json
-        Boost::date_time
 )
 
 target_compile_definitions(download_wrapper PRIVATE DOWNLOAD_WRAPPER_BUILD)

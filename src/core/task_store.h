@@ -58,8 +58,6 @@ public:
     std::vector<TaskRecord> load_tasks_by_save_path(const std::string& save_path);
     /// 清理指定 save_path 下的非下载任务（source IN (1,2)）；用于全量清理本地/远程文件任务。
     void clear_local_tasks(const std::string& save_path);
-    /// 按 source 清理全部非下载任务（用于批量清理，不限 save_path）。
-    void clear_tasks_by_source(int source);
     /// 新增任务：纯 INSERT，复合键 (client_id, key_type, natural_key) 须由 r 三字段预填。
     void insert(TaskRecord& r);
     /// 更新既有任务：按复合键原地 UPDATE 全字段。
@@ -78,12 +76,32 @@ public:
     /// 仅清除某任务的断点续传数据。
     void clear_resume(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key);
     
+    /// 查询指定文件的完整物理路径（task_files 表）；不存在返回空串。
+    std::string load_file_physical_path(const std::string &client_id, dw_protocol_t protocol,
+                                        const std::string &natural_key, int32_t file_index) const;
+
+    // ---- 文件目录表（file_records）----
+
+    /// 新增文件记录：自增 id 回填到 r.id。
+    void insert_file_record(FileRecord &r);
+    /// 载入指定客户端的全部文件记录（按 modified_at DESC）。
+    std::vector<FileRecord> load_file_records(const std::string &client_id);
+    /// 同步文件记录的进度冗余字段（status/total_size/total_done），免全字段 UPDATE。
+    void sync_file_record_progress(dw_protocol_t task_protocol, const std::string &task_natural_key,
+                                   int32_t status, int64_t total_size, int64_t total_done);
+    /// 按任务关联键更新文件记录的 root_name 和 file_type（PARSED 后修正）。
+    void update_file_record_meta(dw_protocol_t task_protocol, const std::string &task_natural_key,
+                                 const std::string &root_name, bool file_type);
+
     // ---- 任务文件信息 ----
     
     /// 全量重写任务节点树（先删后插，事务包裹）。
+    /// @param physical_path_prefix 物理路径前缀（save_path 或 save_path/content_root），
+    ///        与文件 name 拼接得到完整物理路径。
     void save_task_files(const std::string &client_id, dw_protocol_t protocol,
                          const std::string &natural_key,
-                         const std::vector<dw_file_info_t>& files);
+                         const std::vector<dw_file_info_t>& files,
+                         const std::string &physical_path_prefix);
     /// 加载任务节点树（按 file_index 升序）；不存在返回空 vector。
     std::vector<dw_file_info_t> load_task_files(const std::string &client_id, dw_protocol_t protocol,
                                                 const std::string &natural_key);
@@ -105,30 +123,21 @@ public:
                           const std::string &natural_key, int32_t file_index,
                           int64_t downloaded_bytes, int64_t total_size);
     
-    // ---- 边下边播缓存（已合并到 task_files.play_position_ms）----
+    // ---- 播放进度（独立表 play_progress，以物理路径为键）----
     
-    /// 写入 / 覆盖文件播放进度（毫秒）；直接 UPDATE task_files。
+    /// 写入 / 覆盖文件播放进度（毫秒）；经 task_files 解析物理路径后写 play_progress。
     void set_play_position(const std::string &client_id, dw_protocol_t protocol,
                            const std::string &natural_key, int32_t file_index, int64_t position_ms);
     /// 读取文件播放进度（毫秒）；无记录返回 0。
     int64_t get_play_position(const std::string &client_id, dw_protocol_t protocol,
                               const std::string &natural_key, int32_t file_index);
     
-    // ---- 已下载区间快照 ----
+    // ---- 已下载区间快照（以物理路径为键）----
     
-    /// 覆盖写入某文件的已下载连续区间快照（事务：先删该 file_index 旧区间再批量写；空即清空）。
-    void save_segments(const std::string &client_id, dw_protocol_t protocol,
-                       const std::string &natural_key, int32_t file_index,
-                       const std::vector<dw_byte_range_t>& segments);
-    /// 批量覆盖写入多文件的已下载区间快照（单事务）；替代逐文件 save_segments 调用。
-    void save_segments_batch(const std::string &client_id, dw_protocol_t protocol,
-                             const std::string &natural_key,
-                             const std::vector<std::pair<int32_t, std::vector<dw_byte_range_t>>>& file_segments);
+    /// 批量覆盖写入多文件的已下载区间快照（单事务）。
+    void save_segments_batch(const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t>>>& file_segments);
     /// 读取某文件的已下载区间快照（按 seg_start 升序）；不存在返回空 vector。
-    std::vector<dw_byte_range_t> load_segments(const std::string &client_id, dw_protocol_t protocol,
-                                               const std::string &natural_key, int32_t file_index);
-    /// 清除某任务的全部区间快照（error 重下用）。
-    void clear_segments(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key);
+    std::vector<dw_byte_range_t> load_segments(const std::string &physical_path, int32_t file_index);
 
 private:
     sqlite3* db_ = nullptr;

@@ -54,7 +54,7 @@ static constexpr int kWaitIntervalMs = 500;
 static std::atomic<int>          g_port{0};
 static std::unique_ptr<net::io_context>    g_ioc;
 static std::unique_ptr<tcp::acceptor>      g_acceptor;
-static std::unique_ptr<std::thread>        g_thread;
+static std::unique_ptr<std::jthread>       g_thread; // jthread：reset/异常路径兜底自动 join
 static std::atomic<bool>         g_running{false};
 
 // ========================================================================
@@ -526,7 +526,7 @@ int dw_proxy_start(void) {
 
         dw::playback::do_accept();
 
-        dw::playback::g_thread = std::make_unique<std::thread>([]() {
+        dw::playback::g_thread = std::make_unique<std::jthread>([]() {
             dw::playback::g_ioc->run();
         });
 

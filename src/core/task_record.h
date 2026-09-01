@@ -66,16 +66,15 @@ struct TaskRecord {
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
     std::string              save_path;     // 用户指定的保存目录（固定不变）
-    std::string              content_root;  // save_path 下的实际根目录名（物理路径 = save_path/content_root）
-                                             // BT PARSED 时由文件结构分析确定；HTTP 由定名流程写入。
-                                             // 空 = 尚未定名（PARSED 前）。
+    std::string              content_root;  // save_path 下的包装目录名（仅冲突/多根时非空）
+                                             // 空 = 未包装（内容直接落 save_path 下）。
                                              // 本地任务的 raw_key 也指向此字段。
-    std::string              filename;      // content_root 内的主文件名（含后缀），BT 多文件任务可空
     std::string              url;           // HTTP 身份 + 下载地址（HTTP 时 raw_key 指向此字段）
     std::string              info_hash;     // BT 身份（BT 时 raw_key 指向此字段），HTTP 该字段为空
     std::string              magnet_link;   // BT
     std::string              torrent_file;  // BT
     std::string              name;          // 任务显示名称（种子原始名 / HTTP 原始文件名；STATUS_UPDATE 可更新）
+    std::string              trace_id;      // 追踪 ID（持久化）：外部注入值优先，缺省为识别键本身（url / info_hash）；日志关联用
 
     std::vector<int32_t>     file_indexes;
     std::vector<int32_t>     priority_file_indexes; // 优先下载文件索引（不持久化）
@@ -88,6 +87,8 @@ struct TaskRecord {
     // 最新快照（用于 dw_list_tasks 与断点恢复展示）
     dw_task_status_t status       = DW_TASK_STATUS_QUEUED;
     int32_t          source       = 0;  // 0=本地任务 1=本地文件 2=远程文件
+    bool             dup_checked  = false; // 首次解析的重名判定已完成（持久化）；
+                                           // PARSED 事件快路依据，避免重复磁盘冲突检测误判包装
     int64_t          total_size   = -1;
     int64_t          total_done   = -1;
     double           progress     = -1.0;
@@ -108,9 +109,6 @@ struct TaskRecord {
     dw_reason_t reason        = DW_REASON_NONE; // 采集到的原因码；仅终态 ERROR 有意义
     std::string message;                        // 采集到的状态 / 错误文本
 
-    // BT 扩展遥测（引擎推入，A 线程校验拍判断用；不持久化）
-    bool bt_multi_file     = false; // 多文件 torrent（name 为根目录名）
-
     // 播放提优信号（dw_set_playing_file 写入，调度器消费；不持久化）
     int32_t playing_file_index  = -1;  // ≥0=待设置 piece deadline 的文件索引
     int64_t playing_byte_offset = 0;   // 播放起始偏移
@@ -119,6 +117,38 @@ struct TaskRecord {
     dw_task_status_t pending_engine_status = DW_TASK_STATUS_QUEUED; // QUEUED=无终态待消费
 };
 
+/**
+ * 文件目录记录：UI 渲染主表，1 任务 = 1 行。
+ *
+ * 存储下载内容的根目录/文件条目，可选关联任务表获取状态与进度。
+ * 添加任务时先以 url/infohash 推导占位，PARSED 后修正为真实根名与文件类型。
+ * 本地文件也入此表（task_protocol 为 LOCAL，无任务关联时 protocol 取 DW_PROTOCOL_LOCAL）。
+ */
+struct FileRecord {
+    int64_t     id = 0;             // 自增主键（0=未落库）
+    std::string client_id;          // 客户端标识
+    int32_t     type = 0;           // 0=本地文件 1=任务文件 2=远程文件（与 TaskRecord.source 对齐）
+    bool        is_remote = false;  // 远程标识
+    std::string save_path;          // 保存路径
+    std::string root_name;          // 根目录/文件名（占位→修正）
+    bool        file_type = true;   // 0=文件 1=目录
+
+    // 任务关联（无关联时 protocol=LOCAL、natural_key 为空）
+    dw_protocol_t task_protocol = DW_PROTOCOL_LOCAL;
+    std::string   task_natural_key; // 关联任务的 natural_key
+
+    // 冗余自 tasks（UI 渲染免 JOIN）
+    int32_t status      = 0;        // 任务状态（dw_task_status_t）
+    int64_t total_size  = -1;       // 总字节
+    int64_t total_done  = 0;        // 已完成字节
+
+    int64_t created_at  = 0;        // Unix 毫秒
+    int64_t modified_at = 0;        // Unix 毫秒
+
+    /// 是否关联了下载任务（非本地文件）。
+    bool has_task() const {
+        return task_protocol != DW_PROTOCOL_LOCAL && !task_natural_key.empty();
+    }
+};
+
 } // namespace dw
-
-

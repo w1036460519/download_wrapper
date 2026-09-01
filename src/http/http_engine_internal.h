@@ -303,7 +303,7 @@ struct dl_task_ctx {
     int64_t last_emit_done = -1; // 上次 emit resume_data 时的总已下载字节（续传上报去重基准：仅总量推进时才 emit）。
     int64_t last_push_done = -1; // 上次投递 STATUS_UPDATE 事件时的总已下载字节（进度推送去重：仅推进超过门槛才投递）
     std::mutex speed_mtx;
-    std::thread task_thread;
+    std::jthread task_thread; // jthread：析构兜底自动 join，防漏 join 路径终止进程
 };
 
 /* ===================== 全局变量（dw::http_engine namespace） ===================== */

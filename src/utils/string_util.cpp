@@ -4,6 +4,8 @@
  */
 #include "utils/string_util.h"
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <filesystem>
 #include <sstream>
@@ -71,6 +73,13 @@ namespace dw::utils {
         const auto p = std::filesystem::path(name);
         const std::string stem = p.stem().string();
         return stem.empty() ? name : stem;
+    }
+
+    bool iequals(std::string_view a, std::string_view b) noexcept {
+        // unsigned char 入参避开 std::tolower 对负值 char 的未定义行为。
+        return std::ranges::equal(a, b, [](unsigned char ca, unsigned char cb) {
+            return std::tolower(ca) == std::tolower(cb);
+        });
     }
 
 }

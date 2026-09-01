@@ -168,12 +168,12 @@ typedef void (*dw_log_cb)(dw_log_level_t level,
 typedef struct dw_file_info {
     int32_t index; /**< libtorrent 文件索引（用于设置优先级）。 */
     char *name; /**< 相对路径（含目录）。 */
+    char *physical_path; /**< 完整物理路径（含 save_path + content_root 前缀）。 */
     int64_t size; /**< 文件字节数。 */
     char *ext; /**< 后缀（不含点，如 mkv）；可为 NULL。 */
     int32_t status; /**< 文件状态：0=下载中，1=磁盘已删除，2=完成正常。 */
     int64_t offset; /**< 文件在 torrent 全局字节流中的起始偏移（HTTP 单文件为 0）。 */
     int64_t downloaded_bytes; /**< 已下载字节数（BT 从 piece bitmap 推算）。 */
-    int64_t play_position_ms; /**< 播放进度（毫秒）。 */
 } dw_file_info_t;
 
 /* ------------------------------------------------------------------ */
@@ -214,7 +214,6 @@ typedef struct dw_progress {
     dw_protocol_t protocol; /**< 协议类型。 */
     const char *name; /**< 任务显示名称。 */
     const char *output_path; /**< 用户指定的保存目录 save_path（恒不变）。实际落盘目录 = output_path / content_root。 */
-    const char *filename; /**< 目标文件名（不含目录）。 */
     int64_t total_size; /**< 总大小（字节）；-1=未知。 */
     int64_t total_done; /**< 已完成字节；-1=未知。 */
     int64_t remaining; /**< 剩余字节；-1=未知。 */
@@ -244,7 +243,7 @@ typedef struct dw_progress {
     /* ===== content_root（追加，保持既有字段偏移） ===== */
 
     const char *content_root; /**< save_path 下的实际根目录名。物理路径 = output_path / content_root。
-                                                空串 = 尚未定名（PARSED 前）。 */
+                                                空串 = 未包装（内容直接落 output_path 下）。 */
 } dw_progress_t;
 
 /* ------------------------------------------------------------------ */
@@ -389,7 +388,6 @@ typedef struct dw_task_snapshot {
     dw_protocol_t protocol; /**< 协议类型。 */
     char *name; /**< 任务显示名称。 */
     char *save_path; /**< 保存目录。 */
-    char *filename; /**< 目标文件名（可能为空串）。 */
     dw_task_status_t status; /**< 持久化的任务状态。 */
     double progress; /**< 进度 0.0-1.0；-1=未知。 */
     int64_t total_size; /**< 总大小（字节）；-1=未知。 */
@@ -400,6 +398,33 @@ typedef struct dw_task_snapshot {
     int32_t source; /**< 来源：0=本地任务 1=本地文件 2=远程文件。 */
     char *content_root; /**< save_path 下的实际根目录名。物理路径 = save_path / content_root。空串=尚未定名。 */
 } dw_task_snapshot_t;
+
+/* ------------------------------------------------------------------ */
+/*  dw_file_record_t — 文件目录记录（UI 渲染主表）                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 文件目录记录快照。
+ *
+ * 由 dw_list_file_records 返回，用于 App 启动时一次性还原文件列表。
+ * 所有字符串由库分配，整个数组通过 dw_file_record_list_free 统一释放。
+ */
+typedef struct dw_file_record {
+    int64_t id;             /**< 自增主键。 */
+    char *client_id;        /**< 客户端标识。 */
+    int32_t type;           /**< 0=本地文件 1=任务文件 2=远程文件。 */
+    bool is_remote;         /**< 远程标识。 */
+    char *save_path;        /**< 保存路径。 */
+    char *root_name;        /**< 根目录/文件名。 */
+    bool file_type;         /**< true=目录 false=文件。 */
+    dw_protocol_t task_protocol; /**< 关联任务协议（DW_PROTOCOL_LOCAL=无关联）。 */
+    char *task_natural_key; /**< 关联任务的 natural_key（无关联时为空串）。 */
+    int32_t status;         /**< 冗余任务状态（dw_task_status_t）。 */
+    int64_t total_size;     /**< 冗余总字节；-1=未知。 */
+    int64_t total_done;     /**< 冗余已完成字节。 */
+    int64_t created_at;     /**< 创建时间（Unix 毫秒）。 */
+    int64_t modified_at;    /**< 最近修改时间（Unix 毫秒）。 */
+} dw_file_record_t;
 
 /* ================================================================== */
 /*                            生命周期                                */
@@ -474,7 +499,7 @@ DW_API void dw_set_log_callback(dw_log_cb cb);
  * 添加单个下载任务。
  *
  * 文件名由库内自动确定：HTTP 从 URL 或响应头解析，BT 从种子元数据获取。
- * 结果经进度回调的 filename / output_path 回报。
+ * 结果经进度回调的 name / output_path / content_root 回报。
  *
  * @param protocol    协议类型。natural_key 从 params.url (HTTP) / params.info_hash (BT) 推导。
  * @param params      任务参数指针，不可为 NULL。
@@ -625,7 +650,7 @@ DW_API void dw_byte_range_free(dw_byte_range_t *ranges, int32_t count);
 /**
  * 查询任务指定文件的物理路径与总大小（边下边播代理用）。
  *
- * 按 save_path/filename 拼接物理路径（save_path 已含包层目录）；
+ * 按 save_path/content_root 拼接物理路径（save_path 已含包层目录）；
  * BT 多文件另经 task_files 表按 file_index 查 name（name 已含完整相对路径）。
  *
  * @param key         任务唯一键。
@@ -701,6 +726,19 @@ DW_API int32_t dw_get_play_position(const dw_task_key_t *key,
  */
 DW_API int32_t dw_list_tasks(dw_task_snapshot_t **out_tasks,
                              int32_t *out_count);
+
+/**
+ * 获取全部文件目录记录。
+ *
+ * 用于 App 启动时一次性还原文件列表（UI 渲染主表）。
+ * 数据来自库内 SQLite file_records 表，无需引擎运行即可返回。
+ *
+ * @param out_records  输出：堆分配的文件记录数组（调用者 dw_file_record_list_free 释放）。
+ * @param out_count    输出：记录数量。
+ * @return             0=成功，-1=失败。
+ */
+DW_API int32_t dw_list_file_records(dw_file_record_t **out_records,
+                                    int32_t *out_count);
 
 /**
  * 设置任务队列优先级（越大越优先）。
@@ -814,6 +852,14 @@ DW_API void dw_file_list_free(dw_file_info_t *files, int32_t count);
  * @param count  数组长度。
  */
 DW_API void dw_task_list_free(dw_task_snapshot_t *tasks, int32_t count);
+
+/**
+ * 释放文件目录记录数组（含各字段字符串）。
+ *
+ * @param records  dw_list_file_records 返回的数组。
+ * @param count    数组长度。
+ */
+DW_API void dw_file_record_list_free(dw_file_record_t *records, int32_t count);
 
 /**
  * 通用内存释放。

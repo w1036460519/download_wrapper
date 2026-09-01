@@ -11,6 +11,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -144,7 +145,7 @@ namespace dw {
         obj["status"] = f.status;
         obj["offset"] = f.offset;
         obj["downloaded_bytes"] = f.downloaded_bytes;
-        obj["play_position_ms"] = f.play_position_ms;
+        obj["physical_path"] = (f.physical_path ? f.physical_path : "");
         return boost::json::serialize(obj);
     }
 
@@ -224,7 +225,7 @@ namespace dw {
     /**
      * 内部日志输出。
      *
-     * func / line 由 DW_LOG 宏自动捕获，直接调用时可为空/0。
+     * func / line 由 log_i / log_d / log_e 函数模板自动捕获，直接调用时可为空/0。
      */
     void log_message(dw_log_level_t level,
                      const char *message,
@@ -237,7 +238,7 @@ namespace dw {
      *
      * 内部转 TaskManager::resolve_and_record_name：持锁以磁盘为唯一真相源抢占唯一 wrapper 名
      * （候选未被占用即立即创建 wrapper 目录物化占位）→ 回写任务 name=wrapper（可能含 (n) 后缀）、
-     * filename=inner_name（HTTP/BT 单文件）、save_path=原 dir（不变）并立即落库（持久预留）。
+     * save_path=原 dir（不变）并立即落库（持久预留）。
      * 返回 wrapper 名（与入参 wrapper_name 不等即重名包层，调用方按目录名创建 wrapper）；
      * 任务未知时仅抢名返回（不落库）。
      * 本通道 wrapper 占位恒为目录，多文件 BT 不得经此路径定名（走 PARSED 事件）。
@@ -251,43 +252,72 @@ namespace dw {
     /**
      * 格式化日志输出（内部）。
      *
-     * func / line 由 DW_LOGF 宏自动捕获；fmt 后接可变参。
-     * DW_PRINTF_FMT 令 GCC/Clang 编译期校验格式串与实参类型匹配（MSVC 下为空）。
+     * func / line 由 log_i / log_d / log_e 函数模板自动捕获；fmt 后接可变参。
+     * 注：调用均经模板转发，fmt 为运行期参数，格式串不做编译期校验；
+     * 非标量实参仍由变参函数通用诊断（-Wnon-pod-varargs）在实例化时拦截。
      */
-#if defined(__GNUC__) || defined(__clang__)
-#define DW_PRINTF_FMT(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
-#else
-#define DW_PRINTF_FMT(fmt_idx, arg_idx)
-#endif
-
     void emit_logf(dw_log_level_t level, const char *trace_id,
                    const char *func, int32_t line,
-                   const char *fmt, ...) DW_PRINTF_FMT(5, 6);
+                   const char *fmt, ...);
 
-    /// 从 task_id 计算 trace_id（取 size_t 自然宽度，不补零），无需跨层透传。
-    inline std::string make_trace(const char *task_id) {
-        if (!task_id || !task_id[0]) return {};
-        char buf[17];
-        std::snprintf(buf, sizeof(buf), "%zx",
-                      std::hash<std::string_view>{}(task_id));
-        return buf;
+    /**
+     * 日志调用点上下文：由追踪 ID 实参隐式转换而来，构造默认参自动捕获调用位置。
+     *
+     * 作为 log_i / log_d / log_e 的首参，携带追踪 ID 与 C++20 source_location
+     *（函数名 / 行号），替代早期宏方案的 __FUNCTION__ / __LINE__ 捕获。
+     */
+    struct log_site {
+        const char *trace_id;      // 追踪 ID；NULL 或空串按无关联任务处理
+        std::source_location loc;  // 调用点位置：构造时（即日志调用处）捕获
+
+        log_site(const char *tid,
+                 std::source_location l = std::source_location::current())
+            : trace_id(tid), loc(l) {}
+    };
+
+    /**
+     * 快捷日志公共实现（内部）：级别由参数指定，调用点位置取自 log_site。
+     *
+     * 纯文本调用（无可变参）内部经 "%s" 转发，文本不会被解释为格式串。
+     */
+    template <typename... Args>
+    void log_at(dw_log_level_t level, log_site site, const char *fmt, Args... args) {
+        if constexpr (sizeof...(Args) == 0) {
+            emit_logf(level, site.trace_id, site.loc.function_name(),
+                      static_cast<int32_t>(site.loc.line()), "%s", fmt);
+        } else {
+            emit_logf(level, site.trace_id, site.loc.function_name(),
+                      static_cast<int32_t>(site.loc.line()), fmt, args...);
+        }
+    }
+
+    /**
+     * 快捷日志接口（库内唯一日志入口）：调用方仅需传入追踪 ID 与格式串。
+     *
+     * 函数模板（早期宏实现已移除）：级别固定为 INFO；调用方函数名与行号经
+     * log_site 的 source_location 自动捕获。实参类型安全：非标量实参（如 std::string）
+     * 实例化时报错；注意格式说明符失配（%s 配 int 等）不再编译期拦截。
+     *
+     * @param site 调用点上下文：由追踪 ID（任务原始标识）隐式转换；
+     *             允许 NULL 或空串，此时按无关联任务处理。
+     * @param fmt  printf 风格格式串，须为非 NULL 字符串；纯文本时可不含转换说明。
+     * @param args 与格式串对应的可变参数，可省略（纯文本调用）。
+     * @return 无。投递失败 / 未配置回调的兑底（输出 stderr）由 emit_logf 内部统一处理。
+     */
+    template <typename... Args>
+    void log_i(log_site site, const char *fmt, Args... args) {
+        log_at(DW_LOG_INFO, site, fmt, args...);
+    }
+
+    /// DEBUG 级别快捷日志：参数语义与错误处理同 log_i。
+    template <typename... Args>
+    void log_d(log_site site, const char *fmt, Args... args) {
+        log_at(DW_LOG_DEBUG, site, fmt, args...);
+    }
+
+    /// ERROR 级别快捷日志：参数语义与错误处理同 log_i。
+    template <typename... Args>
+    void log_e(log_site site, const char *fmt, Args... args) {
+        log_at(DW_LOG_ERROR, site, fmt, args...);
     }
 } // namespace dw
-
-/// 日志宏：自动捕获调用方函数名与行号。
-#define DW_LOG(level, message, trace_id) \
-    dw::log_message((level), (message), (trace_id), __FUNCTION__, __LINE__)
-
-/// 格式化日志宏：自动捕获调用方函数名与行号（需调用方预计算 trace_id）。
-#define DW_LOGF(level, trace_id, fmt, ...) \
-    dw::emit_logf((level), (trace_id), __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__)
-
-/// 任务级格式化日志：从 task_id 自动计算 trace_id，无需调用方透传。
-#define DW_LOG_TASK(level, task_id, fmt, ...) do { \
-    const std::string _dw_tr = dw::make_trace(task_id); \
-    dw::emit_logf((level), _dw_tr.c_str(), __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__); \
-} while (0)
-
-/// 系统级格式化日志：无关联任务，trace_id 为空。
-#define DW_LOG_SYS(level, fmt, ...) \
-    dw::emit_logf((level), "", __FUNCTION__, __LINE__, fmt, ##__VA_ARGS__)

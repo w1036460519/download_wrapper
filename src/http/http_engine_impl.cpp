@@ -25,7 +25,6 @@
 #include <libtorrent/error_code.hpp>
 
 #include <boost/url.hpp>
-#include <boost/algorithm/string.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -44,6 +43,7 @@ namespace dw {
 
         namespace internal {
             using dw::utils::format_unix_ms;
+            using dw::utils::iequals;
             using dw::utils::now_unix_ms;
 
             /// 探测窗口大小（字节）：探测请求发 "Range: 0-(n-1)" 有界区间，
@@ -52,7 +52,7 @@ namespace dw {
 
             /* ---------- 字符串工具 ---------- */
 
-            // boost::algorithm::iequals 替代手写大小写比较
+            // 忽略大小写比较统一走 utils::iequals（string_util）
 
             std::string_view trim_view(std::string_view s) noexcept {
                 constexpr std::string_view ws = " \t\r\n\v\f";
@@ -126,9 +126,9 @@ namespace dw {
                     auto val = (*it).value;
                     if (val.empty()) continue;
 
-                    if (by_filename.empty() && boost::algorithm::iequals(key, "filename")) {
+                    if (by_filename.empty() && iequals(key, "filename")) {
                         by_filename = sanitize_basename(std::string(val));
-                    } else if (by_name.empty() && boost::algorithm::iequals(key, "name")) {
+                    } else if (by_name.empty() && iequals(key, "name")) {
                         by_name = sanitize_basename(std::string(val));
                     }
                 }
@@ -169,7 +169,6 @@ namespace dw {
                 task_progress->protocol = DW_PROTOCOL_HTTP;
                 task_progress->name = tCtx->filename.c_str();
                 task_progress->output_path = tCtx->output_path.c_str();
-                task_progress->filename = tCtx->filename.c_str();
                 task_progress->total_size = tCtx->total_size;
 
                 int64_t total_downloaded = 0;
@@ -270,10 +269,10 @@ namespace dw {
                         return len;
                     }
 
-                    DW_LOG_TASK(DW_LOG_DEBUG, tCtx->url.c_str(), "[part %d] header: %.*s",
+                    log_d(tCtx->url.c_str(), "[part %d] header: %.*s",
                                 pCtx->index, static_cast<int>(raw.size()), raw.data());
 
-                    if (raw.find("HTTP/") == 0) {
+                    if (raw.starts_with("HTTP/")) {
                         if (const auto sp = raw.find(' '); sp != std::string_view::npos) {
                             if (long code = 0; sv_to_int(raw.substr(sp + 1), code)) {
                                 pCtx->seen_http_code = code;
@@ -281,11 +280,11 @@ namespace dw {
                                 // 反向判定：200 全量流可正常落盘的唯一形态是"单分片且写偏移为 0"
                                 //（探测降级、从头全量重收），此时照单全收；其余（多分片并行、
                                 // done>0 续传）从 0 开始的全量流必然错位，标记漂移：经管理层重启时
-                                // clear_resume+clear_segments 并重探测、ftruncate 至新 total_size，全量复位。
+                                // clear_resume 并重探测、ftruncate 至新 total_size，全量复位。
                                 const bool full_stream_ok = tCtx->parts.size() <= 1
                                                             && tCtx->parts[pCtx->index].done == 0;
                                 if (code == 200 && !full_stream_ok) {
-                                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
+                                    log_e(tCtx->url.c_str(),
                                                 "[part %d] drift: expected 206, got http_code=%ld (parts=%d done=%lld)",
                                                 pCtx->index, code,
                                                 static_cast<int>(tCtx->parts.size()),
@@ -304,7 +303,7 @@ namespace dw {
                     const auto name = trim_view(raw.substr(0, colon));
                     const auto val = trim_view(raw.substr(colon + 1));
 
-                    if (boost::algorithm::iequals(name, "Content-Range")) {
+                    if (iequals(name, "Content-Range")) {
                         // bytes 0-1/239784356
                         if (const auto slash = val.find('/'); slash != std::string_view::npos) {
                             if (const auto total_sv = val.substr(slash + 1);
@@ -315,7 +314,7 @@ namespace dw {
                                         tCtx->total_size = total;
                                     }
                                     if (tCtx->total_size > 0 && total != tCtx->total_size) {
-                                        DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
+                                        log_e(tCtx->url.c_str(),
                                                     "[part %d] drift: Content-Range total=%lld, expected=%lld",
                                                     pCtx->index, static_cast<long long>(total),
                                                     static_cast<long long>(tCtx->total_size));
@@ -324,14 +323,14 @@ namespace dw {
                                 }
                             }
                         }
-                    } else if (boost::algorithm::iequals(name, "Content-Length")) {
+                    } else if (iequals(name, "Content-Length")) {
                         // 兜底仅限探测收到 200（全量流，CL 即总大小）；206 的 CL 是探测
                         // 窗口大小而非文件总长，总大小恒由上方 Content-Range 的 total 提供。
                         if (int64_t cl = 0; sv_to_int(val, cl) && cl > 0 && pCtx->seen_total_size <= 0 && tCtx->
                                             probing && pCtx->seen_http_code != 206) {
                             pCtx->seen_total_size = cl;
                         }
-                    } else if (boost::algorithm::iequals(name, "Content-Disposition")) {
+                    } else if (iequals(name, "Content-Disposition")) {
                         // 服务器真实建议名优先于 URL 推断（header 先于首笔 body，finalize_probing
                         // 定名时已可用）；filename 已有值时跳过解析（add 显式指定名 /
                         // 恢复任务的历史凭证名，两者优先级均更高）。
@@ -340,20 +339,20 @@ namespace dw {
                                 tCtx->filename = parsed;
                             }
                         }
-                    } else if (boost::algorithm::iequals(name, "ETag")) {
+                    } else if (iequals(name, "ETag")) {
                         pCtx->seen_etag.assign(val);
                         if (tCtx->etag.empty()) tCtx->etag = pCtx->seen_etag;
                         if (!tCtx->etag.empty() && pCtx->seen_etag != tCtx->etag) {
-                            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
+                            log_e(tCtx->url.c_str(),
                                         "[part %d] drift: ETag changed, expected=\"%s\", got=\"%s\"",
                                         pCtx->index, tCtx->etag.c_str(), pCtx->seen_etag.c_str());
                             return mark_drift_error();
                         }
-                    } else if (boost::algorithm::iequals(name, "Last-Modified")) {
+                    } else if (iequals(name, "Last-Modified")) {
                         pCtx->seen_last_modified.assign(val);
                         if (tCtx->last_modified.empty()) tCtx->last_modified = pCtx->seen_last_modified;
                         if (!tCtx->last_modified.empty() && pCtx->seen_last_modified != tCtx->last_modified) {
-                            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
+                            log_e(tCtx->url.c_str(),
                                         "[part %d] drift: Last-Modified changed, expected=\"%s\", got=\"%s\"",
                                         pCtx->index, tCtx->last_modified.c_str(), pCtx->seen_last_modified.c_str());
                             return mark_drift_error();
@@ -361,7 +360,7 @@ namespace dw {
                     }
                     return len;
                 } catch (...) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] header_cb exception", pCtx->index);
+                    log_e(tCtx->url.c_str(), "[part %d] header_cb exception", pCtx->index);
                     return 0;
                 }
             }
@@ -386,7 +385,7 @@ namespace dw {
                 if (tCtx->status == DW_TASK_STATUS_ERROR || tCtx->cancel_req.load() || tCtx->pause_req.load()
                     || len == 0) {
                     // 任务已定错 / 取消 / 暂停 / 空数据：短返回终止本连接（预期控制流）
-                    DW_LOG_TASK(DW_LOG_DEBUG, tCtx->url.c_str(),
+                    log_d(tCtx->url.c_str(),
                                 "[part %d] write_cb abort: status=%d cancel=%d pause=%d len=%zu",
                                 pCtx->index, tCtx->status, tCtx->cancel_req.load(),
                                 tCtx->pause_req.load(), len);
@@ -400,7 +399,7 @@ namespace dw {
                     finalize_probing(tCtx, pCtx);
                     if (tCtx->status == DW_TASK_STATUS_ERROR) {
                         // 失败细节（建目录/建文件/预分配）已由 finalize_probing 记录 ERROR
-                        DW_LOG_TASK(DW_LOG_DEBUG, tCtx->url.c_str(),
+                        log_d(tCtx->url.c_str(),
                                     "[part %d] write_cb abort: finalize_probing failed", pCtx->index);
                         push_progress(tCtx, true); // 首帧推送（ERROR 终态）
                         return 0;
@@ -415,7 +414,7 @@ namespace dw {
                     const int64_t remain = part.size - part.done;
                     if (remain <= 0) {
                         // 分片已满，不再写入
-                        DW_LOG_TASK(DW_LOG_DEBUG, tCtx->url.c_str(),
+                        log_d(tCtx->url.c_str(),
                                     "[part %d] write_cb abort: part full, extra=%zu done=%lld",
                                     pCtx->index, len, static_cast<long long>(part.done));
                         return 0;
@@ -426,7 +425,7 @@ namespace dw {
                     }
                 }
                 if (!std::filesystem::exists(tCtx->full_file_path)) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] file missing: path=%s",
+                    log_e(tCtx->url.c_str(), "[part %d] file missing: path=%s",
                                 pCtx->index, tCtx->full_file_path.c_str());
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     part.status = DW_TASK_STATUS_ERROR;
@@ -439,7 +438,7 @@ namespace dw {
                 }
                 const auto off = static_cast<long long>(part.start + part.done);
                 if (const int werr = pCtx->file.pwrite_at(ptr, write_len, off); werr != 0) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(),
+                    log_e(tCtx->url.c_str(),
                                 "[part %d] write failed: wanted=%zu errno=%d",
                                 pCtx->index, write_len, werr);
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
@@ -662,7 +661,7 @@ namespace dw {
                         tCtx->url.c_str(), DW_PROTOCOL_HTTP,
                         tCtx->output_path.c_str(), wrapper.c_str(), raw_name.c_str());
                     if (unique != wrapper) {
-                        DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+                        log_i(tCtx->url.c_str(),
                                     "HTTP 判重：wrapper 包层 '%s' -> '%s'", wrapper.c_str(), unique.c_str());
                     }
                 
@@ -677,7 +676,6 @@ namespace dw {
                     f.offset = 0; // HTTP 单文件模型，全局偏移恒为 0
                     f.status = 0;
                     f.downloaded_bytes = 0;
-                    f.play_position_ms = 0;
                     EngineEvent ev;
                     ev.type = EngineEventType::TASK_FILES;
                     ev.engine_key = tCtx->url;
@@ -695,7 +693,7 @@ namespace dw {
                 if (!tCtx->full_file_path.empty()) {
                     if (const auto dir_path = std::filesystem::path(tCtx->full_file_path).parent_path();
                         !dir_path.empty() && !mkdir_recursive(dir_path.string())) {
-                        DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "mkdir failed: %s", dir_path.string().c_str());
+                        log_e(tCtx->url.c_str(), "mkdir failed: %s", dir_path.string().c_str());
                         tCtx->status = DW_TASK_STATUS_ERROR;
                         tCtx->reason = DW_REASON_ERROR;
                         tCtx->message = "目录创建失败";
@@ -705,7 +703,7 @@ namespace dw {
                     // 随后按总大小预分配（resize_file 按路径操作，无需持有句柄）。
                     DwFile creator;
                     if (!creator.open(tCtx->full_file_path)) {
-                        DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "open failed: %s errno=%d",
+                        log_e(tCtx->url.c_str(), "open failed: %s errno=%d",
                                     tCtx->full_file_path.c_str(), errno);
                         tCtx->status = DW_TASK_STATUS_ERROR;
                         tCtx->reason = DW_REASON_ERROR;
@@ -714,7 +712,7 @@ namespace dw {
                     }
                     if (tCtx->total_size > 0 &&
                         !creator.truncate(tCtx->full_file_path, tCtx->total_size)) {
-                        DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "truncate failed: size=%lld errno=%d",
+                        log_e(tCtx->url.c_str(), "truncate failed: size=%lld errno=%d",
                                     static_cast<long long>(tCtx->total_size), errno);
                         tCtx->status = DW_TASK_STATUS_ERROR;
                         tCtx->reason = DW_REASON_ERROR;
@@ -960,7 +958,7 @@ namespace dw {
                     // 误判为完成而截断文件。
                     if (pCtx->probe_window && rc == CURLE_OK && http_code == 206 && part.done > 0) {
                         pCtx->probe_window = 0;
-                        DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+                        log_i(tCtx->url.c_str(),
                                     "probe window done, continue: part=%d done=%lld/%lld",
                                     pCtx->index, static_cast<long long>(part.done),
                                     static_cast<long long>(part.size));
@@ -981,7 +979,7 @@ namespace dw {
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     auto &part = tCtx->parts[pCtx->index];
                     // 2xx 但区间未收满（服务器提前断开）：按次数重试续传。
-                    DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+                    log_i(tCtx->url.c_str(),
                                 "incomplete: part=%d done=%lld/%lld",
                                 pCtx->index, static_cast<long long>(part.done), static_cast<long long>(part.size));
                     if (pCtx->retry_count >= g_cfg.max_retries) {
@@ -991,20 +989,20 @@ namespace dw {
                         return false;
                     }
                     pCtx->retry_count++;
-                    DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+                    log_i(tCtx->url.c_str(),
                                 "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
                     return true;
                 }
 
                 int retryable = 0;
                 const dw_reason_t reason = classify_failure(rc, http_code, &retryable);
-                DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+                log_i(tCtx->url.c_str(),
                             "failed: part=%d rc=%d http=%ld reason=%d retryable=%d",
                             pCtx->index, static_cast<int>(rc), http_code, static_cast<int>(reason), retryable);
 
                 if (retryable && pCtx->retry_count < g_cfg.max_retries) {
                     pCtx->retry_count++;
-                    DW_LOG_TASK(DW_LOG_INFO, tCtx->url.c_str(),
+                    log_i(tCtx->url.c_str(),
                                 "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
                     return true;
                 }
@@ -1035,7 +1033,7 @@ namespace dw {
             void run_parts_multi(dl_task_ctx *tCtx) {
                 CURLM *multi = curl_multi_init();
                 if (!multi) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "curl_multi_init failed");
+                    log_e(tCtx->url.c_str(), "curl_multi_init failed");
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->status = DW_TASK_STATUS_ERROR;
                     tCtx->reason = DW_REASON_ERROR;
@@ -1064,7 +1062,7 @@ namespace dw {
                     auto add_part = [&](dl_part_ctx *pCtx) -> bool {
                         CURL *curl = build_easy_for_part(tCtx, pCtx);
                         if (!curl) {
-                            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "[part %d] build_easy_for_part failed",
+                            log_e(tCtx->url.c_str(), "[part %d] build_easy_for_part failed",
                                         pCtx->index);
                             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                             tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
@@ -1113,7 +1111,7 @@ namespace dw {
                         if (mc == CURLM_OK)
                             mc = curl_multi_poll(multi, nullptr, 0, 200, nullptr);
                         if (mc != CURLM_OK) {
-                            DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "curl_multi error: %d", static_cast<int>(mc));
+                            log_e(tCtx->url.c_str(), "curl_multi error: %d", static_cast<int>(mc));
                             break;
                         }
 
@@ -1157,13 +1155,13 @@ namespace dw {
                         push_progress(tCtx);
                     }
                 } catch (const std::exception &e) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "run_parts_multi exception: %s", e.what());
+                    log_e(tCtx->url.c_str(), "run_parts_multi exception: %s", e.what());
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->status = DW_TASK_STATUS_ERROR;
                     tCtx->reason = DW_REASON_ERROR;
                     if (tCtx->message.empty()) tCtx->message = "下载过程中出现异常";
                 } catch (...) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "run_parts_multi unknown exception");
+                    log_e(tCtx->url.c_str(), "run_parts_multi unknown exception");
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->status = DW_TASK_STATUS_ERROR;
                     tCtx->reason = DW_REASON_ERROR;
@@ -1211,13 +1209,13 @@ namespace dw {
                     // 暂停退出（分片下载中被打断）：worker 结束前固化一次续传断点，ctx 随后由 sweep 回收。
                     else if (tCtx->pause_req.load() && !tCtx->cancel_req.load()) maybe_emit_resume(tCtx);
                 } catch (const std::exception &e) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func exception: %s", e.what());
+                    log_e(tCtx->url.c_str(), "task_thread_func exception: %s", e.what());
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->status = DW_TASK_STATUS_ERROR;
                     tCtx->reason = DW_REASON_ERROR;
                     tCtx->message = "任务线程异常终止";
                 } catch (...) {
-                    DW_LOG_TASK(DW_LOG_ERROR, tCtx->url.c_str(), "task_thread_func unknown exception");
+                    log_e(tCtx->url.c_str(), "task_thread_func unknown exception");
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->status = DW_TASK_STATUS_ERROR;
                     tCtx->reason = DW_REASON_ERROR;
@@ -1231,7 +1229,7 @@ namespace dw {
             }
 
             void start_task(dl_task_ctx *tCtx) {
-                tCtx->task_thread = std::thread(task_thread_func, tCtx);
+                tCtx->task_thread = std::jthread(task_thread_func, tCtx);
             }
 
             /* =====================================================================
@@ -1290,7 +1288,7 @@ namespace dw {
                             dw_reason_t code, const char *msg, const char *fmt, ...) {
                 // task_id 仅用于日志 trace；dw_submit_result_t 不再回传字符串标识。
                 r->code = code;
-                const std::string trace_id = dw::make_trace(task_id);
+                const char *trace_id = (task_id && task_id[0]) ? task_id : "";
                 if (msg) {
                     const size_t n = std::strlen(msg);
                     auto p = static_cast<char *>(std::malloc(n + 1));
@@ -1304,9 +1302,9 @@ namespace dw {
                         char buf[512];
                         std::vsnprintf(buf, sizeof(buf), fmt, args);
                         va_end(args);
-                        DW_LOGF(DW_LOG_ERROR, trace_id.c_str(), "%s", buf);
+                        log_e(trace_id, "%s", buf);
                     } else if (msg) {
-                        DW_LOGF(DW_LOG_ERROR, trace_id.c_str(), "%s", msg);
+                        log_e(trace_id, "%s", msg);
                     }
                 }
             }

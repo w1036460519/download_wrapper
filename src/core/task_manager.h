@@ -136,6 +136,9 @@ namespace dw {
         // ---- 快照查询 ----
         int32_t list(dw_task_snapshot_t **out_tasks, int32_t *out_count);
 
+        /// 从数据库加载全部文件目录记录（UI 渲染主表）。
+        std::vector<FileRecord> list_file_records();
+
         /// 设置流量闸门：allowed=false 时逐任务暂停所有活跃下载（BT/HTTP）并回落 QUEUED，
         /// 调度线程不再准入新任务；true 时唤醒调度按 QUEUED→准入路径自动重启。
         void set_network_allowed(bool allowed);
@@ -197,10 +200,11 @@ namespace dw {
                                      std::vector<ResolveAction> &resolve_actions);
 
         // A 线程（轻量）：周期遍历内存 + 转发回调，不落库 / 不快照 / 不移除 / 不 sweep。
-        void scheduler_loop();
+        // stop_token 由 jthread 自动传入，stop() 请求停止后唤醒等待点并退出循环。
+        void scheduler_loop(std::stop_token st);
 
         // B 线程（重载）：较长节拍或被 schedule 唤醒，持锁完成持久化 / 区间快照 / 终态注销 / 准入，随后锁外 sweep。
-        void maintenance_loop();
+        void maintenance_loop(std::stop_token st);
 
         // B 线程消费单个引擎事件（PARSED/DOWNLOAD_FAILED/DOWNLOAD_COMPLETED/STATUS_UPDATE/
         // RESUME_DATA/BT_PAUSED/BT_RESUMED/DELETED）。
@@ -292,9 +296,9 @@ namespace dw {
         // 分段内存缓存已移除：dw_get_file_ranges 直接经 DB 读取最新快照。
 
         TaskStore store_; // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
-        std::thread worker_; // A 线程：轻量采集 + 回调
-        std::thread maintenance_; // B 线程：持久化 + 区间快照 + 终态注销 + 准入 + sweep
-        std::atomic<bool> running_{false};
+        std::jthread worker_; // A 线程：轻量采集 + 回调（析构兑底自动请求停止并 join）
+        std::jthread maintenance_; // B 线程：持久化 + 区间快照 + 终态注销 + 准入 + sweep
+        std::atomic<bool> running_{false}; // 生命周期标志：start 准入 / stop 幂等守卫 / run_schedule 准入闸门
         bool schedule_needed_ = false; // 调度线程需被唤醒
         bool net_allowed_ = true; // 流量闸门：false=关闭（不准入新任务）；默认开启，不持久化，由调用方重启后重新下发
         int32_t max_concurrent_ = 3;
