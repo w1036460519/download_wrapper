@@ -27,17 +27,27 @@ jobs:
             triplet: ''            # 见下方 macOS 专用步骤，单独处理双 triplet
             output: download-macos-universal.dylib
             bincache: ~/.cache/vcpkg/archives
-          # Linux 仅 x86_64
+          # Linux：x86_64 + arm64
           - name: linux-x64
             os: ubuntu-24.04
             triplet: x64-linux
             output: download-linux-x64.so
             bincache: ~/.cache/vcpkg/archives
-          # Windows 仅 x64（static-md：依赖静态链入 DLL，CRT 用系统动态运行时，产物自包含）
+          - name: linux-arm64
+            os: ubuntu-24.04
+            triplet: arm64-linux
+            output: download-linux-arm64.so
+            bincache: ~/.cache/vcpkg/archives
+          # Windows：x64 + arm64（static-md：依赖静态链入 DLL，CRT 用系统动态运行时，产物自包含）
           - name: windows-x64
             os: windows-2022
             triplet: x64-windows-static-md
             output: download-windows-x64.dll
+            bincache: ~\AppData\Local\vcpkg\archives
+          - name: windows-arm64
+            os: windows-2022
+            triplet: arm64-windows-static-md
+            output: download-windows-arm64.dll
             bincache: ~\AppData\Local\vcpkg\archives
           # iOS：真机 arm64 静态库（.a）。iOS 不允许加载未签名独立动态库，
           # 故编静态库并合并依赖为自包含胖库，随 Runner 链接
@@ -157,7 +167,7 @@ jobs:
 
       # ---------- Linux / Windows：单架构 ----------
       - name: Build (${{ matrix.name }})
-        if: matrix.name == 'linux-x64' || matrix.name == 'windows-x64'
+        if: matrix.name == 'linux-x64' || matrix.name == 'linux-arm64' || matrix.name == 'windows-x64' || matrix.name == 'windows-arm64'
         shell: bash
         run: |
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
@@ -173,7 +183,7 @@ jobs:
 
           # strip 符号：仅 Linux 的 .so 需手动裁剪（仍带静态链入依赖的符号表）；
           # Windows 符号已分离到 .pdb，.dll 本身无需 strip。
-          if [ "${{ matrix.name }}" = "linux-x64" ]; then
+          if [[ "${{ matrix.name }}" == linux-* ]]; then
             echo "== strip 前 =="
             ls -l dist
             strip --strip-unneeded "dist/${{ matrix.output }}"
@@ -215,25 +225,25 @@ jobs:
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
           export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
 
-          # arm64 模拟器
+          # arm64 模拟器（Apple Silicon Mac）
           cmake -B build-sim-arm64 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_SYSROOT=iphonesimulator \
             -DDW_BUILD_SHARED=OFF \
-            -DVCPKG_TARGET_TRIPLET=arm64-ios \
+            -DVCPKG_TARGET_TRIPLET=arm64-ios-simulator \
             -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
           cmake --build build-sim-arm64 --config Release
 
-          # x86_64 模拟器
+          # x86_64 模拟器（Intel Mac）
           cmake -B build-sim-x64 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_SYSROOT=iphonesimulator \
             -DDW_BUILD_SHARED=OFF \
-            -DVCPKG_TARGET_TRIPLET=x64-osx \
+            -DVCPKG_TARGET_TRIPLET=x64-ios-simulator \
             -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
           cmake --build build-sim-x64 --config Release
 
@@ -241,8 +251,8 @@ jobs:
           # 合并各自依赖为自包含胖静态库
           SELF_ARM64=$(find build-sim-arm64 -name "download-ios-simulator-arm64.a" | head -1)
           SELF_X64=$(find build-sim-x64 -name "download-ios-simulator-x64.a" | head -1)
-          DEP_ARM64=$(find . -type d -path "*vcpkg_installed/arm64-ios/lib" | head -1)
-          DEP_X64=$(find . -type d -path "*vcpkg_installed/x64-osx/lib" | head -1)
+          DEP_ARM64=$(find . -type d -path "*vcpkg_installed/arm64-ios-simulator/lib" | head -1)
+          DEP_X64=$(find . -type d -path "*vcpkg_installed/x64-ios-simulator/lib" | head -1)
 
           # 先分别合并为单架构胖库
           libtool -static -o "$RUNNER_TEMP/sim-arm64.a" "$SELF_ARM64" "$DEP_ARM64"/*.a
