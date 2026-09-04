@@ -143,9 +143,16 @@ namespace dw {
         /// 调度线程不再准入新任务；true 时唤醒调度按 QUEUED→准入路径自动重启。
         void set_network_allowed(bool allowed);
 
-        // ---- 任务文件持久化 ----
+        // ---- 任务文件实时查询（task_files 表已移除，磁盘为事实源） ----
 
-        /// 从数据库加载任务的文件列表。
+        /// 解析任务内文件的物理路径与大小（dw_get_task_file_info 消费）。
+        /// HTTP：save_path/content_root/name 推导；BT：handle 在线实时查询。
+        /// @return false=无法解析（定名未落定 / handle 离线 / 序号越界）。
+        bool resolve_file_path(dw_protocol_t proto, const std::string &natural_key,
+                               int32_t file_index, std::string &out_path, int64_t &out_size);
+
+        /// 任务文件列表：BT 引擎实时查询（选中文件，handle 离线返回空）；
+        /// HTTP 从任务记录推导单文件条目。节点字符串堆分配，调用方负责 free。
         std::vector<dw_file_info_t> load_files(dw_protocol_t proto, const std::string &natural_key);
 
         // ---- 本地文件浏览与管理 ----
@@ -253,6 +260,13 @@ namespace dw {
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
         IDownloadEngine *engine_of(dw_protocol_t proto) const;
 
+        // 解析任务内文件的物理路径与大小（假定已持 mtx_）：HTTP 从任务记录推导
+        // （wrapper 模型 save_path/content_root/name）；BT 经引擎 handle 实时查询。
+        // 返回 false=任务不存在 / 定名未落定 / handle 离线 / 序号越界。
+        bool resolve_file_path_locked(dw_protocol_t proto, const std::string &natural_key,
+                                      int32_t file_index, std::string &out_path,
+                                      int64_t &out_size);
+
         // 定名落库（假定已持 mtx_）：抢占唯一 wrapper 名并创建 wrapper 目录占位 →
         // 回写 name=wrapper（可能含 (n) 后缀）、save_path=原 dir（不变）、filename=inner_name
         // （仅在 !multi_file 时记录）并 update。返回 wrapper 名（可能含 (n) 后缀），
@@ -276,11 +290,12 @@ namespace dw {
         void unregister_task(const std::string &union_id);
 
 
-        // 错误任务重新入队前的残留态清理：两协议均清 resume_data + file_segments；
+        // 错误任务重新入队前的残留态清理：两协议均清 resume_data（进度缓存保留供重启恢复）；
         // HTTP 额外复位进度令其从零重下并避免 UI 残留旧进度。非错误态直接跳过。
         void reset_error_task_for_restart(TaskRecord &task_record);
 
-        // 将活引擎的已下载连续区间快照落库（HTTP 单文件 index=0，BT 遍历已选 file_indexes）；
+        // HTTP 周期快照：单文件已下载连续区间全量重写落库（file_index=0）；
+        // BT 进度由 FILE_PROGRESS 事件（piece 驱动）增量维护不经此路径。
         // 供任务未加载进引擎时的播放兜底。假定已持 mtx_，仅短暂访问引擎自有锁，无死锁。
         // 同时检查文件/任务级完成条件。
         void snapshot_segments_locked(TaskRecord &task_record);

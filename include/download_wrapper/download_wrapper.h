@@ -416,6 +416,7 @@ typedef struct dw_file_record {
     bool is_remote;         /**< 远程标识。 */
     char *save_path;        /**< 保存路径。 */
     char *root_name;        /**< 根目录/文件名。 */
+    char *full_path;        /**< 磁盘根实体全路径（save_path/root_name）；占位阶段为空串。 */
     bool file_type;         /**< true=目录 false=文件。 */
     dw_protocol_t task_protocol; /**< 关联任务协议（DW_PROTOCOL_LOCAL=无关联）。 */
     char *task_natural_key; /**< 关联任务的 natural_key（无关联时为空串）。 */
@@ -650,8 +651,8 @@ DW_API void dw_byte_range_free(dw_byte_range_t *ranges, int32_t count);
 /**
  * 查询任务指定文件的物理路径与总大小（边下边播代理用）。
  *
- * 按 save_path/content_root 拼接物理路径（save_path 已含包层目录）；
- * BT 多文件另经 task_files 表按 file_index 查 name（name 已含完整相对路径）。
+ * HTTP 按任务记录推导（save_path/content_root/name，wrapper 目录模型）；
+ * BT 经引擎 handle 实时查询（move_storage 后自动跟随新路径，离线返回失败）。
  *
  * @param key         任务唯一键。
  * @param file_index  文件索引（HTTP 恒 0）。
@@ -683,7 +684,7 @@ DW_API int32_t dw_set_playing_file(const dw_task_key_t *key,
                                    dw_submit_result_t *out_result);
 
 /**
- * 写入文件播放进度（毫秒），落 task_files 表。由 App 侧防抖调用。
+ * 写入文件播放进度（毫秒），按物理路径落 play_progress 表。由 App 侧防抖调用。
  *
  * 与下载协议无关，wrapper 只存不解释播放语义。
  *
@@ -755,18 +756,20 @@ DW_API int32_t dw_set_task_priority(const dw_task_key_t *key,
                                     int32_t priority_file_index_size);
 
 /* ================================================================== */
-/*                        任务文件持久化                              */
+/*                        任务文件查询                                */
 /* ================================================================== */
 
 /**
- * 从数据库加载任务的文件信息（无需引擎运行）。
+ * 获取任务的文件清单（实时查询，task_files 表已移除）。
  *
- * 用于任务详情页展示文件列表；即使引擎句柄已释放仍可读取。
+ * 用于任务详情页展示文件列表。BT 经引擎 handle 实时查询（需引擎在线，
+ * QUEUED 未恢复 / ERROR 态无清单）；HTTP 由任务记录推导（wrapper 目录模型），
+ * 离线亦可返回。
  *
  * @param key       任务唯一键。
  * @param out_files 输出：堆分配的文件信息数组（调用者 dw_file_list_free 释放）。
  * @param out_count 输出：文件数量。
- * @return          0=成功，-1=失败（任务不存在或无文件记录）。
+ * @return          0=成功，-1=失败（任务不存在 / 无文件记录 / BT 引擎离线）。
  */
 DW_API int32_t dw_load_task_files(const dw_task_key_t *key,
                                   dw_file_info_t **out_files,

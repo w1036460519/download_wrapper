@@ -38,6 +38,7 @@ namespace dw {
         BT_RESUMED, // BT 引擎已实际恢复（libtorrent handle.resume 已生效），由 alert 线程确认后投递
         DELETED, // 任务已从引擎移除（remove_torrent 收敛 / handle 无效直接删除），wrapper 据此回收资源
         TASK_FILES, // 任务文件列表推送（HTTP 响应头就绪后推送单文件信息）
+        FILE_PROGRESS, // 文件进度区间就绪（BT 连续 piece 达阈值后合并上报，HTTP 无此事件）
     };
 
     /**
@@ -77,6 +78,16 @@ namespace dw {
 
         // DELETED 事件字段
         int32_t delete_files = 0; // 是否删除落盘文件（1=删，0=不删）
+
+        // TASK_FILES 事件字段（HTTP 磁盘定名就绪）：name=判重后 wrapper 目录名
+        //（磁盘根实体名），files[0].name=原始文件名（含后缀）。
+
+        // FILE_PROGRESS 事件字段（BT：连续 piece 达 1% 阈值后合并的文件内区间）
+        int32_t file_index = -1; // 目标文件索引（libtorrent 文件序号，-1=未设置）
+        std::string file_path; // 文件物理路径（引擎侧拼好，handle 视角 save_path/相对路径）
+        int64_t offset_start = 0; // 区间起点（文件内相对偏移，含）
+        int64_t offset_end = 0; // 区间终点（文件内相对偏移，含）
+        int64_t file_size = 0; // 文件总大小（bytes，供完成判定）
     };
 
     // ---- 枚举名称序列化（供 to_string 重载使用）----
@@ -92,6 +103,7 @@ namespace dw {
             case EngineEventType::BT_RESUMED: return "BT_RESUMED";
             case EngineEventType::DELETED: return "DELETED";
             case EngineEventType::TASK_FILES: return "TASK_FILES";
+            case EngineEventType::FILE_PROGRESS: return "FILE_PROGRESS";
             default: return "UNKNOWN";
         }
     }

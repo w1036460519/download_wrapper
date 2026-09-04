@@ -149,6 +149,19 @@ public:
     int32_t move_storage(const char* task_id, const char* new_save_path) override;
 
     /**
+     * 文件路径实时查询：handle 在线时按文件序号解析物理路径与大小。
+     * @return false=handle 离线（任务不在 session / 元数据未就绪 / 序号越界）。
+     */
+    bool get_file_path(const char* task_id, int32_t file_index,
+                       std::string& out_path, int64_t& out_size) override;
+
+    /**
+     * 文件列表实时查询：选中文件的扁平清单（pad 文件过滤，优先级口径与
+     * PARSED 上报一致）。节点字符串堆分配，调用方负责 free。
+     */
+    std::vector<dw_file_info_t> get_file_list(const char* task_id) override;
+
+    /**
      * 周期性维护策略：回收已达做种分享率阈值的任务（remove_torrent 释放上下文）。
      * 由上层调度循环定时调用；无匹配任务时为空操作。
      */

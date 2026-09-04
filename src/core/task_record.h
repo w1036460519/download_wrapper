@@ -66,9 +66,11 @@ struct TaskRecord {
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
     std::string              save_path;     // 用户指定的保存目录（固定不变）
-    std::string              content_root;  // save_path 下的包装目录名（仅冲突/多根时非空）
-                                             // 空 = 未包装（内容直接落 save_path 下）。
-                                             // 本地任务的 raw_key 也指向此字段。
+    std::string              content_root;  // save_path 下的磁盘根文件/目录名（恒非空，取判重后根名）；
+                                             // 物理前缀按 is_directory 分支：目录 = save_path/content_root，
+                                             // 单文件 = save_path（content_root 即文件名本身）。
+                                             // HTTP 暂未接入（保持空占位）；本地任务的 raw_key 也指向此字段。
+    bool                     is_directory = true; // 磁盘根实体形态：BT 首次 PARSED 落定；HTTP 恒为 false（单文件）
     std::string              url;           // HTTP 身份 + 下载地址（HTTP 时 raw_key 指向此字段）
     std::string              info_hash;     // BT 身份（BT 时 raw_key 指向此字段），HTTP 该字段为空
     std::string              magnet_link;   // BT
@@ -131,7 +133,9 @@ struct FileRecord {
     bool        is_remote = false;  // 远程标识
     std::string save_path;          // 保存路径
     std::string root_name;          // 根目录/文件名（占位→修正）
+    std::string full_path;          // 磁盘根实体全路径（save_path/root_name，目录与单文件统一公式）；占位空串，PARSED 回填
     bool        file_type = true;   // 0=文件 1=目录
+    std::string ext;                // 文件后缀（不含点，如 "mp4"）；目录为空；add 占位空串，PARSED 回填
 
     // 任务关联（无关联时 protocol=LOCAL、natural_key 为空）
     dw_protocol_t task_protocol = DW_PROTOCOL_LOCAL;

@@ -97,7 +97,8 @@ std::string request_unique_name(const char*   engine_key,
                                 const char*   inner_name) {
     if (!engine_key || !dir || !wrapper_name) return wrapper_name ? wrapper_name : "";
     // 定名上调：TaskManager 持锁抢占唯一 wrapper 名并物化 wrapper 目录占位 →
-    // 回写任务并落库（持久预留）。alert 线程上调锁 mtx_ 与现有 on_task_files 同模式，无死锁。
+    // 回写任务并落库（持久预留）。引擎回调线程上调锁 mtx_，TaskManager 持锁期间
+    // 不回调引擎，无死锁。
     // multi_file 恒 false：本通道当前仅 HTTP 引擎使用，其落盘为单文件模型；
     // 若后续接入多文件协议，须由调用方按内容结构传入真实值。
     if (g_downloader && g_downloader->task_manager) {
@@ -465,7 +466,8 @@ DW_API int32_t dw_get_file_list(const dw_task_key_t* key,
     *out_files = nullptr;
     *out_count = 0;
 
-    // 从 task_files 表读取（文件元数据已由 PARSED 事件入库，downloaded_bytes 由周期快照更新）。
+    // 文件清单实时查询：BT 经 handle 在线查询（选中文件），HTTP 从任务记录推导；
+    // downloaded_bytes 由进度缓存聚合回填。
     const dw_protocol_t proto = key->protocol;
     const auto files = d->task_manager->load_files(proto, dw::natural_key_of(key));
     if (files.empty()) {
@@ -573,55 +575,14 @@ DW_API int32_t dw_get_task_file_info(const dw_task_key_t* key,
     *out_path = nullptr;
     *out_size = -1;
 
+    // 物理路径与大小统一经 TaskManager 解析：
+    // HTTP 从任务记录推导（wrapper 模型），BT 经引擎 handle 实时查询。
     const dw_protocol_t proto = key->protocol;
     const std::string nk = dw::natural_key_of(key);
-
-    // 持锁快照任务记录（save_path / content_root / protocol / total_size）
-    dw::TaskRecord rec;
-    {
-        std::lock_guard<std::mutex> lock(d->task_manager->get_mutex());
-        if (!d->task_manager->get_store().load_by_natural_key(
-                d->task_manager->client_id(),
-                static_cast<dw_protocol_t>(key->protocol),
-                nk, rec)) {
-            log_e("", "失败: 任务不存在 key_type=%d natural_key=%s",
-                    key->protocol, key->natural_key ? key->natural_key : "");
-            return -1;
-        }
-    }
-
-    // 物理路径构建：HTTP = save_path/name；BT = save_path/content_root/[task_files.name]
     std::string file_path;
     int64_t file_size = -1;
-
-    if (rec.protocol == DW_PROTOCOL_HTTP) {
-        // HTTP 单文件：name = 实际文件名，content_root 为空时直接 save_path/name
-        if (!rec.name.empty()) {
-            const std::filesystem::path base = rec.content_root.empty()
-                ? std::filesystem::path(rec.save_path)
-                : std::filesystem::path(rec.save_path) / rec.content_root;
-            file_path = (base / rec.name).string();
-            file_size = rec.total_size;
-        }
-    } else {
-        // BT：经 task_files 表按 file_index 查 name（name 已含完整相对路径）
-        const std::filesystem::path base = rec.content_root.empty()
-            ? std::filesystem::path(rec.save_path)
-            : std::filesystem::path(rec.save_path) / rec.content_root;
-        auto files = d->task_manager->load_files(proto, nk);
-        for (const auto& f : files) {
-            if (f.index == file_index) {
-                if (f.name && f.name[0]) {
-                    file_path = (base / f.name).string();
-                    file_size = f.size;
-                }
-                break;
-            }
-        }
-    }
-
-    if (file_path.empty()) {
-        log_e("", "失败: 无法构建文件路径 key_type=%d natural_key=%s fi=%d",
+    if (!d->task_manager->resolve_file_path(proto, nk, file_index, file_path, file_size)) {
+        log_e("", "失败: 无法解析文件路径 key_type=%d natural_key=%s fi=%d",
                 key->protocol, key->natural_key ? key->natural_key : "", file_index);
         return -1;
     }
@@ -732,7 +693,7 @@ DW_API int32_t dw_set_task_priority(const dw_task_key_t* key,
 }
 
 /* ------------------------------------------------------------------ */
-/*  任务文件持久化                                                    */
+/*  任务文件查询                                                      */
 /* ------------------------------------------------------------------ */
 
 DW_API int32_t dw_load_task_files(const dw_task_key_t* key,
@@ -748,7 +709,7 @@ DW_API int32_t dw_load_task_files(const dw_task_key_t* key,
         if (out_count) *out_count = 0;
         return -1;
     }
-    // 从 task_files 表按复合键关联加载（自然键入表外键）。
+    // 实时查询文件清单（task_files 表已移除）：BT 经引擎 handle，HTTP 由任务记录推导。
     const dw_protocol_t lf_proto = key->protocol;
     auto file_vec = d->task_manager->load_files(lf_proto, dw::natural_key_of(key));
     if (file_vec.empty()) {
@@ -909,13 +870,14 @@ DW_API int32_t dw_list_file_records(dw_file_record_t **out_records,
         arr[i].is_remote = r.is_remote;
         arr[i].save_path = dw::dup_cstr(r.save_path);
         arr[i].root_name = dw::dup_cstr(r.root_name);
+        arr[i].full_path = dw::dup_cstr(r.full_path);
         arr[i].file_type = r.file_type;
         arr[i].task_protocol = r.task_protocol;
         arr[i].task_natural_key = dw::dup_cstr(r.task_natural_key);
         // 字符串复制失败（内存不足）：回滚已分配的字段与数组，
         // 不向调用方返回含 NULL 字段的半成品快照。
         if (!arr[i].client_id || !arr[i].save_path ||
-            !arr[i].root_name || !arr[i].task_natural_key) {
+            !arr[i].root_name || !arr[i].full_path || !arr[i].task_natural_key) {
             log_e("", "失败: 文件记录字符串复制内存不足 i=%d n=%d", i, n);
             dw_file_record_list_free(arr, i + 1);
             *out_records = nullptr;
@@ -939,6 +901,7 @@ DW_API void dw_file_record_list_free(dw_file_record_t *records, int32_t count) {
         std::free(records[i].client_id);
         std::free(records[i].save_path);
         std::free(records[i].root_name);
+        std::free(records[i].full_path);
         std::free(records[i].task_natural_key);
     }
     std::free(records);

@@ -36,8 +36,11 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace lt = libtorrent;
@@ -60,6 +63,133 @@ namespace dw {
         double g_seed_ratio_limit = 3.0;
         // 事件投递目标
         class TaskManager* g_task_manager = nullptr;
+
+        // 前向声明：info_hash_hex 重载（定义在本文件下方）。
+        std::string info_hash_hex(const lt::torrent_handle &h);
+
+        // ---- 文件进度区间聚合（piece_finished_alert 驱动）----
+        // 每 (info_hash, file_index) 维护一个待上报区间：piece 连续到达时扩展区间，
+        // 断续或文件切换时结算。累计字节数达到阈值（1% 文件大小，兑底 4 个 piece）才上报。
+        struct ProgressAgg {
+            int64_t start = -1;   // 当前区间起点（文件内相对偏移）
+            int64_t end = -1;     // 当前区间终点（含）
+            int64_t bytes = 0;    // 区间累计字节数
+            int64_t file_size = 0; // 文件总大小（首个 piece 时记录）
+        };
+        std::mutex g_progress_mtx;
+        std::map<std::pair<std::string, int32_t>, ProgressAgg> g_progress_agg;
+        // 阈值兑底：4 个 piece（小文件也至少积累 4 piece 才上报，避免频繁写库）。
+        constexpr int64_t kProgressMinPieces = 4;
+
+        // piece 完成处理：切分到相交文件，聚合连续区间，达阈值上报 FILE_PROGRESS 事件。
+        // 仅内存操作 + 轻量事件投递，无 DB / IO（引擎回调性能约束）。
+        void handle_piece_finished(const lt::torrent_handle &h, lt::piece_index_t piece) {
+            if (!g_task_manager || !h.is_valid()) return;
+            std::shared_ptr<const lt::torrent_info> ti;
+            try {
+                ti = h.torrent_file();
+            } catch (...) {
+                return;
+            }
+            if (!ti) return;
+            const std::string key = info_hash_hex(h); // 循环外一次计算（一个 piece 可能跨多文件）
+            if (key.empty()) return;
+            const lt::file_storage &fs = ti->files();
+            const lt::piece_index_t last = ti->last_piece();
+            if (piece < lt::piece_index_t{0} || piece > last) return;
+
+            const int64_t piece_len = ti->piece_length();
+            const int64_t piece_start = static_cast<int64_t>(static_cast<int>(piece)) * piece_len;
+            const int64_t piece_end = piece_start + piece_len - 1; // 闭区间
+            const int64_t total = ti->total_size();
+            const int64_t clamped_end = std::min(piece_end, total - 1); // 尾 piece 截断
+
+            std::vector<EngineEvent> outs;
+            {
+                std::lock_guard<std::mutex> lk(g_progress_mtx);
+                // 遍历与该 piece 相交的全部文件（v1 torrent 一个 piece 可能跨文件）。
+                const int file_count = fs.num_files();
+                for (int i = 0; i < file_count; ++i) {
+                    const lt::file_index_t idx{i};
+                    if (fs.pad_file_at(idx)) continue;
+                    const int64_t f_off = fs.file_offset(idx);
+                    const int64_t f_size = fs.file_size(idx);
+                    if (f_size <= 0) continue;
+                    const int64_t f_end = f_off + f_size - 1;
+                    // 无交集
+                    if (piece_start > f_end || clamped_end < f_off) continue;
+
+                    // 文件内相对偏移（闭区间）
+                    const int64_t s = std::max(piece_start, f_off) - f_off;
+                    const int64_t e = std::min(clamped_end, f_end) - f_off;
+                    if (e < s) continue;
+
+                    ProgressAgg &agg = g_progress_agg[{key, i}];
+                    // 阈值：1% 文件大小，兑底 4 个 piece 字节。
+                    const int64_t threshold = std::max(f_size / 100,
+                                                       kProgressMinPieces * piece_len);
+                    if (agg.file_size == 0) agg.file_size = f_size;
+                    if (agg.start < 0 || s > agg.end + 1) {
+                        // 新区间（首个或与前段断续）：旧区间达阈值则结算，未达按 1% 语义丢弃。
+                        if (agg.start >= 0 && agg.bytes >= threshold) {
+                            EngineEvent ev;
+                            ev.type = EngineEventType::FILE_PROGRESS;
+                            ev.file_index = i;
+                            ev.offset_start = agg.start;
+                            ev.offset_end = agg.end;
+                            ev.file_size = agg.file_size;
+                            outs.push_back(std::move(ev));
+                        }
+                        agg.start = s;
+                        agg.end = e;
+                        agg.bytes = e - s + 1;
+                    } else {
+                        // 连续扩展（可能重叠，取最大端）。
+                        agg.end = std::max(agg.end, e);
+                        agg.bytes = agg.end - agg.start + 1;
+                    }
+                    // 覆盖文件尾：末段区间已完整，即时结算（不受 1% 阈值约束，否则末段
+                    // 无后续触发点将缺失到任务终态）；结算后清聚合器。
+                    if (e == f_size - 1) {
+                        EngineEvent ev;
+                        ev.type = EngineEventType::FILE_PROGRESS;
+                        ev.file_index = i;
+                        ev.offset_start = agg.start;
+                        ev.offset_end = agg.end;
+                        ev.file_size = agg.file_size;
+                        outs.push_back(std::move(ev));
+                        agg.start = -1;
+                        agg.end = -1;
+                        agg.bytes = 0;
+                    }
+                }
+            }
+            // 结算事件统一补物理路径：handle 当前 save_path / 文件相对路径。
+            // 仅达阈值结算时发生（频率受 1% 阈值约束），单次 status 查询可接受；
+            // 路径解析失败置空，消费侧按空路径守卫丢弃。
+            if (!outs.empty()) {
+                std::string sp;
+                try {
+                    sp = h.status(lt::torrent_handle::query_save_path).save_path;
+                } catch (...) {
+                }
+                for (auto &ev: outs) {
+                    try {
+                        if (!sp.empty()) {
+                            ev.file_path = (std::filesystem::path(sp) /
+                                            fs.file_path(lt::file_index_t{ev.file_index})).string();
+                        }
+                    } catch (...) {
+                        ev.file_path.clear();
+                    }
+                }
+            }
+            for (auto &ev: outs) {
+                ev.engine_key = key;
+                ev.protocol = DW_PROTOCOL_TORRENT;
+                g_task_manager->on_engine_event(std::move(ev));
+            }
+        }
 
         // 从 info_hash_t 提取 hex（优先 v2，回退 v1）
         std::string info_hash_hex(const lt::info_hash_t &ih) {
@@ -125,8 +255,10 @@ namespace dw {
         }
 
         // 前向声明：扁平文件列表构建（供 PARSED 事件与 fill_file_list 复用）。
+        // priorities 非空时仅收录非 dont_download 的文件（用户选中集）；空指针 = 不过滤。
         std::vector<dw_file_info_t> build_flat_file_list(
-            const std::shared_ptr<const lt::torrent_info> &ti);
+            const std::shared_ptr<const lt::torrent_info> &ti,
+            const std::vector<lt::download_priority_t> *priorities = nullptr);
 
         // 构建解析完成事件
         EngineEvent build_parsed_event(const lt::torrent_handle &h) {
@@ -145,7 +277,10 @@ namespace dw {
                 }
                 ev.name = ti->name();
                 ev.save_path = st.save_path;
-                ev.files = build_flat_file_list(ti);
+                // 仅上报待下载文件：dont_download 优先级的文件（未选中）不上报。
+                // 默认全选时所有文件均为 default/更高优先级，自然全部包含。
+                const auto priorities = h.get_file_priorities();
+                ev.files = build_flat_file_list(ti, &priorities);
             } catch (...) {
                 ev.engine_key.clear(); // 异常时返回空事件
             }
@@ -196,6 +331,10 @@ namespace dw {
                 if (EngineEvent ev = build_parsed_event(mr->handle); !ev.engine_key.empty()) {
                     if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
                 }
+            }
+            // piece 完成：维护文件进度区间（连续达 1% 阈值后合并上报）
+            else if (const auto *pf = lt::alert_cast<lt::piece_finished_alert>(a)) {
+                handle_piece_finished(pf->handle, pf->piece_index);
             }
             // 下载完成
             else if (const auto *tf = lt::alert_cast<lt::torrent_finished_alert>(a)) {
@@ -401,9 +540,10 @@ namespace dw {
             return 0;
         }
 
-        // 扁平文件列表
+        // 扁平文件列表（可按 file_priorities 过滤未选中文件）
         std::vector<dw_file_info_t> build_flat_file_list(
-            const std::shared_ptr<const lt::torrent_info> &ti) {
+            const std::shared_ptr<const lt::torrent_info> &ti,
+            const std::vector<lt::download_priority_t> *priorities) {
             std::vector<dw_file_info_t> files;
             const lt::file_storage &fs = ti->files();
             const int file_count = fs.num_files();
@@ -420,6 +560,11 @@ namespace dw {
                 const lt::file_index_t idx{i};
                 // 过滤 pad 文件
                 if (fs.pad_file_at(idx)) continue;
+                // 过滤未选中文件（dont_download）：用户指定部分下载时仅上报选中集。
+                if (priorities && i < static_cast<int>(priorities->size())
+                    && (*priorities)[static_cast<size_t>(i)] == lt::download_priority_t{0}) {
+                    continue;
+                }
                 const std::string path = fs.file_path(idx);
                 dw_file_info_t f{};
                 f.index = i;
@@ -471,10 +616,10 @@ namespace dw {
         }
         try {
             lt::settings_pack pack;
-            // 仅订阅错误、状态更新与存储（元数据就绪改名的 rename 事件），屏蔽 peer/piece/block 等细粒度事件
+            // 订阅错误、状态、存储与 piece 完成（进度区间维护）；屏蔽 peer/block 等细粒度事件
             pack.set_int(lt::settings_pack::alert_mask,
                          lt::alert_category::error | lt::alert_category::status
-                         | lt::alert_category::storage);
+                         | lt::alert_category::storage | lt::alert_category::piece_progress);
 
             int listen_port = 0;
             if (cfg) {
@@ -834,10 +979,9 @@ namespace dw {
                 const std::string key = info_hash_hex(handle);
                 try {
                     g_session->remove_torrent(handle);
-                    log_i(key.c_str(), "分享率达标，释放完成 key=%s", key.c_str());
+                    log_i(key.c_str(), "分享率达标，释放完成");
                 } catch (const std::exception &e) {
-                    log_e(key.c_str(), "分享率达标，释放失败 key=%s msg=%s",
-                                key.c_str(), e.what());
+                    log_e(key.c_str(), "分享率达标，释放失败 msg=%s", e.what());
                 }
             }
         }
@@ -879,6 +1023,45 @@ namespace dw {
         }
         log_i(key.c_str(), "迁移发起: -> '%s'", new_save_path);
         return 1;
+    }
+
+    bool TorrentEngine::get_file_path(const char *task_id, int32_t file_index,
+                                      std::string &out_path, int64_t &out_size) {
+        if (!task_id || !task_id[0] || file_index < 0) return false;
+        const lt::torrent_handle h = find_handle(std::string(task_id));
+        if (!h.is_valid()) return false;
+        try {
+            const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
+            if (!ti || file_index >= ti->files().num_files()) return false;
+            const lt::file_index_t idx{file_index};
+            // 物理路径 = handle 当前 save_path / 文件相对路径（move_storage 后自动跟随）。
+            const std::string save_path =
+                    h.status(lt::torrent_handle::query_save_path).save_path;
+            out_path = (std::filesystem::path(save_path) / ti->files().file_path(idx)).string();
+            out_size = ti->files().file_size(idx);
+            return true;
+        } catch (const std::exception &e) {
+            log_e(task_id, "文件路径查询异常: %s", e.what());
+            return false;
+        }
+    }
+
+    std::vector<dw_file_info_t> TorrentEngine::get_file_list(const char *task_id) {
+        std::vector<dw_file_info_t> out;
+        if (!task_id || !task_id[0]) return out;
+        const lt::torrent_handle h = find_handle(std::string(task_id));
+        if (!h.is_valid()) return out;
+        try {
+            const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
+            if (!ti) return out;
+            // 优先级口径与 PARSED 上报一致：仅选中文件（dont_download 不含）。
+            const auto priorities = h.get_file_priorities();
+            out = build_flat_file_list(ti, &priorities);
+        } catch (const std::exception &e) {
+            log_e(task_id, "文件列表查询异常: %s", e.what());
+            out.clear();
+        }
+        return out;
     }
 
     void TorrentEngine::post_updates() {

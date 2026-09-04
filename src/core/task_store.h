@@ -65,7 +65,7 @@ public:
     /// 仅更新任务状态（轻量操作，避免全字段 UPDATE）。
     void update_status(const std::string &client_id, dw_protocol_t protocol,
                        const std::string &natural_key, int32_t status);
-    /// 删除任务及其 resume_data / task_files / file_segments（统一按复合键）。
+    /// 删除任务及其 resume_data / file_progress_cache（统一按复合键）。
     void remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key);
     /// 写入 / 覆盖断点续传数据。
     void save_resume(const std::string &client_id, dw_protocol_t protocol,
@@ -75,69 +75,61 @@ public:
                                      const std::string &natural_key);
     /// 仅清除某任务的断点续传数据。
     void clear_resume(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key);
-    
-    /// 查询指定文件的完整物理路径（task_files 表）；不存在返回空串。
-    std::string load_file_physical_path(const std::string &client_id, dw_protocol_t protocol,
-                                        const std::string &natural_key, int32_t file_index) const;
 
     // ---- 文件目录表（file_records）----
 
     /// 新增文件记录：自增 id 回填到 r.id。
     void insert_file_record(FileRecord &r);
+    /// 按任务关联三要素（client_id + task_protocol + task_natural_key）判存，
+    /// 用于占位插入的幂等检查，避免重复新建。
+    bool has_file_record(const std::string &client_id, dw_protocol_t task_protocol,
+                         const std::string &task_natural_key) const;
     /// 载入指定客户端的全部文件记录（按 modified_at DESC）。
     std::vector<FileRecord> load_file_records(const std::string &client_id);
     /// 同步文件记录的进度冗余字段（status/total_size/total_done），免全字段 UPDATE。
     void sync_file_record_progress(dw_protocol_t task_protocol, const std::string &task_natural_key,
                                    int32_t status, int64_t total_size, int64_t total_done);
-    /// 按任务关联键更新文件记录的 root_name 和 file_type（PARSED 后修正）。
-    void update_file_record_meta(dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                 const std::string &root_name, bool file_type);
+    /// 按任务关联三要素（client_id + task_protocol + task_natural_key）更新文件记录的
+    /// root_name、full_path、file_type 和 ext（PARSED 后修正为判重后根名、
+    /// 磁盘根实体全路径、实际形态与文件后缀）。
+    /// full_path = save_path/root_name（目录与单文件统一公式）；
+    /// ext 不含点（如 "mp4"），目录场景传空串保持 NULL。
+    void update_file_record_meta(const std::string &client_id,
+                                 dw_protocol_t task_protocol, const std::string &task_natural_key,
+                                 const std::string &root_name, const std::string &full_path,
+                                 bool file_type, const std::string &ext);
 
-    // ---- 任务文件信息 ----
-    
-    /// 全量重写任务节点树（先删后插，事务包裹）。
-    /// @param physical_path_prefix 物理路径前缀（save_path 或 save_path/content_root），
-    ///        与文件 name 拼接得到完整物理路径。
-    void save_task_files(const std::string &client_id, dw_protocol_t protocol,
-                         const std::string &natural_key,
-                         const std::vector<dw_file_info_t>& files,
-                         const std::string &physical_path_prefix);
-    /// 加载任务节点树（按 file_index 升序）；不存在返回空 vector。
-    std::vector<dw_file_info_t> load_task_files(const std::string &client_id, dw_protocol_t protocol,
-                                                const std::string &natural_key);
-    /// 任务级 0→2 传播：将全部文件节点置为完成正常（不触碰已删除态）。
-    void mark_task_files_completed(const std::string &client_id, dw_protocol_t protocol,
-                                   const std::string &natural_key);
-    /// 单文件完成标记：将指定 (key, file_index) 的文件节点置为完成（幂等，已删除态不触碰）。
-    void mark_file_completed(const std::string &client_id, dw_protocol_t protocol,
-                             const std::string &natural_key, int32_t file_index);
-    /// 批量更新文件的已下载字节数（事务包裹）；由 snapshot_segments_locked 从 ranges 推导后调用。
-    void update_downloaded_bytes(const std::string &client_id, dw_protocol_t protocol,
-                                 const std::string &natural_key,
-                                 const std::vector<std::pair<int32_t, int64_t>>& file_bytes);
-    /// 单条文件节点懒创建 / 进度推送（upsert）：存在则更新 downloaded_bytes（必要时 size），
-    /// 不存在则插入一行（name='' 探测占位、offset=0、status=0）。HTTP 探测定名时、BT
-    /// 元数据全量上报之外的进度推送均走此路径，保证 task_files 随进度按需落地，不必
-    /// 一次性写齐。元数据靠后续 save_task_files 全量写时补齐（name/ext/offset）。
-    void upsert_task_file(const std::string &client_id, dw_protocol_t protocol,
-                          const std::string &natural_key, int32_t file_index,
-                          int64_t downloaded_bytes, int64_t total_size);
-    
     // ---- 播放进度（独立表 play_progress，以物理路径为键）----
-    
-    /// 写入 / 覆盖文件播放进度（毫秒）；经 task_files 解析物理路径后写 play_progress。
-    void set_play_position(const std::string &client_id, dw_protocol_t protocol,
-                           const std::string &natural_key, int32_t file_index, int64_t position_ms);
+
+    /// 写入 / 覆盖文件播放进度（毫秒）。物理路径由调用方（TaskManager）解析后直传。
+    void set_play_position(const std::string &file_path, int64_t position_ms);
     /// 读取文件播放进度（毫秒）；无记录返回 0。
-    int64_t get_play_position(const std::string &client_id, dw_protocol_t protocol,
-                              const std::string &natural_key, int32_t file_index);
+    int64_t get_play_position(const std::string &file_path);
     
-    // ---- 已下载区间快照（以物理路径为键）----
-    
-    /// 批量覆盖写入多文件的已下载区间快照（单事务）。
-    void save_segments_batch(const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t>>>& file_segments);
-    /// 读取某文件的已下载区间快照（按 seg_start 升序）；不存在返回空 vector。
-    std::vector<dw_byte_range_t> load_segments(const std::string &physical_path, int32_t file_index);
+    // ---- 文件下载进度缓存（file_progress_cache：三要素 + file_index 定位，物理路径供 App 关联）----
+    // 区间为闭区间 [offset_start, offset_end]；engine 侧按 1% 文件大小（兑底 4 piece）判定后才入库。
+
+    /// 全量重写多个文件的进度区间（单事务）：先删该文件旧区间再插入，HTTP 周期快照用。
+    void replace_file_progress(const std::string &client_id, dw_protocol_t protocol,
+                              const std::string &natural_key,
+                              const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t>>> &file_ranges);
+    /// 增量合并一个下载区间（BT piece 事件驱动）：与既有区间重叠/相邻则合并为一行，
+    /// 返回该文件合并后的累计已下载字节（供调用方判定文件完成）。
+    int64_t upsert_file_progress(const std::string &client_id, dw_protocol_t protocol,
+                                 const std::string &natural_key, int32_t file_index,
+                                 const std::string &physical_path,
+                                 int64_t offset_start, int64_t offset_end);
+    /// 按文件删除进度缓存（文件下载完成，区间失去意义）。
+    void delete_file_progress_by_file(const std::string &client_id, dw_protocol_t protocol,
+                                     const std::string &natural_key, int32_t file_index);
+    /// 按任务删除全部进度缓存（任务删除级联）。
+    void delete_file_progress_by_task(const std::string &client_id, dw_protocol_t protocol,
+                                     const std::string &natural_key);
+    /// 聚合文件累计已下载字节；无记录返回 0。
+    int64_t sum_file_progress_by_file(const std::string &client_id, dw_protocol_t protocol,
+                                      const std::string &natural_key, int32_t file_index) const;
+    /// 按物理路径读取某文件的已下载区间（按 offset_start 升序）；不存在返回空 vector。
+    std::vector<dw_byte_range_t> load_segments(const std::string &physical_path, int32_t file_index) const;
 
 private:
     sqlite3* db_ = nullptr;

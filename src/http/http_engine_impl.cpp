@@ -665,8 +665,9 @@ namespace dw {
                                     "HTTP 判重：wrapper 包层 '%s' -> '%s'", wrapper.c_str(), unique.c_str());
                     }
                 
-                    // HTTP 单文件模型：头到齐即可确定最终文件，推单条根层文件节点。
-                    // 指针字段仅在调用期有效，库内深拷落库。
+                    // HTTP 单文件模型：头到齐即可确定最终文件，推定名事件（TASK_FILES）。
+                    // name=判重后 wrapper 目录名（磁盘根实体），files[0].name=原始文件名（含后缀）。
+                    // 指针字段仅在调用期有效，TaskManager 消费时按值拷贝。
                     dw_file_info_t f{};
                     f.index = 0;
                     f.name = const_cast<char *>(raw_name.c_str());
@@ -680,6 +681,7 @@ namespace dw {
                     ev.type = EngineEventType::TASK_FILES;
                     ev.engine_key = tCtx->url;
                     ev.protocol = DW_PROTOCOL_HTTP;
+                    ev.name = unique; // 判重后 wrapper 目录名
                     ev.files.push_back(f);
                     if (g_task_manager) {
                         g_task_manager->on_engine_event(std::move(ev));

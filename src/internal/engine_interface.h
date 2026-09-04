@@ -17,6 +17,7 @@
 #include "download_wrapper/download_wrapper.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace dw {
@@ -97,6 +98,16 @@ public:
     /// 判重决策归 TaskManager（重名时目标为 save_path/唯一包层目录）。
     /// @return 0=已一致空操作，1=已发起异步迁移，-1=失败（任务不存在等）。
     virtual int32_t move_storage(const char* /*id*/, const char* /*new_save_path*/) { return -1; }
+
+    /// 文件路径实时查询（BT 覆写）：按 libtorrent 文件序号解析物理路径与大小。
+    /// 依赖 handle 在线（任务在 session 中）；离线（未恢复/已删除/元数据未就绪）
+    /// 返回 false。HTTP 单文件不实现，由 TaskManager 从任务记录推导。
+    virtual bool get_file_path(const char* /*id*/, int32_t /*file_index*/,
+                               std::string& /*out_path*/, int64_t& /*out_size*/) { return false; }
+
+    /// 文件列表实时查询（BT 覆写）：返回选中文件的扁平清单（pad 文件已过滤）。
+    /// 各节点字符串字段为堆分配，调用方负责 free；handle 离线返回空。
+    virtual std::vector<dw_file_info_t> get_file_list(const char* /*id*/) { return {}; }
 };
 
 } // namespace dw

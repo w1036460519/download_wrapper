@@ -146,8 +146,8 @@ namespace dw {
 
         if (!validate_add_input(url, params->save_path, &err)) {
             set_result(out_result, url, DW_REASON_ERROR, nullptr,
-                       "validate_add_input failed: url=%s output=%s err=%s",
-                       url ? url : "", params->save_path ? params->save_path : "", err);
+                       "validate_add_input failed: output=%s err=%s",
+                       params->save_path ? params->save_path : "", err);
             return -1;
         }
 
@@ -190,7 +190,7 @@ namespace dw {
         auto tCtx_guard = task_create_new(url, params->save_path);
         if (!tCtx_guard) {
             set_result(out_result, url, DW_REASON_ERROR, nullptr,
-                       "task_create_new failed: url=%s", url);
+                       "task_create_new failed");
             return -1;
         }
         dl_task_ctx *tCtx = tCtx_guard.get();
@@ -254,7 +254,7 @@ namespace dw {
         } catch (...) { inserted = false; }
         if (!inserted) {
             set_result(out_result, url, DW_REASON_ERROR, nullptr,
-                       "g_tasks.emplace failed: url=%s", url);
+                       "g_tasks.emplace failed");
             return -1;
         }
 
@@ -263,9 +263,9 @@ namespace dw {
         log_i(tCtx->url.c_str(),
                     "HTTP add_task 成功: output=%s probing=%d",
                     tCtx->output_path.c_str(), tCtx->probing);
+        // 成功路径（DW_REASON_NONE）set_result 不输出日志，上方 log_i 已记录，此处不再传 fmt。
         set_result(out_result, url, DW_REASON_NONE,
-                   tCtx->probing ? nullptr : "跳过探测，使用 resume_data",
-                   "add_task ok: url=%s probing=%d", tCtx->url.c_str(), tCtx->probing);
+                   tCtx->probing ? nullptr : "跳过探测，使用 resume_data", nullptr);
         return 0;
     }
 
@@ -457,8 +457,7 @@ namespace dw {
             if (owned->task_thread.joinable()) owned->task_thread.join();
             owned.reset(); // 显式析构关闭全部分片文件句柄
             log_i(url.c_str(),
-                        deleting ? "删除回收 HTTP 上下文 url=%s"
-                                 : "终态回收 HTTP 上下文 url=%s", url.c_str());
+                  deleting ? "删除回收 HTTP 上下文" : "终态回收 HTTP 上下文");
             // 删除中任务：回收完成后发 DELETED 事件，wrapper 据此回收资源 + 删文件。
             if (deleting) {
                 if (he::g_task_manager) {

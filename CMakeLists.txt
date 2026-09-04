@@ -70,6 +70,60 @@ else()
     add_library(download_wrapper STATIC ${DW_SOURCES})
 endif()
 
+# 产物命名：download-{platform}-{arch}.{ext}
+# 平台检测（iOS 区分 device / simulator）
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(DW_PLATFORM "macos")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if(CMAKE_OSX_SYSROOT MATCHES "iphonesimulator")
+        set(DW_PLATFORM "ios-simulator")
+    else()
+        set(DW_PLATFORM "ios")
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(DW_PLATFORM "linux")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    set(DW_PLATFORM "windows")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(DW_PLATFORM "android")
+else()
+    set(DW_PLATFORM "${CMAKE_SYSTEM_NAME}")
+endif()
+
+# 架构检测
+if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    # Android：仅支持 arm64（真机）和 x64（模拟器）
+    if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+        set(DW_ARCH "arm64")
+    elseif(CMAKE_ANDROID_ARCH_ABI STREQUAL "x86_64")
+        set(DW_ARCH "x64")
+    else()
+        message(FATAL_ERROR "Unsupported Android ABI: ${CMAKE_ANDROID_ARCH_ABI}. Only arm64-v8a and x86_64 are supported.")
+    endif()
+elseif(CMAKE_OSX_ARCHITECTURES)
+    # macOS/iOS：多架构合并时为 universal，单架构取具体值
+    list(LENGTH CMAKE_OSX_ARCHITECTURES DW_ARCH_COUNT)
+    if(DW_ARCH_COUNT GREATER 1)
+        set(DW_ARCH "universal")
+    else()
+        list(GET CMAKE_OSX_ARCHITECTURES 0 DW_ARCH)
+        if(DW_ARCH STREQUAL "x86_64")
+            set(DW_ARCH "x64")
+        endif()
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    set(DW_ARCH "arm64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    set(DW_ARCH "x64")
+else()
+    set(DW_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+set_target_properties(download_wrapper PROPERTIES
+    OUTPUT_NAME "download-${DW_PLATFORM}-${DW_ARCH}"
+    PREFIX ""  # 去掉 lib 前缀，全平台统一无 lib 前缀
+)
+
 target_include_directories(download_wrapper
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

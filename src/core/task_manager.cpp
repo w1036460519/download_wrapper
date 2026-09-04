@@ -133,7 +133,7 @@ namespace dw {
         maintenance_ = std::jthread([this](std::stop_token st) { maintenance_loop(st); });
 
         log_i("", "下载器启动 clientId=%s tasks=%zu concurrent=%d",
-                client_id_.c_str(), tasks_.size(), max_concurrent_);
+              client_id_.c_str(), tasks_.size(), max_concurrent_);
         return 0;
     }
 
@@ -178,7 +178,7 @@ namespace dw {
         }
         const char *raw_key = dw_task_params_key(params, proto);
         log_i("", "添加任务[%s] force=%d %s",
-                to_string(proto), force, to_string(*params).c_str());
+              to_string(proto), force, to_string(*params).c_str());
         if (!raw_key || !raw_key[0]) {
             out->code = DW_REASON_ERROR;
             out->message = nullptr;
@@ -241,15 +241,18 @@ namespace dw {
                 // 初始显示名占位为识别键（HTTP url / BT info_hash / magnet link），
                 // 待引擎回报真实名后经事件同步。
                 task_record.name = key;
+                // 磁盘根实体形态：HTTP 恒单文件；BT 占位默认目录，首次 PARSED 落定。
+                task_record.is_directory = proto != DW_PROTOCOL_HTTP;
                 // 全新任务：置 QUEUED，调度器调 resume_task 创建 handle（无 resume_data，走 magnet/torrent/info_hash）。
                 task_record.status = DW_TASK_STATUS_QUEUED;
                 task_record.synth_notified = false;
                 store_.insert(task_record);
                 // 插入 file_record 占位：root_name 暂用 key（url/info_hash），PARSED 后修正。
-                {
+                // 三要素（client_id + protocol + key）幂等：已存在则不重复新建。
+                if (!store_.has_file_record(client_id_, proto, key)) {
                     FileRecord fr;
                     fr.client_id = client_id_;
-                    fr.type = 0; // 本地文件
+                    fr.type = 1; // 任务文件
                     fr.is_remote = false;
                     fr.save_path = task_record.save_path;
                     fr.root_name = key; // 占位，PARSED 时经 update_file_record_meta 修正
@@ -275,7 +278,7 @@ namespace dw {
     int32_t TaskManager::pause(const dw_protocol_t proto, const std::string &natural_key,
                                dw_submit_result_t *out) {
         if (!out) return -1;
-        log_i(natural_key.c_str(), "暂停任务[%s] key=%s", to_string(proto), natural_key.c_str());
+        log_i(natural_key.c_str(), "暂停任务[%s]", to_string(proto));
         if (IDownloadEngine *eng = engine_of(proto)) {
             return eng->pause_task(natural_key.c_str(), out);
         }
@@ -288,8 +291,8 @@ namespace dw {
                                 const char **trackers, const int32_t tracker_count,
                                 dw_submit_result_t *out) {
         if (!out) return -1;
-        log_i(natural_key.c_str(), "恢复任务[%s] key=%s trackers=%d",
-                    to_string(proto), natural_key.c_str(), tracker_count);
+        log_i(natural_key.c_str(), "恢复任务[%s] trackers=%d",
+              to_string(proto), tracker_count);
 
         // 加载任务记录、恢复数据、构建参数（持锁保证一致性）。
         dw_task_params_t p;
@@ -336,8 +339,8 @@ namespace dw {
     int32_t TaskManager::remove(const dw_protocol_t proto, const std::string &natural_key,
                                 const int32_t delete_files, dw_submit_result_t *out) {
         if (!out) return -1;
-        log_i(natural_key.c_str(), "删除任务[%s] key=%s delete_files=%d",
-                    to_string(proto), natural_key.c_str(), delete_files);
+        log_i(natural_key.c_str(), "删除任务[%s] delete_files=%d",
+              to_string(proto), delete_files);
         if (IDownloadEngine *eng = engine_of(proto)) {
             return eng->delete_task(natural_key.c_str(), delete_files, out);
         }
@@ -383,21 +386,63 @@ namespace dw {
     void TaskManager::set_play_position(dw_protocol_t proto, const std::string &natural_key, const int32_t file_index,
                                         const int64_t position_ms) {
         std::lock_guard<std::mutex> lock(mtx_);
-        store_.set_play_position(client_id_, proto, natural_key, file_index, position_ms);
+        // play_progress 以物理路径为键：路径解析失败（定名未落定 / handle 离线）静默丢弃。
+        std::string path;
+        int64_t size = 0;
+        if (resolve_file_path_locked(proto, natural_key, file_index, path, size)) {
+            store_.set_play_position(path, position_ms);
+        }
     }
 
     int64_t TaskManager::get_play_position(dw_protocol_t proto, const std::string &natural_key,
                                            const int32_t file_index) {
         std::lock_guard<std::mutex> lock(mtx_);
-        return store_.get_play_position(client_id_, proto, natural_key, file_index);
+        std::string path;
+        int64_t size = 0;
+        if (!resolve_file_path_locked(proto, natural_key, file_index, path, size)) return 0;
+        return store_.get_play_position(path);
+    }
+
+    bool TaskManager::resolve_file_path(dw_protocol_t proto, const std::string &natural_key,
+                                        int32_t file_index, std::string &out_path, int64_t &out_size) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return resolve_file_path_locked(proto, natural_key, file_index, out_path, out_size);
+    }
+
+    bool TaskManager::resolve_file_path_locked(dw_protocol_t proto, const std::string &natural_key,
+                                               int32_t file_index, std::string &out_path,
+                                               int64_t &out_size) {
+        // 内存优先，DB 兜底加载任务记录（持锁期间引用稳定）。
+        const TaskRecord *rec_ptr = nullptr;
+        TaskRecord db_rec;
+        const auto it = tasks_.find(union_id_of(proto, natural_key));
+        if (it != tasks_.end()) {
+            rec_ptr = &it->second;
+        } else if (store_.load_by_natural_key(client_id_, proto, natural_key, db_rec)) {
+            rec_ptr = &db_rec;
+        }
+        if (!rec_ptr) return false;
+
+        if (proto == DW_PROTOCOL_HTTP) {
+            // wrapper 模型：物理路径 = save_path / content_root（wrapper 目录） / name（原始文件名）。
+            if (rec_ptr->content_root.empty() || rec_ptr->name.empty()) return false; // 定名未落定
+            out_path = (std::filesystem::path(rec_ptr->save_path) /
+                        rec_ptr->content_root / rec_ptr->name).string();
+            out_size = rec_ptr->total_size;
+            return true;
+        }
+        // BT：handle 在线实时查询（引擎调用不回调 TaskManager，持锁安全）。
+        if (!torrent_) return false;
+        return torrent_->get_file_path(rec_ptr->raw_key().c_str(), file_index, out_path, out_size);
     }
 
     std::vector<dw_byte_range_t> TaskManager::load_segments(dw_protocol_t proto, const std::string &natural_key,
                                                             const int32_t file_index) {
         std::lock_guard<std::mutex> lock(mtx_);
-        // file_segments 已改为物理路径键，先从 task_files 解析物理路径。
-        std::string path = store_.load_file_physical_path(client_id_, proto, natural_key, file_index);
-        if (path.empty()) return {};
+        // 进度缓存按物理路径存键：先解析路径，再查区间。
+        std::string path;
+        int64_t size = 0;
+        if (!resolve_file_path_locked(proto, natural_key, file_index, path, size)) return {};
         return store_.load_segments(path, file_index);
     }
 
@@ -426,7 +471,7 @@ namespace dw {
 
         // 前置检查：部分事件可在无锁情况下提前退出。
         if (event.type == EngineEventType::RESUME_DATA && event.resume_data.empty()) {
-            log_d(key.c_str(), "RESUME_DATA 为空 key=%s", key.c_str());
+            log_d(key.c_str(), "RESUME_DATA 为空");
             return;
         }
         if (event.type == EngineEventType::TASK_FILES && event.files.empty()) {
@@ -437,203 +482,194 @@ namespace dw {
         std::lock_guard<std::mutex> lock(mtx_);
         TaskRecord *rec = load_task_record_locked(client_id_, event.protocol, key);
         if (!rec) {
-            log_e(key.c_str(), "事件 %s 任务不存在 key=%s", to_string(event).c_str(), key.c_str());
+            log_e(key.c_str(), "事件 %s 任务不存在", to_string(event).c_str());
             return;
         }
 
         switch (event.type) {
             case EngineEventType::PARSED: {
-                    // 解析完成（元数据+文件信息就绪，或存储迁移后再次就绪）。
-                    // content_root 模型：content_root = save_path 下的实际根目录名，
-                    //   物理路径 = save_path/content_root；空 = 未包装。
-                    // dup_checked 标记首次解析的重名判定已完成：后续 PARSED 事件（如
-                    //   storage_moved_alert 触发）直接走快路迁态，不重复磁盘冲突检测。
-                    //
-                    // 单锁覆盖整个 case：最多 10 个并发任务，竞争极低，
-                    //   反复释放/重获锁反而增加 find 次数和代码复杂度。
-                    //   std::mutex 不可重入，持锁期间所有内部调用均不再 lock mtx_。
-                    //
-                    // 状态守卫：仅 RESOLVING → PARSED，防止覆盖并发状态变更。
+                // 解析完成（元数据+文件信息就绪，或存储迁移后再次就绪）。
+                // content_root 模型：content_root = save_path 下的磁盘根文件/目录名（恒非空，
+                //   取判重后 wrap_name）；物理前缀按 is_directory 分支：目录 = save_path/content_root，
+                //   单文件 = save_path（content_root 即文件名本身）。
+                // dup_checked 标记首次解析的重名判定已完成：后续 PARSED 事件（如
+                //   storage_moved_alert 触发）直接走快路迁态，不重复磁盘冲突检测。
+                //
+                // 单锁覆盖整个 case：最多 10 个并发任务，竞争极低，
+                //   反复释放/重获锁反而增加 find 次数和代码复杂度。
+                //   std::mutex 不可重入，持锁期间所有内部调用均不再 lock mtx_。
+                //
+                // 状态守卫：仅 RESOLVING → PARSED，防止覆盖并发状态变更。
 
-                    const std::string &torrent_name = event.name;
+                const std::string &torrent_name = event.name;
 
-                    if (rec->dup_checked) {
-                        // 重名判定已完成：快路仅做状态迁移。
+                if (rec->dup_checked) {
+                    // 重名判定已完成：快路仅做状态迁移。
+                    if (rec->status == DW_TASK_STATUS_RESOLVING) {
+                        rec->status = DW_TASK_STATUS_PARSED;
+                        rec->dirty = true;
+                        log_i(key.c_str(), "解析完成 content_root='%s'",
+                              rec->content_root.c_str());
+                        schedule_needed_ = true;
+                    }
+                } else {
+                    /*
+                     * 收集根文件/目录：key=根条目名（相对路径首段），value=是否目录。
+                     * 示例：
+                     *  - "movie.mkv"           → {"movie.mkv", false}
+                     *  - "Season 1/e01.mkv"    → {"Season 1", true}
+                     *  - "a.mkv", "b/e01.mkv"  → {"a.mkv", false}, {"b", true}
+                     */
+                    std::unordered_map<std::string, bool> root_entries;
+                    for (const auto &f: event.files) {
+                        std::filesystem::path fp(f.name);
+                        std::string root = fp.begin() != fp.end() ? fp.begin()->string() : "";
+                        if (root.empty() || root == "." || root == ".." || root == "/") continue;
+                        bool is_dir = fp.has_parent_path();
+                        root_entries.try_emplace(root, is_dir);
+                    }
+
+                    {
+                        boost::json::array arr;
+                        for (const auto &[name, dir]: root_entries) {
+                            boost::json::object obj;
+                            obj["name"] = name;
+                            obj["type"] = dir ? "目录" : "文件";
+                            arr.push_back(obj);
+                        }
+                        log_i(key.c_str(), "根条目收集 共 %zu 项: %s",
+                              root_entries.size(), boost::json::serialize(arr).c_str());
+                    }
+
+                    std::string base_name;
+                    //是否包装 true:包装 false:未包装
+                    bool need_wrap = false;
+                    // true:目录 false:文件
+                    bool is_dir = true;
+                    if (root_entries.size() == 1) {
+                        base_name = root_entries.begin()->first;
+                        is_dir = root_entries.begin()->second;
+                    } else if (root_entries.size() > 1) {
+                        base_name = torrent_name;
+                        if (base_name.empty()) {
+                            base_name = std::filesystem::path(root_entries.begin()->first).stem().string();
+                        }
+                        is_dir = true;
+                        // 多根条目需要包装
+                        need_wrap = true;
+                    }
+
+                    if (base_name.empty()) {
+                        rec->status = DW_TASK_STATUS_ERROR;
+                        rec->reason = DW_REASON_ERROR;
+                        rec->message = "无效的下载文件";
+                        store_.update(*rec);
+                        schedule_needed_ = true;
+                        log_e(key.c_str(), "解析事件无法确定名称");
+                        return;
+                    }
+
+                    // 重名判定
+                    // true: 重名冲突 false: 未冲突
+                    const bool conflict = std::filesystem::exists(std::filesystem::path(event.save_path) / base_name);
+                    std::string wrap_name = base_name;
+                    std::string ext;
+                    if (!is_dir) {
+                        // 单文件 解析出后缀
+                        ext = std::filesystem::path(base_name).extension().string();
+                        if (!ext.empty() && ext[0] == '.') {
+                            ext = ext.substr(1);
+                        }
+                    }
+                    if (conflict) {
+                        // 单文件重名，包装不包含后缀
+                        const std::string wrap_base = !is_dir
+                                                          ? std::filesystem::path(base_name).stem().string()
+                                                          : base_name;
+                        wrap_name = utils::acquire_wrapper_name(event.save_path, wrap_base, nullptr);
+                        log_i(key.c_str(), "重名 '%s' -> '%s'", base_name.c_str(), wrap_name.c_str());
+                        need_wrap = true; // 重名需要包装
+                        is_dir = true; // 冲突包装后变为目录
+                    }
+
+                    rec->content_root = wrap_name;
+                    rec->is_directory = is_dir;
+                    if (need_wrap) {
+                        log_i(key.c_str(), "包装 '%s'", wrap_name.c_str());
+                    }
+                    rec->dup_checked = true;
+                    store_.update(*rec);
+                    // 更新文件列表
+                    const std::string full_path =
+                            (std::filesystem::path(event.save_path) / wrap_name).string();
+                    store_.update_file_record_meta(rec->client_id, rec->protocol, rec->raw_key(),
+                                                   wrap_name, full_path, is_dir, ext);
+
+                    if (need_wrap) {
+                        // 需要包装：move_storage 迁入包装目录。
+                        if (torrent_) {
+                            // 确保包装名已注册（冲突时 acquire 已在判重处调用，多根无冲突时需补调）。
+                            if (!conflict) {
+                                (void) utils::acquire_wrapper_name(event.save_path, base_name, nullptr);
+                            }
+                            // 包装场景 is_dir 恒 true，迁移目标即 full_path。
+                            if (torrent_->move_storage(key.c_str(), full_path.c_str()) == 0) {
+                                log_i(key.c_str(), "move_storage 已发起 -> '%s'",
+                                      full_path.c_str());
+                            } else {
+                                rec->status = DW_TASK_STATUS_ERROR;
+                                rec->reason = DW_REASON_ERROR;
+                                rec->message = "存储迁移发起失败";
+                                store_.update(*rec);
+                                schedule_needed_ = true;
+                                log_e(key.c_str(), "move_storage 发起失败");
+                            }
+                        }
+                        // 等 storage_moved_alert 再次触发 PARSED 走快路。
+                    } else {
+                        // 不包装：创建占位，直接转 PARSED。
+                        std::filesystem::create_directories(event.save_path);
+                        if (is_dir) {
+                            // 单根目录：创建目录占位。
+                            std::filesystem::create_directories(
+                                std::filesystem::path(event.save_path) / base_name);
+                        } else {
+                            // 单文件：创建空文件占位（libtorrent 下载时覆盖）。
+                            std::ofstream ofs(
+                                std::filesystem::path(event.save_path) / base_name,
+                                std::ios::app);
+                        }
                         if (rec->status == DW_TASK_STATUS_RESOLVING) {
                             rec->status = DW_TASK_STATUS_PARSED;
                             rec->dirty = true;
-                            log_i(key.c_str(), "解析完成 key=%s content_root='%s'",
-                                        key.c_str(), rec->content_root.c_str());
                             schedule_needed_ = true;
-                        }
-                    } else {
-                        // ---- 首次解析：根条目收集 + 冲突检测 + 包装判定 ----
-
-                        /*
-                         * 收集根文件/目录：key=根条目名（相对路径首段），value=是否目录。
-                         * 示例：
-                         *  - "movie.mkv"           → {"movie.mkv", false}
-                         *  - "Season 1/e01.mkv"    → {"Season 1", true}
-                         *  - "a.mkv", "b/e01.mkv"  → {"a.mkv", false}, {"b", true}
-                         */
-                        std::unordered_map<std::string, bool> root_entries;
-                        for (const auto &f: event.files) {
-                            std::filesystem::path fp(f.name);
-                            std::string root = fp.begin() != fp.end() ? fp.begin()->string() : "";
-                            if (root.empty() || root == "." || root == ".." || root == "/") continue;
-                            bool is_dir = fp.has_parent_path();
-                            root_entries.try_emplace(root, is_dir);
-                        }
-
-                        // root_entries 为空说明文件列表全部无效路径，无法继续。
-                        if (root_entries.empty()) {
-                            rec->status = DW_TASK_STATUS_ERROR;
-                            rec->reason = DW_REASON_ERROR;
-                            rec->message = "无效文件条目";
-                            store_.update(*rec);
-                            schedule_needed_ = true;
-                            log_e(key.c_str(), "解析事件无有效文件条目 key=%s", key.c_str());
-                            return;
-                        }
-
-                        // base_name 推导 + 文件类型判定。
-                        std::string base_name;
-                        bool is_dir = true; // 默认目录（多根/冲突包装后均为目录）
-                        if (root_entries.size() == 1) {
-                            // 单根条目：可能是单文件或单目录，由 value 判定。
-                            base_name = root_entries.begin()->first;
-                            is_dir = root_entries.begin()->second;
-                        } else {
-                            // 多根：base_name = torrent_name，为空时用首个根名去后缀兜底。
-                            base_name = torrent_name;
-                            if (base_name.empty()) {
-                                base_name = std::filesystem::path(root_entries.begin()->first).stem().string();
-                            }
-                            is_dir = true;
-                        }
-
-                        if (base_name.empty()) {
-                            rec->status = DW_TASK_STATUS_ERROR;
-                            rec->reason = DW_REASON_ERROR;
-                            rec->message = "无法确定任务名称";
-                            store_.update(*rec);
-                            schedule_needed_ = true;
-                            log_e(key.c_str(), "解析事件无法确定名称 key=%s", key.c_str());
-                            return;
-                        }
-
-                        // 磁盘冲突检测与包装判定：多根（>1）或冲突时必须包装。
-                        const bool conflict = std::filesystem::exists(
-                            std::filesystem::path(event.save_path) / base_name);
-                        const bool need_wrap = (root_entries.size() != 1) || conflict;
-
-                        // 重名消解：仅对已确定的根名 base_name 做磁盘判重，冲突时抢占唯一名。
-                        std::string wrap_name = base_name;
-                        if (conflict) {
-                            wrap_name = utils::acquire_wrapper_name(event.save_path, base_name, nullptr);
-                            is_dir = true; // 冲突包装后变为目录
-                            log_i(key.c_str(), "重名 key=%s '%s' -> '%s'", key.c_str(),
-                                        base_name.c_str(), wrap_name.c_str());
-                        }
-
-                        // 包装落定：需要包装时 content_root 统一取判重后的名字，否则保持空。
-                        if (need_wrap) {
-                            rec->content_root = wrap_name;
-                            log_i(key.c_str(), "包装 key=%s content_root='%s'",
-                                        key.c_str(), wrap_name.c_str());
-                        } else {
-                            // 单根/单文件无冲突：不包装，内容直接落 save_path 下。
-                            log_i(key.c_str(), "无冲突不包装 key=%s base_name='%s'",
-                                        key.c_str(), base_name.c_str());
-                        }
-
-                        // 重名判定完成：置位后后续 PARSED 事件走快路，不再重复冲突检测。
-                        rec->dup_checked = true;
-
-                        store_.update(*rec);
-
-                        // 更新 file_records 元数据（root_name + file_type）。
-                        store_.update_file_record_meta(rec->protocol, rec->raw_key(), base_name, is_dir);
-
-                        // 保存文件列表（首次解析，引擎上报 files 时）。
-                        if (!event.files.empty()) {
-                            const std::string prefix = need_wrap
-                                                           ? (std::filesystem::path(event.save_path) / rec->
-                                                              content_root).
-                                                           string()
-                                                           : std::string(event.save_path);
-                            store_.save_task_files(rec->client_id, rec->protocol, rec->raw_key(),
-                                                   event.files, prefix);
-                        }
-
-                        if (need_wrap) {
-                            // 需要包装：move_storage 迁入包装目录。
-                            if (torrent_) {
-                                // 确保包装名已注册（冲突时 acquire 已在判重处调用，多根无冲突时需补调）。
-                                if (!conflict) {
-                                    (void) utils::acquire_wrapper_name(event.save_path, base_name, nullptr);
-                                }
-                                const std::string effective =
-                                        (std::filesystem::path(event.save_path) / rec->content_root).string();
-                                if (torrent_->move_storage(key.c_str(), effective.c_str()) == 0) {
-                                    log_i(key.c_str(), "move_storage 已发起 key=%s -> '%s'",
-                                                key.c_str(), effective.c_str());
-                                } else {
-                                    rec->status = DW_TASK_STATUS_ERROR;
-                                    rec->reason = DW_REASON_ERROR;
-                                    rec->message = "存储迁移发起失败";
-                                    store_.update(*rec);
-                                    schedule_needed_ = true;
-                                    log_e(key.c_str(), "move_storage 发起失败 key=%s",
-                                                key.c_str());
-                                }
-                            }
-                            // 等 storage_moved_alert 再次触发 PARSED 走快路。
-                        } else {
-                            // 不包装：创建占位，直接转 PARSED。
-                            std::filesystem::create_directories(event.save_path);
-                            if (is_dir) {
-                                // 单根目录：创建目录占位。
-                                std::filesystem::create_directories(
-                                    std::filesystem::path(event.save_path) / base_name);
-                            } else {
-                                // 单文件：创建空文件占位（libtorrent 下载时覆盖）。
-                                std::ofstream ofs(
-                                    std::filesystem::path(event.save_path) / base_name,
-                                    std::ios::app);
-                            }
-                            if (rec->status == DW_TASK_STATUS_RESOLVING) {
-                                rec->status = DW_TASK_STATUS_PARSED;
-                                rec->dirty = true;
-                                schedule_needed_ = true;
-                            }
                         }
                     }
-
-                    // ---- PARSED → QUEUED 辅助迁移 ----
-                    // 判重/定名完成后由 PARSED 拍同步转 QUEUED（add_task/resume_task 同步路径需此拍）。
-                    // run_schedule 后续择机调用 apply_file_selection 准入 → DOWNLOADING。
-                    // 状态守卫仅允许 PARSED 拍转，避免覆盖并发状态变更。
-                    if (rec->status == DW_TASK_STATUS_PARSED) {
-                        rec->status = DW_TASK_STATUS_QUEUED;
-                        rec->dirty = true;
-                        rec->synth_notified = false;
-                        log_i(key.c_str(), "判重完成转 QUEUED 等待调度器准入 key=%s",
-                                    key.c_str());
-                        // 唤醒 add_task / resume_task 同步等待者。schedule_needed_ 留由 run_schedule
-                        // 择机准入（与原设计一致），本次 notify 仅负责同步路径。
-                        cv_.notify_all();
-                    }
-                    break;
                 }
+
+                // ---- PARSED → QUEUED 辅助迁移 ----
+                // 判重/定名完成后由 PARSED 拍同步转 QUEUED（add_task/resume_task 同步路径需此拍）。
+                // run_schedule 后续择机调用 apply_file_selection 准入 → DOWNLOADING。
+                // 状态守卫仅允许 PARSED 拍转，避免覆盖并发状态变更。
+                if (rec->status == DW_TASK_STATUS_PARSED) {
+                    rec->status = DW_TASK_STATUS_QUEUED;
+                    rec->dirty = true;
+                    rec->synth_notified = false;
+                    log_i(key.c_str(), "判重完成转 QUEUED 等待调度器准入");
+                    // 唤醒 add_task / resume_task 同步等待者。schedule_needed_ 留由 run_schedule
+                    // 择机准入（与原设计一致），本次 notify 仅负责同步路径。
+                    cv_.notify_all();
+                }
+                break;
+            }
             case EngineEventType::DOWNLOAD_FAILED: {
                 // 下载失败（通用）：转 ERROR。
                 rec->status = DW_TASK_STATUS_ERROR;
                 rec->reason = event.reason;
                 rec->message = event.message;
                 rec->dirty = true;
-                log_e(key.c_str(), "下载失败 key=%s msg=%s",
-                            key.c_str(), event.message.c_str());
+                log_e(key.c_str(), "下载失败 msg=%s",
+                      event.message.c_str());
                 schedule_needed_ = true;
                 break;
             }
@@ -641,7 +677,7 @@ namespace dw {
                 // 下载完成：迁 COMPLETED 状态。
                 rec->status = DW_TASK_STATUS_COMPLETED;
                 rec->dirty = true;
-                log_i(key.c_str(), "下载完成 key=%s", key.c_str());
+                log_i(key.c_str(), "下载完成");
                 schedule_needed_ = true;
                 break;
             }
@@ -692,7 +728,7 @@ namespace dw {
                     rec->synth_notified = false;
                     rec->dirty = true;
                     reset_live_telemetry(*rec); // 暂停帧不残留旧速率
-                    log_i(key.c_str(), "BT 暂停生效 key=%s", key.c_str());
+                    log_i(key.c_str(), "BT 暂停生效");
                 }
                 break;
             }
@@ -704,7 +740,7 @@ namespace dw {
                     rec->synth_notified = false;
                     rec->dirty = true;
                     schedule_needed_ = true;
-                    log_i(key.c_str(), "BT 恢复生效 key=%s", key.c_str());
+                    log_i(key.c_str(), "BT 恢复生效");
                     cv_.notify_all();
                 }
                 break;
@@ -721,10 +757,10 @@ namespace dw {
                 const std::string raw_key = rec->raw_key();
                 unregister_task(uid);
                 store_.remove(cid, proto, raw_key);
-                log_i(key.c_str(), "任务已删除回收完成 key=%s", key.c_str());
-                // 按 delete_files 标识决定是否删包层目录（save_path/content_root）：
-                // 有些任务路径是包了一层的，引擎 remove_torrent 已删内部文件，
-                // 此处再删外层目录确保清理干净。
+                log_i(key.c_str(), "任务已删除回收完成");
+                // 按 delete_files 标识删除磁盘根实体（save_path/content_root）：
+                // 包装任务的内部文件引擎已删，包层目录需此处补删；未包装单文件引擎已删本体，
+                // remove_all 为无害空操作。空值守卫防 content_root 未置位的任务（如 HTTP）退化为 save_path 本身。
                 if (event.delete_files && !content_root.empty()) {
                     const std::filesystem::path wrapper_dir =
                             std::filesystem::path(save_path) / content_root;
@@ -732,27 +768,56 @@ namespace dw {
                     std::filesystem::remove_all(wrapper_dir, ec);
                     if (ec) {
                         log_e("", "删除包层目录失败 path=%s err=%s",
-                                wrapper_dir.string().c_str(), ec.message().c_str());
+                              wrapper_dir.string().c_str(), ec.message().c_str());
                     } else {
                         log_i("", "删除包层目录完成 path=%s",
-                                wrapper_dir.string().c_str());
+                              wrapper_dir.string().c_str());
                     }
                 }
                 schedule_needed_ = true;
                 break;
             }
             case EngineEventType::TASK_FILES: {
-                // 任务文件列表推送（HTTP 响应头就绪）：计算物理路径前缀后落库。
-                const std::string prefix = rec->content_root.empty()
-                                               ? std::string(rec->save_path)
-                                               : (std::filesystem::path(rec->save_path) / rec->content_root).string();
-                store_.save_task_files(client_id_, event.protocol, rec->open_id(),
-                                       event.files, prefix);
+                // HTTP 磁盘定名就绪（wrapper 模型）：落定 content_root（判重后 wrapper 目录名）、
+                // is_directory 与 name（原始文件名），同步修正 file_records。BT 不发此事件。
+                // 幂等守卫：content_root 已落定则跳过（全量重下定名沿用既有 wrapper，同值）。
+                if (event.protocol != DW_PROTOCOL_HTTP || event.files.empty() || event.name.empty()) break;
+                if (!rec->content_root.empty()) break;
+                const std::string raw_name = event.files[0].name ? event.files[0].name : "";
+                rec->content_root = event.name; // 磁盘根实体 = wrapper 目录
+                rec->is_directory = true;
+                // name 与 STATUS_UPDATE 同款占位守卫：仅初始 url 占位态写入。
+                if (!raw_name.empty() && rec->name == rec->url) {
+                    rec->name = raw_name;
+                }
+                rec->dirty = true;
+                store_.update(*rec);
+                const std::string full_path =
+                        (std::filesystem::path(rec->save_path) / event.name).string();
+                store_.update_file_record_meta(rec->client_id, rec->protocol, rec->raw_key(),
+                                               event.name, full_path, true, std::string());
+                log_i(key.c_str(), "HTTP 定名 wrapper='%s' file='%s'",
+                      event.name.c_str(), raw_name.c_str());
+                break;
+            }
+            case EngineEventType::FILE_PROGRESS: {
+                // 文件进度区间就绪（BT 连续 piece 达阈值）：按事件携带的物理路径合并写入
+                // 进度缓存表；文件完成时区间缓存失去意义即删（完成态由"磁盘存在+无缓存"推断）。
+                if (event.file_path.empty()) break; // 引擎未能解析路径：丢弃该区间
+                const int64_t downloaded = store_.upsert_file_progress(
+                    rec->client_id, rec->protocol, rec->raw_key(), event.file_index,
+                    event.file_path, event.offset_start, event.offset_end);
+                if (event.file_size > 0 && downloaded >= event.file_size) {
+                    store_.delete_file_progress_by_file(rec->client_id, rec->protocol,
+                                                        rec->raw_key(), event.file_index);
+                    log_d(key.c_str(), "文件进度缓存清空（完成） file_index=%d",
+                          event.file_index);
+                }
                 break;
             }
             default:
-                log_d(key.c_str(), "未处理的事件类型 type=%d key=%s",
-                            static_cast<int>(event.type), key.c_str());
+                log_d(key.c_str(), "未处理的事件类型 type=%d",
+                      static_cast<int>(event.type));
                 break;
         }
     }
@@ -804,9 +869,10 @@ namespace dw {
         rec.name = unique;
         rec.save_path = dir;
         store_.update(rec); // 落库即完成持久预留（跨重启有效）。
-        // 文件表由引擎在事件点经 post_task_files 自主推送，此处不再代写。
+        // 文件清单不再持久化（task_files 已移除，磁盘为事实源）：BT 经 handle 实时查询，
+        // HTTP 由 TASK_FILES 定名事件落定 content_root 后推导。
         if (unique != wrapper_name) {
-            log_i(rec.trace_id.c_str(), "wrapper 去重定名: '%s' -> '%s/' (dir=%s key=%s)",
+            log_i(rec.trace_id.c_str(), "wrapper 去重定名: '%s' -> '%s/' (dir=%s union_id=%s)",
                   wrapper_name.c_str(), unique.c_str(), dir.c_str(),
                   rec.union_id().c_str());
         }
@@ -945,7 +1011,7 @@ namespace dw {
                             it->second.status = DW_TASK_STATUS_DOWNLOADING;
                             it->second.dirty = true;
                             status_changed = true;
-                            log_i(it->second.trace_id.c_str(), "任务解析完成转下载 key=%s",
+                            log_i(it->second.trace_id.c_str(), "任务解析完成转下载 union_id=%s",
                                   act.rec.union_id().c_str());
                         } else {
                             it->second.status = DW_TASK_STATUS_ERROR;
@@ -955,7 +1021,7 @@ namespace dw {
                             schedule_needed_ = true;
                             slot_released = true;
                             status_changed = true;
-                            log_e(it->second.trace_id.c_str(), "apply_file_selection 失败 key=%s",
+                            log_e(it->second.trace_id.c_str(), "apply_file_selection 失败 union_id=%s",
                                   act.rec.union_id().c_str());
                         }
                     }
@@ -968,7 +1034,7 @@ namespace dw {
                             it->second.status = DW_TASK_STATUS_DOWNLOADING;
                             it->second.dirty = true;
                             status_changed = true;
-                            log_i(it->second.trace_id.c_str(), "任务校验通过转下载 key=%s",
+                            log_i(it->second.trace_id.c_str(), "任务校验通过转下载 union_id=%s",
                                   act.rec.union_id().c_str());
                         } else {
                             it->second.status = DW_TASK_STATUS_ERROR;
@@ -976,7 +1042,7 @@ namespace dw {
                             schedule_needed_ = true; // 名额释放，唤醒调度准入后续任务
                             slot_released = true;
                             status_changed = true;
-                            log_e(it->second.trace_id.c_str(), "任务引擎启动失败 key=%s",
+                            log_e(it->second.trace_id.c_str(), "任务引擎启动失败 union_id=%s",
                                   act.rec.union_id().c_str());
                         }
                     }
@@ -1100,12 +1166,6 @@ namespace dw {
                                        task_record.pending_engine_status == DW_TASK_STATUS_COMPLETED ||
                                        task_record.pending_engine_status == DW_TASK_STATUS_ERROR);
             if (now_terminal) {
-                // 任务级 0→2 传播：完成态任务把其文件节点统一置为完成正常。
-                if (task_record.status == DW_TASK_STATUS_COMPLETED ||
-                    task_record.pending_engine_status == DW_TASK_STATUS_COMPLETED) {
-                    store_.mark_task_files_completed(task_record.client_id, task_record.protocol,
-                                                     task_record.raw_key());
-                }
                 to_remove.push_back(union_id);
             } else if (paused) {
                 if (task_record.protocol == DW_PROTOCOL_HTTP) {
@@ -1188,7 +1248,7 @@ namespace dw {
         if (!slowest) return false;
         out_key = engine_key(*slowest);
         out_proto = slowest->protocol;
-        log_i(slowest->trace_id.c_str(), "播放提优暂停最慢任务 key=%s rate=%.1f",
+        log_i(slowest->trace_id.c_str(), "播放提优暂停最慢任务 union_id=%s rate=%.1f",
               slowest->union_id().c_str(), slowest->download_rate);
         slowest->status = DW_TASK_STATUS_PAUSED;
         slowest->synth_notified = false;
@@ -1397,24 +1457,44 @@ namespace dw {
     }
 
 
-    // ---- 任务文件持久化 ----
+    // ---- 任务文件实时查询 ----
 
     std::vector<dw_file_info_t> TaskManager::load_files(dw_protocol_t proto, const std::string &natural_key) {
+        // task_files 表已移除（磁盘为事实源）：BT 经 handle 实时查询，HTTP 从任务记录推导。
         std::lock_guard<std::mutex> lock(mtx_);
-        std::vector<dw_file_info_t> files = store_.load_task_files(client_id_, proto, natural_key);
-        if (files.empty()) return files;
-        // 惰性删除检测：仅对完成态(2)文件 stat 物理路径，缺失则标记为已删除(1)。
-        // 物理路径 = save_path / name（save_path 已含包层目录，name 已含完整相对路径）。
-        TaskRecord task_record;
-        if (!store_.load_by_natural_key(client_id_, proto, natural_key, task_record) || task_record.save_path.empty())
-            return files;
-        std::filesystem::path base(task_record.save_path);
+        std::vector<dw_file_info_t> files;
+        if (proto == DW_PROTOCOL_TORRENT) {
+            if (torrent_) {
+                files = torrent_->get_file_list(natural_key.c_str()); // 选中文件，pad 已过滤
+            }
+        } else {
+            // HTTP 单文件：content_root（wrapper 目录）+ name（原始文件名）落定后可推导。
+            const TaskRecord *rec_ptr = nullptr;
+            TaskRecord db_rec;
+            const auto it = tasks_.find(union_id_of(proto, natural_key));
+            if (it != tasks_.end()) {
+                rec_ptr = &it->second;
+            } else if (store_.load_by_natural_key(client_id_, proto, natural_key, db_rec)) {
+                rec_ptr = &db_rec;
+            }
+            if (rec_ptr && !rec_ptr->content_root.empty() && !rec_ptr->name.empty()) {
+                dw_file_info_t f{};
+                f.index = 0;
+                f.name = dup_cstr(rec_ptr->name);
+                f.physical_path = dup_cstr((std::filesystem::path(rec_ptr->save_path) /
+                                            rec_ptr->content_root / rec_ptr->name).string());
+                const std::string ext = utils::file_extension(rec_ptr->name);
+                f.ext = ext.empty() ? nullptr : dup_cstr(ext);
+                f.size = rec_ptr->total_size;
+                f.offset = 0; // HTTP 单文件模型，全局偏移恒为 0
+                f.status = rec_ptr->status == DW_TASK_STATUS_COMPLETED ? 2 : 0;
+                files.push_back(f);
+            }
+        }
+        // downloaded_bytes 聚合回填：进度缓存区间和；未命中（未开始/已完成清缓存）保持 0。
         for (auto &f: files) {
-            if (f.status != 2) continue;
-            std::filesystem::path p(base);
-            if (f.name) p /= f.name;
-            std::error_code ec;
-            if (!std::filesystem::exists(p, ec)) f.status = 1;
+            f.downloaded_bytes = store_.sum_file_progress_by_file(
+                client_id_, proto, natural_key, f.index);
         }
         return files;
     }
@@ -1697,7 +1777,7 @@ namespace dw {
     void TaskManager::reset_error_task_for_restart(TaskRecord &task_record) {
         if (task_record.status == DW_TASK_STATUS_ERROR) {
             store_.clear_resume(task_record.client_id, task_record.protocol, task_record.raw_key());
-            // file_segments 已改为物理路径键，任务级不再统一清除（段数据持久保留）。
+            // 进度缓存保留：重启后引擎据此恢复已下载区间（任务删除时随 remove 级联清理）。
             if (task_record.protocol == DW_PROTOCOL_HTTP) {
                 task_record.total_done = -1;
                 task_record.progress = -1.0;
@@ -1706,86 +1786,57 @@ namespace dw {
     }
 
     void TaskManager::snapshot_segments_locked(TaskRecord &task_record) {
+        // HTTP 用周期快照维护进度缓存；BT 已改由 FILE_PROGRESS 事件（piece 驱动）增量维护，
+        // 此处不再轮询引擎（避免全量重写覆盖事件增量，也省去逐文件 get_file_ranges 调用）。
+        if (task_record.protocol != DW_PROTOCOL_HTTP) return;
         const std::string key = engine_key(task_record);
-        if (key.empty()) return;
+        if (key.empty() || !http_) return;
 
-        // 收集每个已选文件的最新分段，同时更新内存缓存与 DB 快照。
-        // HTTP 单文件 file_index=0；BT 遍历已选 file_indexes。
+        // 收集单文件最新分段，更新 DB 快照（HTTP 恒 file_index=0）。
         struct file_result {
             int32_t file_index;
             std::vector<dw_byte_range_t> ranges;
         };
         std::vector<file_result> results;
-
-        if (task_record.protocol == DW_PROTOCOL_HTTP) {
-            if (!http_) return;
+        {
             auto ranges = http_->get_file_ranges(key.c_str(), 0);
             if (!ranges.empty()) {
                 results.push_back({0, std::move(ranges)});
             }
-        } else {
-            if (!torrent_) return;
-            for (const int32_t idx: task_record.file_indexes) {
-                auto ranges = torrent_->get_file_ranges(key.c_str(), idx);
-                if (!ranges.empty()) {
-                    results.push_back({idx, std::move(ranges)});
-                }
-            }
         }
 
-        // 从 ranges 推导 downloaded_bytes（避免重复遍历 piece bitmap）
-        std::vector<std::pair<int32_t, int64_t> > file_bytes;
-        file_bytes.reserve(results.size());
-        for (const auto &fr: results) {
-            int64_t bytes = 0;
-            for (const auto &r: fr.ranges) {
-                bytes += r.end - r.start + 1;
-            }
-            file_bytes.emplace_back(fr.file_index, bytes);
-        }
-
-        // 批量写入 DB：区间快照 + downloaded_bytes（各一个事务）
-        // file_segments 已改为物理路径键，需先从 task_files 解析每个文件的物理路径。
+        // 进度区间缓存（全量重写，HTTP 周期快照；BT 已改由 FILE_PROGRESS 事件增量维护）。
+        // 物理路径经 resolve 推导（wrapper 模型 save_path/content_root/name）。
         {
             std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t> > > batch;
             batch.reserve(results.size());
             for (const auto &fr: results) {
-                std::string path = store_.load_file_physical_path(
-                    task_record.client_id, task_record.protocol, task_record.raw_key(), fr.file_index);
-                if (path.empty()) continue;
+                std::string path;
+                int64_t size = 0;
+                if (!resolve_file_path_locked(task_record.protocol, task_record.raw_key(),
+                                              fr.file_index, path, size))
+                    continue;
                 batch.emplace_back(std::move(path), fr.file_index, fr.ranges);
             }
-            store_.save_segments_batch(batch);
+            store_.replace_file_progress(task_record.client_id, task_record.protocol,
+                                         task_record.raw_key(), batch);
         }
-        store_.update_downloaded_bytes(task_record.client_id, task_record.protocol, task_record.raw_key(), file_bytes);
 
         // ---- 数据驱动完成检测（仅 DOWNLOADING 态） ----
         if (task_record.status != DW_TASK_STATUS_DOWNLOADING) return;
 
-        // 从 task_files 表一次性加载文件大小（B 线程持 mtx_，DB 访问安全）。
-        // file_size <= 0 的文件跳过完成判定（HTTP chunked 无总长场景）。
-        const auto all_files = store_.load_task_files(task_record.client_id, task_record.protocol,
-                                                      task_record.raw_key());
+        // HTTP 单文件：总大小取任务记录 total_size（chunked 无总长为 -1，跳过完成判定）。
+        const int64_t file_size = task_record.total_size;
+        if (file_size <= 0) return;
 
         bool all_complete = true;
-        bool any_checkable = false; // 是否有可判定的文件（file_size > 0）
+        bool any_checkable = false;
         for (const auto &fr: results) {
-            // 从已加载的文件列表查当前文件大小
-            int64_t file_size = -1;
-            for (const auto &f: all_files) {
-                if (f.index == fr.file_index) {
-                    file_size = f.size;
-                    break;
-                }
-            }
-            if (file_size <= 0) {
-                all_complete = false;
-                continue; // 不可判定（HTTP chunked 无总长），不阻塞整体判定
-            }
             any_checkable = true;
             if (is_file_complete(fr.ranges, file_size)) {
-                store_.mark_file_completed(task_record.client_id, task_record.protocol, task_record.raw_key(),
-                                           fr.file_index);
+                // 文件完成：区间缓存失去意义即删（完成态由"磁盘存在+无缓存"推断）。
+                store_.delete_file_progress_by_file(task_record.client_id, task_record.protocol,
+                                                    task_record.raw_key(), fr.file_index);
             } else {
                 all_complete = false;
             }
@@ -1794,7 +1845,7 @@ namespace dw {
         // 所有可判定文件均完成 → 数据驱动任务完成（设 pending_engine_status 交 A 线程消费）
         if (any_checkable && all_complete) {
             task_record.pending_engine_status = DW_TASK_STATUS_COMPLETED;
-            log_i(task_record.trace_id.c_str(), "数据驱动任务完成 key=%s",
+            log_i(task_record.trace_id.c_str(), "数据驱动任务完成 union_id=%s",
                   task_record.union_id().c_str());
         }
     }
@@ -1803,8 +1854,9 @@ namespace dw {
                                                                   int32_t file_index) {
         // 内存缓存已移除：直接读 DB 最新快照（经物理路径查询）。
         std::lock_guard<std::mutex> lock(mtx_);
-        std::string path = store_.load_file_physical_path(client_id_, proto, natural_key, file_index);
-        if (path.empty()) return {};
+        std::string path;
+        int64_t size = 0;
+        if (!resolve_file_path_locked(proto, natural_key, file_index, path, size)) return {};
         return store_.load_segments(path, file_index);
     }
 
