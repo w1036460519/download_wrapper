@@ -34,7 +34,7 @@ jobs:
             output: download-linux-x64.so
             bincache: ~/.cache/vcpkg/archives
           - name: linux-arm64
-            os: ubuntu-24.04
+            os: ubuntu-24.04-arm
             triplet: arm64-linux
             output: download-linux-arm64.so
             bincache: ~/.cache/vcpkg/archives
