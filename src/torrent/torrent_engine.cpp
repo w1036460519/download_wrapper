@@ -425,7 +425,7 @@ namespace dw {
                 if (key.empty()) return;
                 if (g_task_manager) {
                     g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::BT_PAUSED,
+                        .type = EngineEventType::PAUSED,
                         .engine_key = key,
                         .protocol = DW_PROTOCOL_TORRENT
                     });
@@ -438,7 +438,7 @@ namespace dw {
                 if (key.empty()) return;
                 if (g_task_manager) {
                     g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::BT_RESUMED,
+                        .type = EngineEventType::RESUMED,
                         .engine_key = key,
                         .protocol = DW_PROTOCOL_TORRENT
                     });
@@ -869,7 +869,7 @@ namespace dw {
             // 重复操作补发恢复事件
             if (g_task_manager) {
                 g_task_manager->on_engine_event(EngineEvent{
-                    .type = EngineEventType::BT_RESUMED,
+                    .type = EngineEventType::RESUMED,
                     .engine_key = key,
                     .protocol = DW_PROTOCOL_TORRENT
                 });
@@ -905,7 +905,7 @@ namespace dw {
         // 重复操作补发暂停事件
         if (g_task_manager) {
             g_task_manager->on_engine_event(EngineEvent{
-                .type = EngineEventType::BT_PAUSED,
+                .type = EngineEventType::PAUSED,
                 .engine_key = key,
                 .protocol = DW_PROTOCOL_TORRENT
             });

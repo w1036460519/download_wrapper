@@ -9,4 +9,5 @@ set(VCPKG_OSX_ARCHITECTURES arm64)
 set(VCPKG_OSX_DEPLOYMENT_TARGET "16.3")
 
 # C++20 支持（std::jthread / std::stop_token 需要）
+set(VCPKG_C_FLAGS "-std=c99")
 set(VCPKG_CXX_FLAGS "-std=c++20")

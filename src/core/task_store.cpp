@@ -204,15 +204,15 @@ namespace dw {
                 "  full_path       TEXT," // 磁盘根实体全路径（save_path/root_name）；占位 NULL，PARSED 回填
                 "  file_type       INTEGER DEFAULT 1," // 0=文件 1=目录
                 "  ext             TEXT," // 文件后缀不含点（如 "mp4"）；目录为 NULL
-                "  task_protocol   INTEGER," // 关联任务协议（NULL=本地文件）
-                "  task_natural_key TEXT," // 关联任务 natural_key
+                "  key_type        INTEGER," // 关联任务协议（NULL=本地文件）
+                "  natural_key     TEXT," // 关联任务 natural_key
                 "  status          INTEGER DEFAULT 0,"
                 "  total_size      INTEGER DEFAULT -1,"
                 "  total_done      INTEGER DEFAULT 0,"
                 "  created_at      INTEGER,"
                 "  modified_at     INTEGER"
                 ");"
-                "CREATE INDEX IF NOT EXISTS idx_file_records_task ON file_records(task_protocol, task_natural_key);"
+                "CREATE INDEX IF NOT EXISTS idx_file_records_task ON file_records(key_type, natural_key);"
                 "CREATE INDEX IF NOT EXISTS idx_file_records_save_path ON file_records(save_path);"
                 // 文件下载进度缓存：已下载连续字节区间（闭区间），engine 按三要素 + file_index
                 // 维护，App 按物理路径关联；文件完成即删（区别于旧 file_segments 的持久保留语义）。
@@ -491,19 +491,7 @@ namespace dw {
         // 是否留存由调用方决定，缓存区间不再有消费方）。
         del_by_key("file_progress_cache");
         // file_records 按任务关联三要素删除（含 client_id，多客户端共库时避免误删）
-        {
-            sqlite3_stmt *st = nullptr;
-            if (sqlite3_prepare_v2(db_,
-                                   "DELETE FROM file_records"
-                                   " WHERE client_id=? AND task_protocol=? AND task_natural_key=?;",
-                                   -1, &st, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(st, 2, static_cast<int>(protocol));
-                sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(st);
-                sqlite3_finalize(st);
-            }
-        }
+        del_by_key("file_records");
     }
 
     void TaskStore::save_resume(const std::string &client_id, dw_protocol_t protocol,
@@ -590,7 +578,7 @@ namespace dw {
         bool exists = false;
         if (sqlite3_prepare_v2(db_,
                                "SELECT 1 FROM file_records"
-                               " WHERE client_id=? AND task_protocol=? AND task_natural_key=? LIMIT 1;",
+                               " WHERE client_id=? AND key_type=? AND natural_key=? LIMIT 1;",
                                -1, &st, nullptr) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int(st, 2, static_cast<int>(task_protocol));
@@ -607,7 +595,7 @@ namespace dw {
         if (r.modified_at == 0) r.modified_at = now;
         const char *sql =
                 "INSERT INTO file_records (client_id, type, is_remote, save_path, root_name,"
-                " full_path, file_type, ext, task_protocol, task_natural_key, status, total_size, total_done,"
+                " full_path, file_type, ext, key_type, natural_key, status, total_size, total_done,"
                 " created_at, modified_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
         sqlite3_stmt *st = nullptr;
@@ -652,7 +640,7 @@ namespace dw {
         std::vector<FileRecord> out;
         const char *sql =
                 "SELECT id, client_id, type, is_remote, save_path, root_name, full_path, file_type, ext,"
-                " task_protocol, task_natural_key, status, total_size, total_done,"
+                " key_type, natural_key, status, total_size, total_done,"
                 " created_at, modified_at FROM file_records"
                 " WHERE client_id=? ORDER BY modified_at DESC;";
         sqlite3_stmt *st = nullptr;
@@ -671,7 +659,7 @@ namespace dw {
                                               int32_t status, int64_t total_size, int64_t total_done) {
         const char *sql =
                 "UPDATE file_records SET status=?, total_size=?, total_done=?, modified_at=?"
-                " WHERE task_protocol=? AND task_natural_key=?;";
+                " WHERE key_type=? AND natural_key=?;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
         sqlite3_bind_int(st, 1, status);
@@ -688,10 +676,10 @@ namespace dw {
                                             dw_protocol_t task_protocol, const std::string &task_natural_key,
                                             const std::string &root_name, const std::string &full_path,
                                             bool file_type, const std::string &ext) {
-        // 按三要素（client_id + task_protocol + task_natural_key）精准定位，与 has_file_record/remove 一致。
+        // 按三要素（client_id + key_type + natural_key）精准定位，与 has_file_record/remove 一致。
         const char *sql =
                 "UPDATE file_records SET root_name=?, full_path=?, file_type=?, ext=?, modified_at=?"
-                " WHERE client_id=? AND task_protocol=? AND task_natural_key=?;";
+                " WHERE client_id=? AND key_type=? AND natural_key=?;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
         sqlite3_bind_text(st, 1, root_name.c_str(), -1, SQLITE_TRANSIENT);

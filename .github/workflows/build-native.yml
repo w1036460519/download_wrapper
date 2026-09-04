@@ -171,10 +171,16 @@ jobs:
         shell: bash
         run: |
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          # Windows ARM64 需要显式指定架构（Visual Studio 生成器默认 x64）
+          ARCH_FLAG=""
+          if [[ "${{ matrix.name }}" == "windows-arm64" ]]; then
+            ARCH_FLAG="-A ARM64"
+          fi
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+            $ARCH_FLAG
           cmake --build build --config Release
 
           mkdir -p dist

@@ -144,8 +144,8 @@ target_link_libraries(download_wrapper
 
 target_compile_definitions(download_wrapper PRIVATE DOWNLOAD_WRAPPER_BUILD)
 
-# iOS 真机需要显式指定 C++20（vcpkg triplet 可能未传递 std::jthread/stop_token 支持）
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+# Apple 平台需要显式指定 C++20（vcpkg triplet 可能未传递 std::jthread/stop_token 支持）
+if(APPLE)
     target_compile_options(download_wrapper PRIVATE -std=c++20)
 endif()
 

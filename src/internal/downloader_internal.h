@@ -34,8 +34,8 @@ namespace dw {
         DOWNLOAD_COMPLETED, // 下载完成
         STATUS_UPDATE, // 状态+进度更新（替代原 post_progress）
         RESUME_DATA, // 断点续传数据就绪（BT resume / HTTP 定期存档）
-        BT_PAUSED, // BT 引擎已实际暂停（libtorrent handle.pause 已生效），由 alert 线程确认后投递
-        BT_RESUMED, // BT 引擎已实际恢复（libtorrent handle.resume 已生效），由 alert 线程确认后投递
+        PAUSED, // BT 引擎已实际暂停（libtorrent handle.pause 已生效），由 alert 线程确认后投递
+        RESUMED, // BT 引擎已实际恢复（libtorrent handle.resume 已生效），由 alert 线程确认后投递
         DELETED, // 任务已从引擎移除（remove_torrent 收敛 / handle 无效直接删除），wrapper 据此回收资源
         TASK_FILES, // 任务文件列表推送（HTTP 响应头就绪后推送单文件信息）
         FILE_PROGRESS, // 文件进度区间就绪（BT 连续 piece 达阈值后合并上报，HTTP 无此事件）
@@ -99,8 +99,8 @@ namespace dw {
             case EngineEventType::DOWNLOAD_COMPLETED: return "DOWNLOAD_COMPLETED";
             case EngineEventType::STATUS_UPDATE: return "STATUS_UPDATE";
             case EngineEventType::RESUME_DATA: return "RESUME_DATA";
-            case EngineEventType::BT_PAUSED: return "BT_PAUSED";
-            case EngineEventType::BT_RESUMED: return "BT_RESUMED";
+            case EngineEventType::PAUSED: return "BT_PAUSED";
+            case EngineEventType::RESUMED: return "BT_RESUMED";
             case EngineEventType::DELETED: return "DELETED";
             case EngineEventType::TASK_FILES: return "TASK_FILES";
             case EngineEventType::FILE_PROGRESS: return "FILE_PROGRESS";

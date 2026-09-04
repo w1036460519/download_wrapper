@@ -501,8 +501,6 @@ namespace dw {
                 //
                 // 状态守卫：仅 RESOLVING → PARSED，防止覆盖并发状态变更。
 
-                const std::string &torrent_name = event.name;
-
                 if (rec->dup_checked) {
                     // 重名判定已完成：快路仅做状态迁移。
                     if (rec->status == DW_TASK_STATUS_RESOLVING) {
@@ -550,7 +548,7 @@ namespace dw {
                         base_name = root_entries.begin()->first;
                         is_dir = root_entries.begin()->second;
                     } else if (root_entries.size() > 1) {
-                        base_name = torrent_name;
+                        base_name = event.name;
                         if (base_name.empty()) {
                             base_name = std::filesystem::path(root_entries.begin()->first).stem().string();
                         }
@@ -592,6 +590,7 @@ namespace dw {
                         is_dir = true; // 冲突包装后变为目录
                     }
 
+                    // content_root 恒有值：无冲突时 wrap_name == base_name，冲突时 wrap_name = stem(n)
                     rec->content_root = wrap_name;
                     rec->is_directory = is_dir;
                     if (need_wrap) {
@@ -664,7 +663,6 @@ namespace dw {
                 break;
             }
             case EngineEventType::DOWNLOAD_FAILED: {
-                // 下载失败（通用）：转 ERROR。
                 rec->status = DW_TASK_STATUS_ERROR;
                 rec->reason = event.reason;
                 rec->message = event.message;
@@ -674,21 +672,17 @@ namespace dw {
                 break;
             }
             case EngineEventType::DOWNLOAD_COMPLETED: {
-                // 下载完成：迁 COMPLETED 状态，清除错误信息与文件进度缓存（完成态由磁盘存在推断，无需区间缓存）。
                 rec->status = DW_TASK_STATUS_COMPLETED;
                 rec->reason = DW_REASON_NONE;
                 rec->message.clear();
                 rec->dirty = true;
+                // 清除文件进度缓存
                 store_.delete_file_progress_by_task(rec->client_id, rec->protocol, rec->raw_key());
                 log_i(key.c_str(), "下载完成");
                 schedule_needed_ = true;
                 break;
             }
             case EngineEventType::STATUS_UPDATE: {
-                // 状态+进度更新：写入 TaskRecord 内存字段。状态不再由事件携带（map_status 已移除），
-                // 终态判断由 progress>=1.0（BT 完成）或 DOWNLOAD_FAILED 事件提供；PAUSED/RESUMED
-                // 由独立 BT_PAUSED/BT_RESUMED 事件负责迁移。
-
                 // 进度数值
                 rec->progress = event.progress;
                 rec->total_size = event.total_size;
@@ -699,13 +693,7 @@ namespace dw {
                 rec->support_range = event.support_range;
                 rec->reason = event.reason;
                 rec->message = event.message;
-
-                // 元数据字段：仅在 name 仍处于初始占位态（等于 engine key）时写入。
-                // PARSED / request_unique_name 回调锁定 wrapper 名后，后续帧不再冲刷，
-                // 防止去重后缀 (n) 被 libtorrent 原始种子名覆盖。
-                // HTTP: name = 实际文件名（含后缀）；BT: name 保持 wrapper 目录名不变。
-                const std::string &ekey = (event.protocol == DW_PROTOCOL_HTTP) ? rec->url : rec->info_hash;
-                if (!event.name.empty() && rec->name == ekey && event.protocol == DW_PROTOCOL_HTTP) {
+                if (!event.name.empty()) {
                     rec->name = event.name;
                 }
                 if (!event.etag.empty()) rec->etag = event.etag;
@@ -715,37 +703,27 @@ namespace dw {
                 break;
             }
             case EngineEventType::RESUME_DATA: {
-                // 断点续传数据就绪：暂存内存，由 B 线程 flush_dirty_locked 落库。
+                // 断点续传数据
                 rec->pending_resume.assign(
                     reinterpret_cast<const char *>(event.resume_data.data()),
                     event.resume_data.size());
                 break;
             }
-            case EngineEventType::BT_PAUSED: {
-                // BT 暂停生效：状态机迁 PAUSED。状态守卫仅允许活跃态迁入，避免重复帧覆盖。
-                if (rec->status == DW_TASK_STATUS_DOWNLOADING ||
-                    rec->status == DW_TASK_STATUS_QUEUED ||
-                    rec->status == DW_TASK_STATUS_RESOLVING ||
-                    rec->status == DW_TASK_STATUS_PARSED) {
-                    rec->status = DW_TASK_STATUS_PAUSED;
-                    rec->synth_notified = false;
-                    rec->dirty = true;
-                    reset_live_telemetry(*rec); // 暂停帧不残留旧速率
-                    log_i(key.c_str(), "BT 暂停生效");
-                }
+            case EngineEventType::PAUSED: {
+                rec->status = DW_TASK_STATUS_PAUSED;
+                rec->synth_notified = false;
+                rec->dirty = true;
+                reset_live_telemetry(*rec);
+                log_i(key.c_str(), "暂停生效");
                 break;
             }
-            case EngineEventType::BT_RESUMED: {
-                // BT 恢复生效：状态机迁 QUEUED 等待 run_schedule 准入，任务进入正常调度路径。
-                // PAUSED 迁 QUEUED 为常规路径；如任务已被外部制以 COMPLETED/ERROR 则不覆盖。
-                if (rec->status == DW_TASK_STATUS_PAUSED) {
-                    rec->status = DW_TASK_STATUS_QUEUED;
-                    rec->synth_notified = false;
-                    rec->dirty = true;
-                    schedule_needed_ = true;
-                    log_i(key.c_str(), "BT 恢复生效");
-                    cv_.notify_all();
-                }
+            case EngineEventType::RESUMED: {
+                rec->status = DW_TASK_STATUS_QUEUED;
+                rec->synth_notified = false;
+                rec->dirty = true;
+                schedule_needed_ = true;
+                log_i(key.c_str(), "恢复生效");
+                cv_.notify_all();
                 break;
             }
             case EngineEventType::DELETED: {
