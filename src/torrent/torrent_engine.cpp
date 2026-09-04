@@ -96,6 +96,7 @@ namespace dw {
             if (key.empty()) return;
             const lt::file_storage &fs = ti->files();
             const lt::piece_index_t last = ti->last_piece();
+            ti->hash_for_piece()
             if (piece < lt::piece_index_t{0} || piece > last) return;
 
             const int64_t piece_len = ti->piece_length();

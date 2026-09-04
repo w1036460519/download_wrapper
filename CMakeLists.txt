@@ -36,11 +36,12 @@ endif()
 
 if(APPLE)
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-        # 16.3 / 13.3：std::format chrono 时间格式化（time_util）所需 libc++ 符号的最低系统版本。
+        # iOS 17.0+：std::jthread/stop_token 完整支持所需版本（Xcode 15+ SDK）
+        # macOS 14.0+：std::format chrono 时间格式化及完整 C++20 支持所需版本
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-            set(CMAKE_OSX_DEPLOYMENT_TARGET "16.3" CACHE STRING "最低 iOS 版本")
+            set(CMAKE_OSX_DEPLOYMENT_TARGET "17.0" CACHE STRING "最低 iOS 版本")
         else()
-            set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "最低 macOS 版本")
+            set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "最低 macOS 版本")
         endif()
     endif()
     # 目标架构由外部传入：macOS CI 分架构编译后用 lipo 合并为 universal binary；

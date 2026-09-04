@@ -485,12 +485,13 @@ namespace dw {
                 sqlite3_finalize(st);
             }
         };
+        // 删除任务数据
         del_by_key("tasks");
+        // 删除任务的恢复数据
         del_by_key("resume_data");
-        // 进度缓存随任务级联删除（区别于旧 file_segments 持久保留语义：任务删除后文件
-        // 是否留存由调用方决定，缓存区间不再有消费方）。
+        // 删除任务的文件进度缓存
         del_by_key("file_progress_cache");
-        // file_records 按任务关联三要素删除（含 client_id，多客户端共库时避免误删）
+        // 删除文件记录
         del_by_key("file_records");
     }
 
@@ -735,7 +736,7 @@ namespace dw {
 
     void TaskStore::replace_file_progress(
         const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key,
-        const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t>>> &file_ranges) {
+        const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t> > > &file_ranges) {
         if (file_ranges.empty()) return;
         sqlite3_exec(db_, "BEGIN;", nullptr, nullptr, nullptr);
         // 先删除涉及文件的旧区间（按三要素 + file_index 精准清除），再全量插入。
@@ -811,7 +812,7 @@ namespace dw {
             // 重叠/相邻判定：旧行区间 [s,e] 与新区间 [ns,ne] 满足 s <= ne 且 e+1 >= ns。
             sqlite3_bind_int64(sel, 5, offset_end);
             sqlite3_bind_int64(sel, 6, offset_start);
-            std::vector<std::pair<int64_t, int64_t>> olds;
+            std::vector<std::pair<int64_t, int64_t> > olds;
             while (sqlite3_step(sel) == SQLITE_ROW) {
                 const int64_t s = sqlite3_column_int64(sel, 0);
                 const int64_t e = sqlite3_column_int64(sel, 1);
@@ -876,12 +877,13 @@ namespace dw {
     }
 
     void TaskStore::delete_file_progress_by_file(const std::string &client_id, dw_protocol_t protocol,
-                                                  const std::string &natural_key, int32_t file_index) {
+                                                 const std::string &natural_key, int32_t file_index) {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
                                "DELETE FROM file_progress_cache"
                                " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?;",
-                               -1, &st, nullptr) != SQLITE_OK) return;
+                               -1, &st, nullptr) != SQLITE_OK)
+            return;
         sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 2, static_cast<int>(protocol));
         sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
@@ -891,12 +893,13 @@ namespace dw {
     }
 
     void TaskStore::delete_file_progress_by_task(const std::string &client_id, dw_protocol_t protocol,
-                                                  const std::string &natural_key) {
+                                                 const std::string &natural_key) {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
                                "DELETE FROM file_progress_cache"
                                " WHERE client_id=? AND key_type=? AND natural_key=?;",
-                               -1, &st, nullptr) != SQLITE_OK) return;
+                               -1, &st, nullptr) != SQLITE_OK)
+            return;
         sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 2, static_cast<int>(protocol));
         sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
@@ -911,7 +914,8 @@ namespace dw {
         if (sqlite3_prepare_v2(db_,
                                "SELECT COALESCE(SUM(offset_end - offset_start + 1), 0) FROM file_progress_cache"
                                " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?;",
-                               -1, &st, nullptr) != SQLITE_OK) return total;
+                               -1, &st, nullptr) != SQLITE_OK)
+            return total;
         sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 2, static_cast<int>(protocol));
         sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
@@ -940,5 +944,4 @@ namespace dw {
         sqlite3_finalize(st);
         return out;
     }
-
 } // namespace dw

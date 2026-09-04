@@ -727,21 +727,17 @@ namespace dw {
                 break;
             }
             case EngineEventType::DELETED: {
-                // 任务已从引擎移除：回收资源 + 清理数据 + 按标识删包层目录。
-                // 提取包层目录路径（save_path/content_root），用于后续删除。
                 const std::string save_path = rec->save_path;
                 const std::string content_root = rec->content_root;
-                // 回收内存资源 + 清理 DB。
                 const std::string uid = rec->union_id();
                 const std::string cid = rec->client_id;
                 const dw_protocol_t proto = rec->protocol;
                 const std::string raw_key = rec->raw_key();
                 unregister_task(uid);
+                // 删除数据库相关数据
                 store_.remove(cid, proto, raw_key);
                 log_i(key.c_str(), "任务已删除回收完成");
-                // 按 delete_files 标识删除磁盘根实体（save_path/content_root）：
-                // 包装任务的内部文件引擎已删，包层目录需此处补删；未包装单文件引擎已删本体，
-                // remove_all 为无害空操作。空值守卫防 content_root 未置位的任务（如 HTTP）退化为 save_path 本身。
+                // 删除文件
                 if (event.delete_files && !content_root.empty()) {
                     const std::filesystem::path wrapper_dir =
                             std::filesystem::path(save_path) / content_root;
@@ -759,6 +755,7 @@ namespace dw {
                 break;
             }
             case EngineEventType::TASK_FILES: {
+                // todo 可能去除
                 // HTTP 磁盘定名就绪（wrapper 模型）：落定 content_root（判重后 wrapper 目录名）、
                 // is_directory 与 name（原始文件名），同步修正 file_records。BT 不发此事件。
                 // 幂等守卫：content_root 已落定则跳过（全量重下定名沿用既有 wrapper，同值）。

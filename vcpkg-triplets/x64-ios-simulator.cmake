@@ -6,7 +6,7 @@ set(VCPKG_LIBRARY_LINKAGE static)
 set(VCPKG_CMAKE_SYSTEM_NAME iOS)
 set(VCPKG_OSX_SYSROOT iphonesimulator)
 set(VCPKG_OSX_ARCHITECTURES x86_64)
-set(VCPKG_OSX_DEPLOYMENT_TARGET "16.3")
+set(VCPKG_OSX_DEPLOYMENT_TARGET "17.0")
 
 # C++20 支持（std::jthread / std::stop_token 需要）
 set(VCPKG_C_FLAGS "-std=c99")
