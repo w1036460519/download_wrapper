@@ -197,6 +197,7 @@ jobs:
         shell: bash
         run: |
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \

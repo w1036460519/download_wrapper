@@ -608,9 +608,10 @@ namespace dw {
                     if (need_wrap) {
                         // 需要包装：move_storage 迁入包装目录。
                         if (torrent_) {
-                            // 确保包装名已注册（冲突时 acquire 已在判重处调用，多根无冲突时需补调）。
+                            // 多根无冲突场景：base_name 已是最终名称，补齐目录占位使判重可见。
+                            // 冲突场景的占位已在上方 acquire_wrapper_name 调用时物化，无需重复。
                             if (!conflict) {
-                                (void) utils::acquire_wrapper_name(event.save_path, base_name, nullptr);
+                                utils::ensure_placeholder(event.save_path, base_name, true);
                             }
                             // 包装场景 is_dir 恒 true，迁移目标即 full_path。
                             if (torrent_->move_storage(key.c_str(), full_path.c_str()) == 0) {
@@ -668,15 +669,17 @@ namespace dw {
                 rec->reason = event.reason;
                 rec->message = event.message;
                 rec->dirty = true;
-                log_e(key.c_str(), "下载失败 msg=%s",
-                      event.message.c_str());
+                log_e(key.c_str(), "下载失败 msg=%s", event.message.c_str());
                 schedule_needed_ = true;
                 break;
             }
             case EngineEventType::DOWNLOAD_COMPLETED: {
-                // 下载完成：迁 COMPLETED 状态。
+                // 下载完成：迁 COMPLETED 状态，清除错误信息与文件进度缓存（完成态由磁盘存在推断，无需区间缓存）。
                 rec->status = DW_TASK_STATUS_COMPLETED;
+                rec->reason = DW_REASON_NONE;
+                rec->message.clear();
                 rec->dirty = true;
+                store_.delete_file_progress_by_task(rec->client_id, rec->protocol, rec->raw_key());
                 log_i(key.c_str(), "下载完成");
                 schedule_needed_ = true;
                 break;
