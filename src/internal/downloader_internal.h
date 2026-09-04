@@ -9,6 +9,7 @@
 #include "core/task_record.h"
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <source_location>
@@ -84,10 +85,10 @@ namespace dw {
 
         // FILE_PROGRESS 事件字段（BT：连续 piece 达 1% 阈值后合并的文件内区间）
         int32_t file_index = -1; // 目标文件索引（libtorrent 文件序号，-1=未设置）
-        std::string file_path; // 文件物理路径（引擎侧拼好，handle 视角 save_path/相对路径）
-        int64_t offset_start = 0; // 区间起点（文件内相对偏移，含）
-        int64_t offset_end = 0; // 区间终点（文件内相对偏移，含）
+        std::string file_path; // 文件相对路径（引擎侧，handle 视角相对路径）
+        std::string full_path; // 完整路径（save_path + file_path，供调用方直接使用）
         int64_t file_size = 0; // 文件总大小（bytes，供完成判定）
+        std::map<int64_t, int64_t> intervals; // 有序区间集合（key=offset_start, value=offset_end），序列化后保存
     };
 
     // ---- 枚举名称序列化（供 to_string 重载使用）----
@@ -188,6 +189,20 @@ namespace dw {
         obj["etag"] = e.etag;
         obj["last_modified"] = e.last_modified;
         obj["resume_size"] = e.resume_data.size();
+        // FILE_PROGRESS 字段
+        obj["file_index"] = e.file_index;
+        obj["file_path"] = e.file_path;
+        obj["full_path"] = e.full_path;
+        obj["file_size"] = e.file_size;
+        // 区间集合序列化
+        boost::json::array intervals_arr;
+        for (const auto &[start, end] : e.intervals) {
+            boost::json::array interval;
+            interval.push_back(start);
+            interval.push_back(end);
+            intervals_arr.push_back(std::move(interval));
+        }
+        obj["intervals"] = std::move(intervals_arr);
         return boost::json::serialize(obj);
     }
 

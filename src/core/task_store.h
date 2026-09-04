@@ -107,18 +107,18 @@ public:
     int64_t get_play_position(const std::string &file_path);
     
     // ---- 文件下载进度缓存（file_progress_cache：三要素 + file_index 定位，物理路径供 App 关联）----
-    // 区间为闭区间 [offset_start, offset_end]；engine 侧按 1% 文件大小（兑底 4 piece）判定后才入库。
+    // intervals 为 JSON 序列化区间集合：[[start1,end1],[start2,end2],...]；engine 侧按 1% 文件大小（兑底 4 piece）判定后才入库。
 
     /// 全量重写多个文件的进度区间（单事务）：先删该文件旧区间再插入，HTTP 周期快照用。
     void replace_file_progress(const std::string &client_id, dw_protocol_t protocol,
                               const std::string &natural_key,
                               const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t>>> &file_ranges);
-    /// 增量合并一个下载区间（BT piece 事件驱动）：与既有区间重叠/相邻则合并为一行，
-    /// 返回该文件合并后的累计已下载字节（供调用方判定文件完成）。
-    int64_t upsert_file_progress(const std::string &client_id, dw_protocol_t protocol,
-                                 const std::string &natural_key, int32_t file_index,
-                                 const std::string &physical_path,
-                                 int64_t offset_start, int64_t offset_end);
+    /// 保存完整区间集合（BT piece 事件驱动）：UPSERT 语义，直接覆盖该文件的 intervals 字段，
+    /// 返回该文件累计已下载字节（供调用方判定文件完成）。
+    int64_t save_file_progress(const std::string &client_id, dw_protocol_t protocol,
+                               const std::string &natural_key, int32_t file_index,
+                               const std::string &physical_path,
+                               const std::string &intervals_json);
     /// 按文件删除进度缓存（文件下载完成，区间失去意义）。
     void delete_file_progress_by_file(const std::string &client_id, dw_protocol_t protocol,
                                      const std::string &natural_key, int32_t file_index);

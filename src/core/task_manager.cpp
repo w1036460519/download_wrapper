@@ -779,12 +779,21 @@ namespace dw {
                 break;
             }
             case EngineEventType::FILE_PROGRESS: {
-                // 文件进度区间就绪（BT 连续 piece 达阈值）：按事件携带的物理路径合并写入
-                // 进度缓存表；文件完成时区间缓存失去意义即删（完成态由"磁盘存在+无缓存"推断）。
-                if (event.file_path.empty()) break; // 引擎未能解析路径：丢弃该区间
-                const int64_t downloaded = store_.upsert_file_progress(
+                // 文件进度区间就绪（BT 连续 piece 达阈值）：引擎侧已合并完整区间集合，
+                // 调用方序列化后直接保存；文件完成时区间缓存失去意义即删。
+                if (event.full_path.empty()) break; // 引擎未能解析路径：丢弃该区间
+                // 序列化区间集合为 JSON：[[start1,end1],[start2,end2],...]
+                boost::json::array intervals_arr;
+                for (const auto &[start, end] : event.intervals) {
+                    boost::json::array interval;
+                    interval.push_back(start);
+                    interval.push_back(end);
+                    intervals_arr.push_back(std::move(interval));
+                }
+                const std::string intervals_json = boost::json::serialize(intervals_arr);
+                const int64_t downloaded = store_.save_file_progress(
                     rec->client_id, rec->protocol, rec->raw_key(), event.file_index,
-                    event.file_path, event.offset_start, event.offset_end);
+                    event.full_path, intervals_json);
                 if (event.file_size > 0 && downloaded >= event.file_size) {
                     store_.delete_file_progress_by_file(rec->client_id, rec->protocol,
                                                         rec->raw_key(), event.file_index);

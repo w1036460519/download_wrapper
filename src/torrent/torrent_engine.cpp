@@ -67,21 +67,11 @@ namespace dw {
         // 前向声明：info_hash_hex 重载（定义在本文件下方）。
         std::string info_hash_hex(const lt::torrent_handle &h);
 
-        // ---- 文件进度区间聚合（piece_finished_alert 驱动）----
-        // 每 (info_hash, file_index) 维护一个待上报区间：piece 连续到达时扩展区间，
-        // 断续或文件切换时结算。累计字节数达到阈值（1% 文件大小，兑底 4 个 piece）才上报。
-        struct ProgressAgg {
-            int64_t start = -1;   // 当前区间起点（文件内相对偏移）
-            int64_t end = -1;     // 当前区间终点（含）
-            int64_t bytes = 0;    // 区间累计字节数
-            int64_t file_size = 0; // 文件总大小（首个 piece 时记录）
-        };
-        std::mutex g_progress_mtx;
-        std::map<std::pair<std::string, int32_t>, ProgressAgg> g_progress_agg;
-        // 阈值兑底：4 个 piece（小文件也至少积累 4 piece 才上报，避免频繁写库）。
-        constexpr int64_t kProgressMinPieces = 4;
+        // ---- 文件进度区间聚合（piece_finished_alert 驱动，bitfield 位运算）----
+        // 引擎侧完成区间合并，调用方直接保存 JSON 序列化后的完整区间集合。
+        // 阈值：1% 文件大小，兑底 4 个 piece。
 
-        // piece 完成处理：切分到相交文件，聚合连续区间，达阈值上报 FILE_PROGRESS 事件。
+        // piece 完成处理：基于 bitfield 位运算收集文件级完整区间，达阈值上报 FILE_PROGRESS 事件。
         // 仅内存操作 + 轻量事件投递，无 DB / IO（引擎回调性能约束）。
         void handle_piece_finished(const lt::torrent_handle &h, lt::piece_index_t piece) {
             if (!g_task_manager || !h.is_valid()) return;
@@ -92,102 +82,100 @@ namespace dw {
                 return;
             }
             if (!ti) return;
-            const std::string key = info_hash_hex(h); // 循环外一次计算（一个 piece 可能跨多文件）
+            const std::string key = info_hash_hex(h);
             if (key.empty()) return;
             const lt::file_storage &fs = ti->files();
             const lt::piece_index_t last = ti->last_piece();
             if (piece < lt::piece_index_t{0} || piece > last) return;
 
             const int64_t piece_len = ti->piece_length();
-            const int64_t piece_start = static_cast<int64_t>(static_cast<int>(piece)) * piece_len;
-            const int64_t piece_end = piece_start + piece_len - 1; // 闭区间
-            const int64_t total = ti->total_size();
-            const int64_t clamped_end = std::min(piece_end, total - 1); // 尾 piece 截断
 
-            std::vector<EngineEvent> outs;
-            {
-                std::lock_guard<std::mutex> lk(g_progress_mtx);
-                // 遍历与该 piece 相交的全部文件（v1 torrent 一个 piece 可能跨文件）。
-                const int file_count = fs.num_files();
-                for (int i = 0; i < file_count; ++i) {
-                    const lt::file_index_t idx{i};
-                    if (fs.pad_file_at(idx)) continue;
-                    const int64_t f_off = fs.file_offset(idx);
-                    const int64_t f_size = fs.file_size(idx);
-                    if (f_size <= 0) continue;
-                    const int64_t f_end = f_off + f_size - 1;
-                    // 无交集
-                    if (piece_start > f_end || clamped_end < f_off) continue;
+            // 1. 获取 bitfield（一次调用获取完整 piece 完成状态）
+            lt::torrent_status status = h.status(lt::torrent_handle::query_pieces);
+            const lt::bitfield &pieces = status.pieces;
 
-                    // 文件内相对偏移（闭区间）
-                    const int64_t s = std::max(piece_start, f_off) - f_off;
-                    const int64_t e = std::min(clamped_end, f_end) - f_off;
-                    if (e < s) continue;
-
-                    ProgressAgg &agg = g_progress_agg[{key, i}];
-                    // 阈值：1% 文件大小，兑底 4 个 piece 字节。
-                    const int64_t threshold = std::max(f_size / 100,
-                                                       kProgressMinPieces * piece_len);
-                    if (agg.file_size == 0) agg.file_size = f_size;
-                    if (agg.start < 0 || s > agg.end + 1) {
-                        // 新区间（首个或与前段断续）：旧区间达阈值则结算，未达按 1% 语义丢弃。
-                        if (agg.start >= 0 && agg.bytes >= threshold) {
-                            EngineEvent ev;
-                            ev.type = EngineEventType::FILE_PROGRESS;
-                            ev.file_index = i;
-                            ev.offset_start = agg.start;
-                            ev.offset_end = agg.end;
-                            ev.file_size = agg.file_size;
-                            outs.push_back(std::move(ev));
-                        }
-                        agg.start = s;
-                        agg.end = e;
-                        agg.bytes = e - s + 1;
-                    } else {
-                        // 连续扩展（可能重叠，取最大端）。
-                        agg.end = std::max(agg.end, e);
-                        agg.bytes = agg.end - agg.start + 1;
-                    }
-                    // 覆盖文件尾：末段区间已完整，即时结算（不受 1% 阈值约束，否则末段
-                    // 无后续触发点将缺失到任务终态）；结算后清聚合器。
-                    if (e == f_size - 1) {
-                        EngineEvent ev;
-                        ev.type = EngineEventType::FILE_PROGRESS;
-                        ev.file_index = i;
-                        ev.offset_start = agg.start;
-                        ev.offset_end = agg.end;
-                        ev.file_size = agg.file_size;
-                        outs.push_back(std::move(ev));
-                        agg.start = -1;
-                        agg.end = -1;
-                        agg.bytes = 0;
-                    }
-                }
+            // 2. 获取 save_path
+            std::string save_path;
+            try {
+                save_path = h.status(lt::torrent_handle::query_save_path).save_path;
+            } catch (...) {
             }
-            // 结算事件统一补物理路径：handle 当前 save_path / 文件相对路径。
-            // 仅达阈值结算时发生（频率受 1% 阈值约束），单次 status 查询可接受；
-            // 路径解析失败置空，消费侧按空路径守卫丢弃。
-            if (!outs.empty()) {
-                std::string sp;
-                try {
-                    sp = h.status(lt::torrent_handle::query_save_path).save_path;
-                } catch (...) {
-                }
-                for (auto &ev: outs) {
-                    try {
-                        if (!sp.empty()) {
-                            ev.file_path = (std::filesystem::path(sp) /
-                                            fs.file_path(lt::file_index_t{ev.file_index})).string();
-                        }
-                    } catch (...) {
-                        ev.file_path.clear();
-                    }
-                }
-            }
-            for (auto &ev: outs) {
+
+            // 3. 遍历文件，收集每个文件的完整区间
+            const int file_count = fs.num_files();
+            for (int i = 0; i < file_count; ++i) {
+                const lt::file_index_t idx{i};
+                if (fs.pad_file_at(idx)) continue;
+                const int64_t f_off = fs.file_offset(idx);
+                const int64_t f_size = fs.file_size(idx);
+                if (f_size <= 0) continue;
+                const int64_t f_end = f_off + f_size - 1;
+
+                // 计算文件的 piece 范围
+                const int f_piece_start = static_cast<int>(f_off / piece_len);
+                const int f_piece_end = static_cast<int>((f_off + f_size - 1) / piece_len);
+
+                // 判断 piece 是否在当前文件中
+                const int piece_idx = static_cast<int>(piece);
+                if (piece_idx < f_piece_start || piece_idx > f_piece_end) continue;
+
+                // 构建 file_event
+                EngineEvent ev;
+                ev.type = EngineEventType::FILE_PROGRESS;
                 ev.engine_key = key;
                 ev.protocol = DW_PROTOCOL_TORRENT;
-                g_task_manager->on_engine_event(std::move(ev));
+                ev.file_index = i;
+                ev.file_size = f_size;
+                ev.file_path = fs.file_path(idx);
+                if (!save_path.empty()) {
+                    ev.full_path = (std::filesystem::path(save_path) / fs.file_path(idx)).string();
+                }
+
+                // 阈值：1% 文件大小，兑底 4 个 piece 字节
+                const int64_t threshold = std::max(f_size / 100, 4 * piece_len);
+
+                // 从文件的开始 piece_index 遍历，计算连续区间
+                int j = f_piece_start;
+                while (j <= f_piece_end) {
+                    // 跳过未完成的 piece
+                    if (!pieces.get_bit(j)) {
+                        ++j;
+                        continue;
+                    }
+                    // 找到连续完成的起点
+                    int start = j;
+                    while (j <= f_piece_end && pieces.get_bit(j)) {
+                        ++j;
+                    }
+                    int end = j - 1;
+
+                    // 计算文件内的 byte 范围（闭区间）
+                    const int64_t range_start = std::max(
+                        static_cast<int64_t>(start) * piece_len, f_off) - f_off;
+                    const int64_t range_end = std::min(
+                        static_cast<int64_t>(end + 1) * piece_len - 1, f_end) - f_off;
+                    if (range_end < range_start) continue;
+
+                    const int64_t bytes = range_end - range_start + 1;
+                    if (bytes < threshold) continue;  // 未达阈值，跳过
+
+                    // 放入区间集合（std::map 自动按 offset_start 有序）
+                    ev.intervals[range_start] = range_end;
+                }
+
+                // 检查文件是否全部下载完成
+                if (ev.intervals.size() == 1) {
+                    auto it = ev.intervals.begin();
+                    if (it->first == 0 && it->second == f_size - 1) {
+                        log_i(key.c_str(), "文件已下载完成：%s", ev.file_path.c_str());
+                        continue;  // 跳过不发送事件
+                    }
+                }
+
+                // 发送事件（区间集合已完整，调用方直接序列化保存）
+                if (!ev.intervals.empty()) {
+                    g_task_manager->on_engine_event(std::move(ev));
+                }
             }
         }
 

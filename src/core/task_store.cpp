@@ -214,18 +214,17 @@ namespace dw {
                 ");"
                 "CREATE INDEX IF NOT EXISTS idx_file_records_task ON file_records(key_type, natural_key);"
                 "CREATE INDEX IF NOT EXISTS idx_file_records_save_path ON file_records(save_path);"
-                // 文件下载进度缓存：已下载连续字节区间（闭区间），engine 按三要素 + file_index
-                // 维护，App 按物理路径关联；文件完成即删（区别于旧 file_segments 的持久保留语义）。
+                // 文件下载进度缓存：已下载连续字节区间集合（JSON 序列化），engine 按三要素 + file_index
+                // 维护完整区间集合，调用方直接保存；文件完成即删（区别于旧 file_segments 的持久保留语义）。
                 "CREATE TABLE IF NOT EXISTS file_progress_cache ("
                 "  client_id     TEXT NOT NULL,"
                 "  key_type      INTEGER NOT NULL,"
                 "  natural_key   TEXT NOT NULL,"
                 "  file_index    INTEGER NOT NULL,"
                 "  physical_path TEXT NOT NULL,"
-                "  offset_start  INTEGER NOT NULL,"
-                "  offset_end    INTEGER NOT NULL,"
+                "  intervals     TEXT NOT NULL,"  // JSON 序列化区间集合：[[start1,end1],[start2,end2],...]
                 "  modified_at   INTEGER,"
-                "  PRIMARY KEY (client_id, key_type, natural_key, file_index, offset_start)"
+                "  PRIMARY KEY (client_id, key_type, natural_key, file_index)"
                 ");"
                 "CREATE INDEX IF NOT EXISTS idx_fpc_path ON file_progress_cache(physical_path);"
                 // 播放进度表：独立于任务生命周期，以物理路径为唯一标识。
@@ -739,140 +738,79 @@ namespace dw {
         const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t> > > &file_ranges) {
         if (file_ranges.empty()) return;
         sqlite3_exec(db_, "BEGIN;", nullptr, nullptr, nullptr);
-        // 先删除涉及文件的旧区间（按三要素 + file_index 精准清除），再全量插入。
-        {
-            sqlite3_stmt *del = nullptr;
-            if (sqlite3_prepare_v2(db_,
-                                   "DELETE FROM file_progress_cache"
-                                   " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?;",
-                                   -1, &del, nullptr) != SQLITE_OK) {
-                sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-                return;
-            }
-            for (const auto &[path, idx, segs]: file_ranges) {
-                if (segs.empty()) continue;
-                sqlite3_reset(del);
-                sqlite3_bind_text(del, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(del, 2, static_cast<int>(protocol));
-                sqlite3_bind_text(del, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(del, 4, idx);
-                sqlite3_step(del);
-            }
-            sqlite3_finalize(del);
+        const char *sql =
+                "INSERT OR REPLACE INTO file_progress_cache"
+                " (client_id, key_type, natural_key, file_index, physical_path, intervals, modified_at)"
+                " VALUES (?,?,?,?,?,?,?);";
+        sqlite3_stmt *st = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            return;
         }
-        {
-            const char *sql =
-                    "INSERT INTO file_progress_cache"
-                    " (client_id, key_type, natural_key, file_index, physical_path, offset_start, offset_end, modified_at)"
-                    " VALUES (?,?,?,?,?,?,?,?);";
-            sqlite3_stmt *st = nullptr;
-            if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
-                sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-                return;
+        for (const auto &[path, idx, segs]: file_ranges) {
+            if (segs.empty()) continue;
+            // 序列化区间集合为 JSON：[[start1,end1],[start2,end2],...]
+            boost::json::array intervals_arr;
+            for (const auto &seg: segs) {
+                boost::json::array interval;
+                interval.push_back(seg.start);
+                interval.push_back(seg.end);
+                intervals_arr.push_back(std::move(interval));
             }
-            for (const auto &[path, idx, segs]: file_ranges) {
-                for (const auto &seg: segs) {
-                    sqlite3_reset(st);
-                    sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(st, 2, static_cast<int>(protocol));
-                    sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(st, 4, idx);
-                    sqlite3_bind_text(st, 5, path.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int64(st, 6, seg.start);
-                    sqlite3_bind_int64(st, 7, seg.end);
-                    sqlite3_bind_int64(st, 8, now_unix_ms());
-                    sqlite3_step(st);
-                }
-            }
-            sqlite3_finalize(st);
+            const std::string intervals_json = boost::json::serialize(intervals_arr);
+            sqlite3_reset(st);
+            sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 2, static_cast<int>(protocol));
+            sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 4, idx);
+            sqlite3_bind_text(st, 5, path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 6, intervals_json.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 7, now_unix_ms());
+            sqlite3_step(st);
         }
+        sqlite3_finalize(st);
         sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
     }
 
-    int64_t TaskStore::upsert_file_progress(const std::string &client_id, dw_protocol_t protocol,
-                                            const std::string &natural_key, int32_t file_index,
-                                            const std::string &physical_path,
-                                            int64_t offset_start, int64_t offset_end) {
-        if (offset_start < 0 || offset_end < offset_start) return 0;
+    int64_t TaskStore::save_file_progress(const std::string &client_id, dw_protocol_t protocol,
+                                          const std::string &natural_key, int32_t file_index,
+                                          const std::string &physical_path,
+                                          const std::string &intervals_json) {
+        if (intervals_json.empty()) return 0;
         int64_t total = 0;
-        sqlite3_exec(db_, "BEGIN;", nullptr, nullptr, nullptr);
-        // 合并语义：选出与新区间重叠或相邻（端点相接）的既有行，内存合并后删旧插新。
-        sqlite3_stmt *sel = nullptr;
-        int64_t merge_start = offset_start;
-        int64_t merge_end = offset_end;
+        // UPSERT 语义：直接覆盖该文件的 intervals 字段
+        sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_,
-                               "SELECT offset_start, offset_end FROM file_progress_cache"
-                               " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?"
-                               "   AND offset_start <= ? AND offset_end + 1 >= ?;",
-                               -1, &sel, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(sel, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(sel, 2, static_cast<int>(protocol));
-            sqlite3_bind_text(sel, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(sel, 4, file_index);
-            // 重叠/相邻判定：旧行区间 [s,e] 与新区间 [ns,ne] 满足 s <= ne 且 e+1 >= ns。
-            sqlite3_bind_int64(sel, 5, offset_end);
-            sqlite3_bind_int64(sel, 6, offset_start);
-            std::vector<std::pair<int64_t, int64_t> > olds;
-            while (sqlite3_step(sel) == SQLITE_ROW) {
-                const int64_t s = sqlite3_column_int64(sel, 0);
-                const int64_t e = sqlite3_column_int64(sel, 1);
-                olds.emplace_back(s, e);
-                merge_start = std::min(merge_start, s);
-                merge_end = std::max(merge_end, e);
-            }
-            sqlite3_finalize(sel);
-            if (!olds.empty()) {
-                sqlite3_stmt *del = nullptr;
-                if (sqlite3_prepare_v2(db_,
-                                       "DELETE FROM file_progress_cache"
-                                       " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?"
-                                       "   AND offset_start >= ? AND offset_start <= ?;",
-                                       -1, &del, nullptr) == SQLITE_OK) {
-                    sqlite3_bind_text(del, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(del, 2, static_cast<int>(protocol));
-                    sqlite3_bind_text(del, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(del, 4, file_index);
-                    // 删除范围：与合并区间有交集的行（起点落在合并区间内）。
-                    sqlite3_bind_int64(del, 5, merge_start);
-                    sqlite3_bind_int64(del, 6, merge_end);
-                    sqlite3_step(del);
-                    sqlite3_finalize(del);
+                               "INSERT OR REPLACE INTO file_progress_cache"
+                               " (client_id, key_type, natural_key, file_index, physical_path, intervals, modified_at)"
+                               " VALUES (?,?,?,?,?,?,?);",
+                               -1, &st, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 2, static_cast<int>(protocol));
+            sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 4, file_index);
+            sqlite3_bind_text(st, 5, physical_path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 6, intervals_json.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 7, now_unix_ms());
+            sqlite3_step(st);
+            sqlite3_finalize(st);
+        }
+        // 解析 JSON 计算累计已下载字节（供调用方判定文件完成）
+        // 格式：[[start1,end1],[start2,end2],...]
+        try {
+            auto json = boost::json::parse(intervals_json);
+            if (json.is_array()) {
+                for (const auto &interval : json.as_array()) {
+                    if (interval.is_array() && interval.as_array().size() == 2) {
+                        const int64_t start = interval.as_array()[0].as_int64();
+                        const int64_t end = interval.as_array()[1].as_int64();
+                        total += (end - start + 1);
+                    }
                 }
             }
+        } catch (...) {
+            // JSON 解析失败，返回 0
         }
-        {
-            sqlite3_stmt *st = nullptr;
-            if (sqlite3_prepare_v2(db_,
-                                   "INSERT INTO file_progress_cache"
-                                   " (client_id, key_type, natural_key, file_index, physical_path, offset_start, offset_end, modified_at)"
-                                   " VALUES (?,?,?,?,?,?,?,?);",
-                                   -1, &st, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(st, 2, static_cast<int>(protocol));
-                sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(st, 4, file_index);
-                sqlite3_bind_text(st, 5, physical_path.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(st, 6, merge_start);
-                sqlite3_bind_int64(st, 7, merge_end);
-                sqlite3_bind_int64(st, 8, now_unix_ms());
-                sqlite3_step(st);
-                sqlite3_finalize(st);
-            }
-        }
-        // 返回合并后该文件累计已下载字节（供调用方判定文件完成）。
-        sqlite3_stmt *sum = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT COALESCE(SUM(offset_end - offset_start + 1), 0) FROM file_progress_cache"
-                               " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?;",
-                               -1, &sum, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(sum, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(sum, 2, static_cast<int>(protocol));
-            sqlite3_bind_text(sum, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(sum, 4, file_index);
-            if (sqlite3_step(sum) == SQLITE_ROW) total = sqlite3_column_int64(sum, 0);
-            sqlite3_finalize(sum);
-        }
-        sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
         return total;
     }
 
@@ -912,7 +850,7 @@ namespace dw {
         sqlite3_stmt *st = nullptr;
         int64_t total = 0;
         if (sqlite3_prepare_v2(db_,
-                               "SELECT COALESCE(SUM(offset_end - offset_start + 1), 0) FROM file_progress_cache"
+                               "SELECT intervals FROM file_progress_cache"
                                " WHERE client_id=? AND key_type=? AND natural_key=? AND file_index=?;",
                                -1, &st, nullptr) != SQLITE_OK)
             return total;
@@ -920,7 +858,25 @@ namespace dw {
         sqlite3_bind_int(st, 2, static_cast<int>(protocol));
         sqlite3_bind_text(st, 3, natural_key.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 4, file_index);
-        if (sqlite3_step(st) == SQLITE_ROW) total = sqlite3_column_int64(st, 0);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *json_str = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+            if (json_str) {
+                try {
+                    auto json = boost::json::parse(json_str);
+                    if (json.is_array()) {
+                        for (const auto &interval : json.as_array()) {
+                            if (interval.is_array() && interval.as_array().size() == 2) {
+                                const int64_t start = interval.as_array()[0].as_int64();
+                                const int64_t end = interval.as_array()[1].as_int64();
+                                total += (end - start + 1);
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // JSON 解析失败，返回 0
+                }
+            }
+        }
         sqlite3_finalize(st);
         return total;
     }
@@ -929,17 +885,31 @@ namespace dw {
         std::vector<dw_byte_range_t> out;
         // 按物理路径查询已下载区间（App 播放器按物理路径消费；file_index 辅助定位）。
         const char *sql =
-                "SELECT offset_start, offset_end FROM file_progress_cache"
-                " WHERE physical_path=? AND file_index=? ORDER BY offset_start;";
+                "SELECT intervals FROM file_progress_cache"
+                " WHERE physical_path=? AND file_index=?;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
         sqlite3_bind_text(st, 1, physical_path.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 2, file_index);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            dw_byte_range_t seg{};
-            seg.start = sqlite3_column_int64(st, 0);
-            seg.end = sqlite3_column_int64(st, 1);
-            out.push_back(seg);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *json_str = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+            if (json_str) {
+                try {
+                    auto json = boost::json::parse(json_str);
+                    if (json.is_array()) {
+                        for (const auto &interval : json.as_array()) {
+                            if (interval.is_array() && interval.as_array().size() == 2) {
+                                dw_byte_range_t seg{};
+                                seg.start = interval.as_array()[0].as_int64();
+                                seg.end = interval.as_array()[1].as_int64();
+                                out.push_back(seg);
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // JSON 解析失败，返回空
+                }
+            }
         }
         sqlite3_finalize(st);
         return out;
