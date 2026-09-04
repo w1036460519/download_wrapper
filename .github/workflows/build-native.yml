@@ -23,7 +23,7 @@ jobs:
           # macOS：编译 arm64 + x86_64 后用 lipo 合并为单个 universal .dylib
           # bincache 为 vcpkg 默认二进制缓存目录，供 actions/cache 持久化
           - name: macos-universal
-            os: macos-14
+            os: macos-latest
             triplet: ''            # 见下方 macOS 专用步骤，单独处理双 triplet
             output: download-macos-universal.dylib
             bincache: ~/.cache/vcpkg/archives
@@ -52,13 +52,13 @@ jobs:
           # iOS：真机 arm64 静态库（.a）。iOS 不允许加载未签名独立动态库，
           # 故编静态库并合并依赖为自包含胖库，随 Runner 链接
           - name: ios-arm64
-            os: macos-14
+            os: macos-latest
             triplet: arm64-ios
             output: download-ios-arm64.a
             bincache: ~/.cache/vcpkg/archives
           # iOS：模拟器 universal（x86_64 + arm64 合并）
           - name: ios-simulator-universal
-            os: macos-14
+            os: macos-latest
             triplet: ''            # 模拟器专用步骤，单独处理双 triplet
             output: download-ios-simulator-universal.a
             bincache: ~/.cache/vcpkg/archives
