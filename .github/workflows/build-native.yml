@@ -25,32 +25,44 @@ jobs:
           - name: macos-universal
             os: macos-14
             triplet: ''            # 见下方 macOS 专用步骤，单独处理双 triplet
-            output: libdownload_wrapper.dylib
+            output: download-macos-universal.dylib
             bincache: ~/.cache/vcpkg/archives
           # Linux 仅 x86_64
           - name: linux-x64
             os: ubuntu-24.04
             triplet: x64-linux
-            output: libdownload_wrapper.so
+            output: download-linux-x64.so
             bincache: ~/.cache/vcpkg/archives
           # Windows 仅 x64（static-md：依赖静态链入 DLL，CRT 用系统动态运行时，产物自包含）
           - name: windows-x64
             os: windows-2022
             triplet: x64-windows-static-md
-            output: download_wrapper.dll
+            output: download-windows-x64.dll
             bincache: ~\AppData\Local\vcpkg\archives
           # iOS：真机 arm64 静态库（.a）。iOS 不允许加载未签名独立动态库，
           # 故编静态库并合并依赖为自包含胖库，随 Runner 链接
           - name: ios-arm64
             os: macos-14
             triplet: arm64-ios
-            output: libdownload_wrapper.a
+            output: download-ios-arm64.a
             bincache: ~/.cache/vcpkg/archives
-          # Android：仅 arm64-v8a（NDK 交叉编译，.so 依赖静态链入自包含）
-          - name: android-arm64-v8a
+          # iOS：模拟器 universal（x86_64 + arm64 合并）
+          - name: ios-simulator-universal
+            os: macos-14
+            triplet: ''            # 模拟器专用步骤，单独处理双 triplet
+            output: download-ios-simulator-universal.a
+            bincache: ~/.cache/vcpkg/archives
+          # Android：arm64-v8a（真机）
+          - name: android-arm64
             os: ubuntu-24.04
             triplet: arm64-android
-            output: libdownload_wrapper.so
+            output: download-android-arm64.so
+            bincache: ~/.cache/vcpkg/archives
+          # Android：x86_64（模拟器）
+          - name: android-x64
+            os: ubuntu-24.04
+            triplet: x64-android
+            output: download-android-x64.so
             bincache: ~/.cache/vcpkg/archives
 
     runs-on: ${{ matrix.os }}
@@ -124,24 +136,24 @@ jobs:
           # 合并为 universal binary
           mkdir -p dist
           lipo -create \
-            build-arm64/libdownload_wrapper.dylib \
-            build-x64/libdownload_wrapper.dylib \
-            -output dist/libdownload_wrapper.dylib
+            build-arm64/download-macos-arm64.dylib \
+            build-x64/download-macos-x64.dylib \
+            -output dist/download-macos-universal.dylib
 
           # strip 符号：Release 无调试信息但仍保留静态链入依赖的符号表。
           # -x 只去除本地符号，保留动态库加载必需的导出符号，最稳妥。
           echo "== strip 前 =="
           ls -l dist
-          strip -x dist/libdownload_wrapper.dylib
+          strip -x dist/download-macos-universal.dylib
           echo "== strip 后 =="
           ls -l dist
 
           echo "== universal binary 架构验证 =="
-          lipo -info dist/libdownload_wrapper.dylib
-          file dist/libdownload_wrapper.dylib
+          lipo -info dist/download-macos-universal.dylib
+          file dist/download-macos-universal.dylib
 
           echo "== 部署目标验证（各架构 minos 应为 13.3）=="
-          otool -l dist/libdownload_wrapper.dylib | grep -A3 LC_BUILD_VERSION || true
+          otool -l dist/download-macos-universal.dylib | grep -A3 LC_BUILD_VERSION || true
 
       # ---------- Linux / Windows：单架构 ----------
       - name: Build (${{ matrix.name }})
@@ -164,7 +176,7 @@ jobs:
           if [ "${{ matrix.name }}" = "linux-x64" ]; then
             echo "== strip 前 =="
             ls -l dist
-            strip --strip-unneeded dist/libdownload_wrapper.so
+            strip --strip-unneeded "dist/${{ matrix.output }}"
             echo "== strip 后 =="
           fi
           ls -l dist
@@ -188,16 +200,63 @@ jobs:
           mkdir -p dist
           # STATIC 库只含 download_wrapper 自身符号；需将 vcpkg 依赖（curl/libtorrent/boost/openssl）
           # 一并合并为自包含胖静态库，供 Runner 直接链接。
-          SELF_LIB=$(find build -name "libdownload_wrapper.a" | head -1)
+          SELF_LIB=$(find build -name "download-ios-arm64.a" | head -1)
           DEP_LIB_DIR=$(find . -type d -path "*vcpkg_installed/arm64-ios/lib" | head -1)
           echo "self=$SELF_LIB deps=$DEP_LIB_DIR"
-          libtool -static -o dist/libdownload_wrapper.a "$SELF_LIB" "$DEP_LIB_DIR"/*.a
+          libtool -static -o dist/download-ios-arm64.a "$SELF_LIB" "$DEP_LIB_DIR"/*.a
           echo "== 静态库架构验证 =="
-          lipo -info dist/libdownload_wrapper.a
+          lipo -info dist/download-ios-arm64.a
 
-      # ---------- Android：arm64-v8a 动态库（.so，依赖静态链入自包含）----------
-      - name: Build (Android arm64-v8a)
-        if: matrix.name == 'android-arm64-v8a'
+      # ---------- iOS：模拟器 universal（x86_64 + arm64 合并）----------
+      - name: Build (iOS simulator universal)
+        if: matrix.name == 'ios-simulator-universal'
+        shell: bash
+        run: |
+          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
+
+          # arm64 模拟器
+          cmake -B build-sim-arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DDW_BUILD_SHARED=OFF \
+            -DVCPKG_TARGET_TRIPLET=arm64-ios \
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+          cmake --build build-sim-arm64 --config Release
+
+          # x86_64 模拟器
+          cmake -B build-sim-x64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DDW_BUILD_SHARED=OFF \
+            -DVCPKG_TARGET_TRIPLET=x64-osx \
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+          cmake --build build-sim-x64 --config Release
+
+          mkdir -p dist
+          # 合并各自依赖为自包含胖静态库
+          SELF_ARM64=$(find build-sim-arm64 -name "download-ios-simulator-arm64.a" | head -1)
+          SELF_X64=$(find build-sim-x64 -name "download-ios-simulator-x64.a" | head -1)
+          DEP_ARM64=$(find . -type d -path "*vcpkg_installed/arm64-ios/lib" | head -1)
+          DEP_X64=$(find . -type d -path "*vcpkg_installed/x64-osx/lib" | head -1)
+
+          # 先分别合并为单架构胖库
+          libtool -static -o "$RUNNER_TEMP/sim-arm64.a" "$SELF_ARM64" "$DEP_ARM64"/*.a
+          libtool -static -o "$RUNNER_TEMP/sim-x64.a" "$SELF_X64" "$DEP_X64"/*.a
+
+          # 再合并为 universal
+          lipo -create "$RUNNER_TEMP/sim-arm64.a" "$RUNNER_TEMP/sim-x64.a" \
+            -output dist/download-ios-simulator-universal.a
+          echo "== 模拟器 universal 架构验证 =="
+          lipo -info dist/download-ios-simulator-universal.a
+
+      # ---------- Android：arm64 / x64 动态库（.so，依赖静态链入自包含）----------
+      - name: Build (Android ${{ matrix.name }})
+        if: matrix.name == 'android-arm64' || matrix.name == 'android-x64'
         shell: bash
         run: |
           export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
@@ -212,17 +271,27 @@ jobs:
           # 客观要求 Android 最低 API 28，主项目 ANDROID_PLATFORM 必须与之一致；
           # 否则按 android-21 链接时 sysroot 缺这些符号，触发 undefined symbol 链接失败。
           # 注意：App 侧 download_app 的 minSdkVersion 需同步 >= 28。
+
+          # 按 matrix 选择 ABI 和 triplet
+          if [ "${{ matrix.name }}" = "android-arm64" ]; then
+            ABI="arm64-v8a"
+            ANDROID_TRIPLET="arm64-android"
+          else
+            ABI="x86_64"
+            ANDROID_TRIPLET="x64-android"
+          fi
+
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DVCPKG_TARGET_TRIPLET=arm64-android \
+            -DVCPKG_TARGET_TRIPLET="$ANDROID_TRIPLET" \
             -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
             -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
-            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_ABI="$ABI" \
             -DANDROID_PLATFORM=android-28
           cmake --build build --config Release
 
           mkdir -p dist
-          find build -name "libdownload_wrapper.so" -exec cp {} dist/ \;
+          find build -name "${{ matrix.output }}" -exec cp {} dist/ \;
 
           # strip 符号：NDK 直接输出的 .so 保留了完整符号表与 C++ 异常展开信息，
           # 加上静态链入的 libtorrent/boost/openssl/curl，未裁剪时体积可达数十 MB。
@@ -232,7 +301,7 @@ jobs:
           echo "strip=$STRIP"
           echo "== strip 前 =="
           ls -l dist
-          "$STRIP" --strip-unneeded dist/libdownload_wrapper.so
+          "$STRIP" --strip-unneeded "dist/${{ matrix.output }}"
           echo "== strip 后 =="
           ls -l dist
 
@@ -259,19 +328,12 @@ jobs:
         with:
           path: artifacts
 
-      # 展平目录并重命名：避免不同平台同名 .so 相互覆盖（linux 与 android 均为 libdownload_wrapper.so）
+      # 展平目录：CMake 已按 download-{platform}-{arch}.{ext} 命名，直接收集
       - name: Collect release assets
         run: |
           mkdir -p release
           for dir in artifacts/*/; do
-            plat=$(basename "$dir")            # 形如 download_wrapper-linux-x64
-            for f in "$dir"*; do
-              base=$(basename "$f")
-              ext="${base##*.}"
-              name="${base%.*}"
-              # 以平台名作后缀区分，保证 Release 资产名唯一
-              cp "$f" "release/${name}-${plat#download_wrapper-}.${ext}"
-            done
+            cp "$dir"* release/ 2>/dev/null || true
           done
           echo "== 待发布资产 =="
           ls -l release
