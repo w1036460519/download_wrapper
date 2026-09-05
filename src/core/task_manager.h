@@ -55,9 +55,6 @@ namespace dw {
         /// 注入引擎（由 download_wrapper.cpp 在 init 时提供，经统一接口分发）。
         void set_engines(IDownloadEngine *http, IDownloadEngine *torrent);
 
-        /// 设置合成态进度回调（用于 QUEUED/PAUSED 等库自身管理的状态推送）。
-        void set_progress_cb(dw_progress_cb cb);
-
         /// 打开 DB、建表、加载注册表、启动调度线程；恢复既有任务由调度线程按并发上限重新准入。
         int32_t start(const dw_config_t &cfg);
 
@@ -65,6 +62,10 @@ namespace dw {
         void stop();
 
         // ---- 控制操作（C ABI 转发到此） ----
+
+        /// 添加任务。
+        /// @param force 强制重新添加：清理内存与 DB 中的旧记录（含 resume_data），从零开始；
+        ///              false 时若任务已存在则仅刷新 created_at 用于排序置顶。
         int32_t add(dw_protocol_t proto, const dw_task_params_t *params, dw_submit_result_t *out,
                     bool force = false);
 
@@ -120,7 +121,7 @@ namespace dw {
         /// 事件经值语义拷贝后投递，线程安全。
         void on_engine_event(EngineEvent event);
 
-        // ---- 唯一名定名（add 内部与引擎 request_unique_name 上调共用） ----
+        // ---- 唯一名定名（add 内部使用） ----
         /// 持 mtx_ 抢占唯一 wrapper 名：以磁盘为唯一判重真相源（不查库），候选名未
         /// 被占用即立即创建 wrapper 目录物化占位（"定名即持有"），冲突则整名尾部
         /// 自增 (n) 作为 wrapper 名。随后回写 name=wrapper、save_path=原 dir（不变）、
@@ -169,9 +170,9 @@ namespace dw {
         /// 全量清理指定 save_path 下的非下载任务（source IN (1,2)）：DB + 物理文件。
         int32_t clear_local_tasks(const std::string &save_path);
 
-        /// 删除单个本地文件任务（source=1）：仅 DB + 磁盘清理，不涉及 engine 层。
+        /// 删除单个本地文件条目（type=1）：仅 DB + 磁盘清理，不涉及 engine 层。
         /// 下载任务（source=0）拒绝，应走 dw_delete_task。
-        int32_t delete_local_entry(dw_protocol_t proto, const std::string &natural_key);
+        int32_t delete_local_entry(const std::string &save_path, const std::string &root_name);
 
         // ---- 路径与展示辅助（静态，不依赖实例态） ----
 
@@ -223,7 +224,7 @@ namespace dw {
         // 统一进度转发：由记录（权威态 + 采集遥测）构造 dw_progress_t 发上层（不持 mtx_）；
         // remaining/eta 由 total_size/total_done/download_rate 现算。QUEUED/PAUSED 合成帧同走此路径，
         // 遥测字段已在状态迁移时归零。
-        void emit_progress(dw_progress_cb cb, const TaskRecord &rec);
+        void emit_progress(const TaskRecord &rec);
 
         // 播放提优动作：run_schedule 收集，maintenance_loop 锁外执行引擎调用。
         struct PlayingAction {
@@ -322,10 +323,12 @@ namespace dw {
 
         IDownloadEngine *http_ = nullptr;
         IDownloadEngine *torrent_ = nullptr;
-        dw_progress_cb progress_cb_ = nullptr;
         std::string client_id_; // App 启动时注入的 UUIDv4
 
         // 由 (client_id, protocol, raw_key) 构造 union_id，供 tasks_ 查找。
+        static std::string union_id_of(const std::string &client_id, const dw_protocol_t proto, const std::string &raw_key) {
+            return client_id + '|' + std::string(to_string(proto)) + '|' + raw_key;
+        }
         std::string union_id_of(const dw_protocol_t proto, const std::string &raw_key) const {
             return client_id_ + '|' + std::string(to_string(proto)) + '|' + raw_key;
         }

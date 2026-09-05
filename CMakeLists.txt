@@ -51,6 +51,7 @@ endif()
 # 源文件
 set(DW_SOURCES
     src/download_wrapper.cpp
+    src/core/router.cpp
     src/core/task_manager.cpp
     src/core/task_store.cpp
     src/http/http_engine.cpp

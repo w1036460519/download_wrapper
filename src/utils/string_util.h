@@ -63,6 +63,25 @@ namespace dw::utils {
  * @return 忽略大小写后两串相等返回 true。
  */
     bool iequals(std::string_view a, std::string_view b) noexcept;
+
+    /**
+     * std::string 拷贝为堆分配 C 字符串（malloc 分配，调用方负责 std::free 释放）。
+     *
+     * C ABI 快照中大量字符串字段须从 std::string 拷贝到堆上移交调用方，
+     * 统一收敛到此处，避免各文件重复实现 malloc+memcpy 模式。
+     *
+     * @param s 待拷贝字符串。
+     * @return 堆分配的 '\0' 结尾副本；内存不足返回 nullptr。
+     */
+    char *dup_cstr(const std::string &s);
+
+    /**
+     * const char* 拷贝为堆分配 C 字符串（malloc 分配，调用方负责 std::free 释放）。
+     *
+     * @param s 待拷贝字符串（允许 nullptr）。
+     * @return 堆分配的 '\0' 结尾副本；s 为 nullptr 或空串返回 nullptr。
+     */
+    char *dup_cstr(const char *s);
 }
 
 

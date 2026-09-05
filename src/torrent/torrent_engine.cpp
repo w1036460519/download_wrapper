@@ -538,12 +538,6 @@ namespace dw {
             if (file_count <= 0) return files;
             files.reserve(file_count);
 
-            auto dup = [](const std::string &s) -> char * {
-                auto *p = static_cast<char *>(std::malloc(s.size() + 1));
-                if (p) std::memcpy(p, s.c_str(), s.size() + 1);
-                return p;
-            };
-
             for (int i = 0; i < file_count; ++i) {
                 const lt::file_index_t idx{i};
                 // 过滤 pad 文件
@@ -558,9 +552,9 @@ namespace dw {
                 f.index = i;
                 f.size = fs.file_size(idx);
                 f.offset = fs.file_offset(idx);
-                f.name = dup(path);
+                f.name = utils::dup_cstr(path);
                 const std::string ext = dw::utils::file_extension(path);
-                f.ext = ext.empty() ? nullptr : dup(ext);
+                f.ext = ext.empty() ? nullptr : utils::dup_cstr(ext);
                 f.status = 0; // 下载中
                 f.downloaded_bytes = 0; // PARSED 时刻无 piece 下载，初始为 0
                 files.push_back(f);
@@ -1087,9 +1081,7 @@ namespace dw {
         } else {
             return nullptr;
         }
-        auto *result = static_cast<char *>(std::malloc(s.size() + 1));
-        if (result) std::memcpy(result, s.c_str(), s.size() + 1);
-        return result;
+        return utils::dup_cstr(s);
     }
 
     char *TorrentEngine::torrent_file_to_info_hash(const char *torrent_file_path) {
@@ -1111,9 +1103,7 @@ namespace dw {
         } else {
             return nullptr;
         }
-        auto *result = static_cast<char *>(std::malloc(s.size() + 1));
-        if (result) std::memcpy(result, s.c_str(), s.size() + 1);
-        return result;
+        return utils::dup_cstr(s);
     }
 
     char *TorrentEngine::info_hash_to_magnet(const char *task_id) {
@@ -1129,10 +1119,8 @@ namespace dw {
         try {
             const std::string magnet = lt::make_magnet_uri(handle);
             if (magnet.empty()) return nullptr;
-            auto *result = static_cast<char *>(std::malloc(magnet.size() + 1));
-            if (result) std::memcpy(result, magnet.c_str(), magnet.size() + 1);
             log_i(task_id, "info_hash_to_magnet 成功");
-            return result;
+            return utils::dup_cstr(magnet);
         } catch (const std::exception &e) {
             log_e(task_id, "生成磁力链接失败: %s", e.what());
             return nullptr;
@@ -1161,11 +1149,10 @@ namespace dw {
 
         // 种子名称
         const std::string name = ti->name();
-        *out_name = static_cast<char *>(std::malloc(name.size() + 1));
+        *out_name = utils::dup_cstr(name);
         if (!*out_name) {
             return -1;
         }
-        std::memcpy(*out_name, name.c_str(), name.size() + 1);
 
         // info_hash
         const lt::info_hash_t &hashes = ti->info_hashes();
@@ -1180,13 +1167,12 @@ namespace dw {
             *out_name = nullptr;
             return -1;
         }
-        *out_info_hash = static_cast<char *>(std::malloc(info_hash_str.size() + 1));
+        *out_info_hash = utils::dup_cstr(info_hash_str);
         if (!*out_info_hash) {
             std::free(*out_name);
             *out_name = nullptr;
             return -1;
         }
-        std::memcpy(*out_info_hash, info_hash_str.c_str(), info_hash_str.size() + 1);
 
         // 文件列表
         if (fill_file_list(ti, out_files, out_count) != 0) {

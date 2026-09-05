@@ -212,7 +212,6 @@ namespace dw {
         boost::json::object obj;
         obj["save_path"] = p.save_path ? p.save_path : "";
         obj["url"] = p.url ? p.url : "";
-        obj["trace_id"] = p.trace_id ? p.trace_id : "";
         obj["info_hash"] = p.info_hash ? p.info_hash : "";
         obj["magnet"] = p.magnet_link ? p.magnet_link : "";
         obj["torrent"] = p.torrent_file ? p.torrent_file : "";
@@ -225,10 +224,43 @@ namespace dw {
         return boost::json::serialize(obj);
     }
 
+    // ---- dw_config_t 序列化（调试日志用）----
+
+    inline std::string to_string(const dw_config_t &c) {
+        boost::json::object obj;
+        // HTTP 配置
+        obj["connect_timeout"] = c.connect_timeout_seconds;
+        obj["request_timeout"] = c.request_timeout_seconds;
+        obj["low_speed_limit"] = c.low_speed_limit_bps;
+        obj["low_speed_time"] = c.low_speed_time;
+        obj["max_redirect"] = c.max_redirect;
+        obj["proxy"] = c.proxy ? c.proxy : "";
+        obj["user_agent"] = c.user_agent ? c.user_agent : "";
+        obj["verify_ssl"] = c.verify_ssl;
+        obj["ca_bundle"] = c.ca_bundle ? c.ca_bundle : "";
+        obj["max_retries"] = c.max_retries;
+        obj["default_parts"] = c.default_parts;
+        obj["min_size_for_split"] = c.min_size_for_split;
+        // BT 配置
+        obj["listen_port"] = c.listen_port;
+        obj["max_concurrent"] = c.max_concurrent_downloads;
+        obj["dl_rate_limit"] = c.download_rate_limit;
+        obj["ul_rate_limit"] = c.upload_rate_limit;
+        obj["seed_ratio"] = c.seed_ratio_limit;
+        // 通用配置
+        obj["callback_interval"] = c.status_callback_interval_ms;
+        obj["log_level"] = static_cast<int>(c.log_level);
+        obj["work_dir"] = c.work_dir ? c.work_dir : "";
+        obj["client_id"] = c.client_id ? c.client_id : "";
+        return boost::json::serialize(obj);
+    }
+
+    class Router;
+
     /**
      * 下载器全局单例内部实现。
      *
-     * 持有 HTTP 和 BT 两个引擎实例，以及回调函数指针与。
+     * 持有 HTTP 和 BT 两个引擎实例，通过 Router 路由到 TaskManager。
      */
     struct dw_downloader {
         std::mutex mutex;
@@ -236,10 +268,10 @@ namespace dw {
 
         std::unique_ptr<HttpEngine> http_engine;
         std::unique_ptr<TorrentEngine> torrent_engine;
-        std::unique_ptr<TaskManager> task_manager;
+        std::unique_ptr<Router> router;  // L2 路由层
 
-        dw_progress_cb progress_cb = nullptr;
-        dw_log_cb log_cb = nullptr;
+        std::atomic<dw_progress_cb> progress_cb{nullptr};
+        std::atomic<dw_log_cb> log_cb{nullptr};
 
         dw_config_t config{};
     };
@@ -248,6 +280,14 @@ namespace dw {
      * 获取全局单例；若未初始化返回 nullptr。
      */
     dw_downloader *global_downloader();
+
+    /**
+     * 安全调用进度回调。
+     *
+     * 内部检查下载器状态与回调有效性，调用失败（未注册/已销毁）时静默忽略，
+     * 不影响业务流程。
+     */
+    void emit_progress(const dw_progress_t *progress);
 
     /**
      * 内部日志输出。
@@ -259,22 +299,6 @@ namespace dw {
                      const char *trace_id = "",
                      const char *func = "",
                      int32_t line = 0);
-
-    /**
-     * 内部唯一名上调：引擎在元数据就绪 / 探测出名时请求定名。
-     *
-     * 内部转 TaskManager::resolve_and_record_name：持锁以磁盘为唯一真相源抢占唯一 wrapper 名
-     * （候选未被占用即立即创建 wrapper 目录物化占位）→ 回写任务 name=wrapper（可能含 (n) 后缀）、
-     * save_path=原 dir（不变）并立即落库（持久预留）。
-     * 返回 wrapper 名（与入参 wrapper_name 不等即重名包层，调用方按目录名创建 wrapper）；
-     * 任务未知时仅抢名返回（不落库）。
-     * 本通道 wrapper 占位恒为目录，多文件 BT 不得经此路径定名（走 PARSED 事件）。
-     */
-    std::string request_unique_name(const char *engine_key,
-                                    dw_protocol_t protocol,
-                                    const char *dir,
-                                    const char *wrapper_name,
-                                    const char *inner_name);
 
     /**
      * 格式化日志输出（内部）。

@@ -17,6 +17,7 @@
 #include "internal/downloader_internal.h"
 #include "utils/string_util.h"
 #include "utils/time_util.h"
+#include "utils/unique_name.h"
 
 // 续传 BLOB 复用 libtorrent bencode 编解码（与 BT resume 同族格式，项目已链接）。
 #include <libtorrent/bdecode.hpp>
@@ -646,20 +647,17 @@ namespace dw {
                         tCtx->filename = "download";
                     }
                 
-                    // 新方案：HTTP 落统一 wrapper 模型。
+                    // HTTP 落统一 wrapper 模型：
                     //   raw_name  = tCtx->filename（wrapper 内的内部文件名，含后缀，如 "Inception.mp4"）
                     //   wrapper   = strip_extension(raw_name)（wrapper 目录名，去后缀，如 "Inception"）
-                    //   unique    = request_unique_name(...)（判重后实际 wrapper 名，含可能的 (n) 后缀）
+                    //   unique    = acquire_wrapper_name(...)（判重后实际 wrapper 名，含可能的 (n) 后缀）
                     //   落盘路径  = output_path / unique / raw_name
-                    //   output_path 保持不变（恒为 save_path），wrapper 目录由 request_unique_name 内物化。
-                    // 恢复任务若 resume 存档失效（全量重下）同样上调，幂等守卫已沿用既有 wrapper。
-                    // 已知允许误差：恢复任务若 resume 存档尚未落库即终止（is_resume=0），此处按首次
-                    // 重新定名，磁盘半成品会命中判重再包一层 name(1) 全量重下，窗口极小不做额外防护。
+                    // 定名即物化占位：acquire_wrapper_name 在磁盘创建 wrapper 目录，
+                    // 后续 TASK_FILES 事件上报给 TaskManager 记录到数据库。
                     const std::string raw_name = tCtx->filename;
                     const std::string wrapper = dw::utils::strip_extension(raw_name);
-                    const std::string unique = dw::request_unique_name(
-                        tCtx->url.c_str(), DW_PROTOCOL_HTTP,
-                        tCtx->output_path.c_str(), wrapper.c_str(), raw_name.c_str());
+                    const std::string unique = dw::utils::acquire_wrapper_name(
+                        tCtx->output_path, wrapper);
                     if (unique != wrapper) {
                         log_i(tCtx->url.c_str(),
                                     "HTTP 判重：wrapper 包层 '%s' -> '%s'", wrapper.c_str(), unique.c_str());

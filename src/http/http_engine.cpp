@@ -7,6 +7,7 @@
 #include "core/task_manager.h"
 #include "http/http_engine_internal.h"
 #include "internal/downloader_internal.h"
+#include "utils/string_util.h"
 #include "utils/time_util.h"
 
 #include <algorithm>
@@ -26,7 +27,7 @@ namespace dw {
         char *dup_string(const char *target, const char *source, const char *def) {
             if (target == source) return const_cast<char *>(target);
             std::free(const_cast<char *>(target));
-            return (source && *source) ? strdup(source) : (def ? strdup(def) : nullptr);
+            return (source && *source) ? utils::dup_cstr(source) : (def ? utils::dup_cstr(def) : nullptr);
         }
 
         void apply_config(const dw_config_t *cfg) {

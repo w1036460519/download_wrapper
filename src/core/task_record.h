@@ -28,55 +28,30 @@ inline const char* to_string(dw_protocol_t p) {
 }
 
 /**
- * 任务记录：注册表内存态 = 来源参数（恢复/晋升重建用）+ 最新快照 + 队列元数据。
+ * 任务记录：注册表内存态 = 来源参数（恢复/队列晋升重建用）+ 最新快照 + 队列元数据。
  *
- * 主键为 (client_id, protocol) + 按协议散布到 url/info_hash/content_root 的原始标识。
- * open_id() 按 "type|raw_key" 格式派生，同时为 tasks_ map 键。
+ * 主键为 (client_id, protocol, natural_key)。
+ * natural_key：HTTP=url / BT=info_hash，统一唯一标识。
+ * LOCAL 任务不进 tasks 表，仅存 file_records。
+ * union_id() 按 "client_id|type|natural_key" 格式派生，为 tasks_ map 键。
  */
 struct TaskRecord {
-    // 主键（DB PK = client_id + key_type 列 + natural_key 列；内存无冗余字段）
+    // 主键（DB PK = client_id + protocol 列 + natural_key 列）
     std::string   client_id;    // App 启动时注入（UUIDv4）；本机任务恒 = TaskManager::client_id_
-    dw_protocol_t protocol = DW_PROTOCOL_HTTP; // 同时决定 DB key_type 列值与原始标识落哪个字段
+    dw_protocol_t protocol = DW_PROTOCOL_HTTP; // 协议类型
+    std::string   natural_key;  // 唯一标识：HTTP=url / BT=info_hash
 
-    // ---- 任务标识访问器 ----
-    // 原始标识：按 protocol 取 url / info_hash / content_root（不额外存储，避免冗余）。
-    const std::string& raw_key() const noexcept {
-        switch (protocol) {
-        case DW_PROTOCOL_TORRENT: return info_hash;
-        case DW_PROTOCOL_LOCAL:   return content_root;
-        default:                  return url;
-        }
-    }
-    std::string& raw_key() noexcept {
-        switch (protocol) {
-        case DW_PROTOCOL_TORRENT: return info_hash;
-        case DW_PROTOCOL_LOCAL:   return content_root;
-        default:                  return url;
-        }
-    }
-    // OpenID：本机唯一，格式 "type|raw_key"（如 "HTTP|https://..."、"BT|abc123"）。
-    // 同时为 tasks_ map 键。
-    std::string open_id() const {
-        return std::string(to_string(protocol)) + '|' + raw_key();
-    }
-    // UnionID：跨客户端全局唯一，格式 "client_id|type|raw_key"。
+    // 任务全局唯一标识
     std::string union_id() const {
-        return client_id + '|' + open_id();
+        return client_id + '|' + to_string(protocol) + '|' + natural_key;
     }
 
     // 来源参数（恢复 / 队列晋升时重建引擎任务）
     std::string              save_path;     // 用户指定的保存目录（固定不变）
-    std::string              content_root;  // save_path 下的磁盘根文件/目录名（恒非空，取判重后根名）；
-                                             // 物理前缀按 is_directory 分支：目录 = save_path/content_root，
-                                             // 单文件 = save_path（content_root 即文件名本身）。
-                                             // HTTP 暂未接入（保持空占位）；本地任务的 raw_key 也指向此字段。
-    bool                     is_directory = true; // 磁盘根实体形态：BT 首次 PARSED 落定；HTTP 恒为 false（单文件）
-    std::string              url;           // HTTP 身份 + 下载地址（HTTP 时 raw_key 指向此字段）
-    std::string              info_hash;     // BT 身份（BT 时 raw_key 指向此字段），HTTP 该字段为空
+    std::string              content_root;  // save_path 下的磁盘根文件/目录名（恒非空，取判重后根名）
     std::string              magnet_link;   // BT
     std::string              torrent_file;  // BT
     std::string              name;          // 任务显示名称（种子原始名 / HTTP 原始文件名；STATUS_UPDATE 可更新）
-    std::string              trace_id;      // 追踪 ID（持久化）：外部注入值优先，缺省为识别键本身（url / info_hash）；日志关联用
 
     std::vector<int32_t>     file_indexes;
     std::vector<int32_t>     priority_file_indexes; // 优先下载文件索引（不持久化）
@@ -88,7 +63,7 @@ struct TaskRecord {
 
     // 最新快照（用于 dw_list_tasks 与断点恢复展示）
     dw_task_status_t status       = DW_TASK_STATUS_QUEUED;
-    int32_t          source       = 0;  // 0=本地任务 1=本地文件 2=远程文件
+    dw_source_t      source       = DW_SOURCE_TASK_FILE;  // 来源枚举
     bool             dup_checked  = false; // 首次解析的重名判定已完成（持久化）；
                                            // PARSED 事件快路依据，避免重复磁盘冲突检测误判包装
     int64_t          total_size   = -1;
@@ -129,7 +104,7 @@ struct TaskRecord {
 struct FileRecord {
     int64_t     id = 0;             // 自增主键（0=未落库）
     std::string client_id;          // 客户端标识
-    int32_t     type = 0;           // 0=本地文件 1=任务文件 2=远程文件（与 TaskRecord.source 对齐）
+    dw_source_t type = DW_SOURCE_LOCAL_FILE;  // 来源枚举（与 TaskRecord.source 对齐）
     bool        is_remote = false;  // 远程标识
     std::string save_path;          // 保存路径
     std::string root_name;          // 根目录/文件名（占位→修正）

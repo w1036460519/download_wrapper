@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 
@@ -80,6 +82,20 @@ namespace dw::utils {
         return std::ranges::equal(a, b, [](unsigned char ca, unsigned char cb) {
             return std::tolower(ca) == std::tolower(cb);
         });
+    }
+
+    char *dup_cstr(const std::string &s) {
+        auto *p = static_cast<char *>(std::malloc(s.size() + 1));
+        if (p) std::memcpy(p, s.c_str(), s.size() + 1);
+        return p;
+    }
+
+    char *dup_cstr(const char *s) {
+        if (!s || !*s) return nullptr;
+        const size_t len = std::strlen(s);
+        auto *p = static_cast<char *>(std::malloc(len + 1));
+        if (p) std::memcpy(p, s, len + 1);
+        return p;
     }
 
 }

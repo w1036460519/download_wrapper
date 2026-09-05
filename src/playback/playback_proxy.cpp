@@ -121,11 +121,12 @@ private:
     beast::flat_buffer buffer_;
     http::request<http::string_body> req_;
 
-    // ---- 请求级状态（handle_request 初始化，后续阶段只读） ----
-    // key_type_ + natural_key_ 拆分存储：与 C ABI 一致，URL 参数原样透传。
+    // ---- 请求级 state（handle_request 初始化，后续阶段只读） ----
+    // protocol_ + natural_key_ 拆分存储：与 C ABI 一致，URL 参数原样透传。
     // type 取值 "http" / "bt"；natural_key 须 URL 编码。
+    std::string client_id_;
     std::string natural_key_;
-    int     key_type_     = DW_PROTOCOL_HTTP;
+    int     protocol_     = DW_PROTOCOL_HTTP;
     int     file_index_   = 0;
     int64_t range_start_  = 0;
     int64_t range_end_    = 0;   // 含（闭合区间）；-1 在 handle_request 中已补齐
@@ -160,24 +161,26 @@ private:
             return;
         }
         auto params = parsed->params();
+        auto client_id_it = params.find("client_id");
         auto type_it = params.find("type");
         auto key_it  = params.find("key");
         auto file_it = params.find("file");
-        if (type_it == params.end() || key_it == params.end() || file_it == params.end()) {
-            send_error(http::status::bad_request, "Missing type/key/file parameter");
+        if (client_id_it == params.end() || type_it == params.end() || key_it == params.end() || file_it == params.end()) {
+            send_error(http::status::bad_request, "Missing client_id/type/key/file parameter");
             return;
         }
         try {
+            client_id_ = std::string((*client_id_it).value);
             const std::string type_str((*type_it).value);
-            if (type_str == "http") key_type_ = DW_PROTOCOL_HTTP;
-            else if (type_str == "bt") key_type_ = DW_PROTOCOL_TORRENT;
+            if (type_str == "http") protocol_ = DW_PROTOCOL_HTTP;
+            else if (type_str == "bt") protocol_ = DW_PROTOCOL_TORRENT;
             else {
                 send_error(http::status::bad_request, "Invalid type parameter");
                 return;
             }
             natural_key_ = std::string((*key_it).value);
         } catch (...) {
-            send_error(http::status::bad_request, "Invalid type/key/file parameter");
+            send_error(http::status::bad_request, "Invalid client_id/type/key/file parameter");
             return;
         }
         // file 参数用 from_chars 解析，零分配且无异常
@@ -206,10 +209,10 @@ private:
 
         // ---- 获取文件路径与总大小 ----
         const dw_task_key_t task_key{
-            static_cast<dw_protocol_t>(key_type_), natural_key_.c_str()};
+            static_cast<dw_protocol_t>(protocol_), natural_key_.c_str()};
         char*    raw_path = nullptr;
         int64_t  file_size = -1;
-        if (dw_get_task_file_info(&task_key,
+        if (dw_get_task_file_info(client_id_.c_str(), &task_key,
                                   static_cast<int32_t>(file_index_),
                                   &raw_path, &file_size) != 0 || !raw_path) {
             send_error(http::status::not_found, "Task or file not found");
@@ -262,10 +265,10 @@ private:
 
         // ---- 查询已下载分段（优先缓存，按状态区分） ----
         const dw_task_key_t task_key{
-            static_cast<dw_protocol_t>(key_type_), natural_key_.c_str()};
+            static_cast<dw_protocol_t>(protocol_), natural_key_.c_str()};
         dw_byte_range_t* ranges     = nullptr;
         int32_t          range_count = 0;
-        const int32_t rc = dw_get_file_ranges(&task_key,
+        const int32_t rc = dw_get_file_ranges(client_id_.c_str(), &task_key,
                                               static_cast<int32_t>(file_index_),
                                               &ranges, &range_count);
 
@@ -561,15 +564,16 @@ void dw_proxy_stop(void) {
     dw::playback::g_port = 0;
 }
 
-const char* dw_proxy_get_url(const dw_task_key_t* key, int file_index) {
-    if (!key || !key->natural_key) {
+const char* dw_proxy_get_url(const char* client_id, const dw_task_key_t* key, int file_index) {
+    if (!client_id || !key || !key->natural_key) {
         return "";
     }
     static thread_local std::string url;
     const char *type_str =
         key->protocol == DW_PROTOCOL_TORRENT ? "bt" : "http";
     url = "http://127.0.0.1:" + std::to_string(dw::playback::g_port) +
-          "/file?type=" + type_str +
+          "/file?client_id=" + client_id +
+          "&type=" + type_str +
           "&key=" + key->natural_key +
           "&file=" + std::to_string(file_index);
     return url.c_str();
