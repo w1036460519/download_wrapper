@@ -20,13 +20,14 @@ DW_API void dw_proxy_stop(void);
 /// 生成代理 URL
 ///
 /// URL 形如 http://127.0.0.1:<port>/file?client_id=<id>&type=<http|bt>&key=<urlencoded natural_key>&file=<index>
-/// 调用方须保证 key 在返回的 URL 使用期间有效（线程局部静态存储）。
+/// 调用方须保证 natural_key 在返回的 URL 使用期间有效（线程局部静态存储）。
 ///
-/// \param client_id  客户端标识。
-/// \param key        任务唯一键：protocol + natural_key。
-/// \param file_index 文件索引（HTTP 恒 0）。
+/// \param client_id    客户端标识。
+/// \param protocol     协议类型（用于 URL 中的 type 参数）。
+/// \param natural_key  任务唯一键：HTTP=url, BT=info_hash, LOCAL=content_root。
+/// \param file_index   文件索引（HTTP 恒 0）。
 /// \return URL 字符串（线程局部静态存储，下次调用覆盖）。
-DW_API const char* dw_proxy_get_url(const char* client_id, const dw_task_key_t* key, int file_index);
+DW_API const char* dw_proxy_get_url(const char* client_id, dw_protocol_t protocol, const char* natural_key, int file_index);
 
 /// 查询代理是否运行中
 ///

@@ -46,14 +46,17 @@ public:
 
     /**
      * 恢复单个 HTTP 下载任务（HTTP 无句柄概念，委托 add_task）。
+     * 内部经三要素自取 resume_data（自足含落盘路径）与 save_path（全量重下兑底）。
      */
-    int32_t resume_task(const dw_task_params_t* params,
-                        dw_submit_result_t*     out_result) override;
+    void resume_task(const std::string &natural_key,
+                     const std::string &client_id,
+                     const std::vector<int32_t> &priority_file_indexes) override;
 
     /**
      * 暂停单个 HTTP 下载任务。
      */
-    int32_t pause_task(const char*         id,
+    int32_t pause_task(const std::string &id,
+                       const std::string &client_id,
                        dw_submit_result_t* out_result) override;
 
     /**
@@ -61,7 +64,8 @@ public:
      * 置取消 + 删除标志，sweep 回收后发 DELETED 事件通知 wrapper。
      * @return 0=引擎已接管；-1=错误。
      */
-    int32_t delete_task(const char*         id,
+    int32_t delete_task(const std::string &id,
+                        const std::string &client_id,
                         int32_t             delete_files,
                         dw_submit_result_t* out_result) override;
 
@@ -69,14 +73,14 @@ public:
      * 查询任务运行时资源是否已释放：ctx 已不在任务表（sweep 已析构，线程 join、
      * 分片文件句柄全关）即视为已释放；引擎未初始化 / 未持有该任务同样视为已释放。
      */
-    bool task_released(const char* id) override;
+    bool task_released(const std::string &id) override;
 
     /**
      * 查询单文件已下载字节区间（边下边播；HTTP 单文件模型，忽略 file_index）。
      * 由现有 parts 的 [start, start+done-1] 排序合并连续段；
      * 任务不存在于运行时上下文时返回空 vector。
      */
-    std::vector<dw_byte_range_t> get_file_ranges(const char* id,
+    std::vector<dw_byte_range_t> get_file_ranges(const std::string &id,
                                                  int32_t     file_index) override;
 
     /**

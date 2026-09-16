@@ -3,16 +3,16 @@
  * @brief 任务持久化存储层：封装 SQLite 连接与全部读写操作。
  *
  * 职责边界：
- *   - 仅负责 TaskRecord 落库 / 回读与 resume_data 存取，不触碰内存注册表与调度逻辑；
- *   - 表结构自维护：建表（IF NOT EXISTS）；
+ *   - 负责 file_records（任务状态持久化权威）、resume_data、file_progress_cache、play_progress 的存取；
+ *     不触碰内存注册表与调度逻辑；
+ *   - 表结构自维护：建表（IF NOT EXISTS）+ 旧库补列（ALTER，列已存在时忽略错误）；
  *   - 不做并发保护，要求调用方自行串行化（TaskManager 在持有 mtx_ 时调用）。
  *
  * 唯一键约定：
  *   - 任务主键 = (client_id, protocol, natural_key) 复合键
  *   - 客户端标识 client_id 由 App 启动时注入（UUIDv4）
- *   - protocol：0=http(url) 1=bt(info_hash)
+ *   - protocol：0=http(url) 1=bt(info_hash) 2=local
  *   - natural_key：HTTP=url / BT=info_hash，唯一标识
- *   - LOCAL 任务不进 tasks 表，仅存 file_records
  *   - 全部读写操作按复合键定位，无单字段 task_id 概念
  */
 
@@ -48,26 +48,11 @@ public:
     /// 检测到旧 schema（task_id 列）则 DROP 全部表重建（项目未上线）。
     void init_schema() const;
 
-    /// 载入指定客户端的排队 / 活跃任务（DOWNLOADING/QUEUED/RESOLVING/PARSED），全字段填充。
-    std::vector<TaskRecord> load_active(const std::string &client_id) const;
-    /// 载入全部任务（含暂停 / 完成 / 错误），用于快照列表。
-    std::vector<TaskRecord> load_all() const;
-    /// 按 (client_id, protocol, natural_key) 查记录：natural_key 即唯一标识（HTTP=url / BT=info_hash）。
-    /// 命中返回 true 并填充 out。
-    bool load_by_natural_key(const std::string &client_id, dw_protocol_t protocol,
-                             const std::string &natural_key, TaskRecord &out) const;
-    /// 清理指定 save_path 下的 file_records 中 type IN (1,2) 条目（LOCAL 任务已迁移到 file_records）。
+    /// 清理指定 save_path 下的 file_records 中 type=0（本地文件条目）。
     void clear_local_tasks(const std::string& save_path) const;
-    /// 新增任务：纯 INSERT，复合键 (client_id, protocol, natural_key) 须由 r 三字段预填。
-    void insert(TaskRecord& r) const;
-    /// 更新既有任务：按复合键原地 UPDATE 全字段。
-    void update(const TaskRecord& r) const;
-    /// 仅更新任务状态（轻量操作，避免全字段 UPDATE）。
-    void update_status(const std::string &client_id, dw_protocol_t protocol,
-                       const std::string &natural_key, int32_t status) const;
-    /// 删除任务及其 resume_data / file_progress_cache（统一按复合键）。
+    /// 删除任务及其 resume_data / file_progress_cache / file_records（统一按复合键）。
     void remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
-    /// 重置任务进度：清除 resume_data / file_progress_cache，并将 tasks 表进度字段归零。
+    /// 重置任务进度：清除 resume_data / file_progress_cache，file_records 状态回 QUEUED、进度归零。
     void reset_task_progress(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
     /// 写入 / 覆盖断点续传数据。
     void save_resume(const std::string &client_id, dw_protocol_t protocol,
@@ -86,6 +71,9 @@ public:
     /// 用于占位插入的幂等检查，避免重复新建。
     bool has_file_record(const std::string &client_id, dw_protocol_t task_protocol,
                          const std::string &task_natural_key) const;
+    /// 按任务关联三要素刷新 modified_at 为当前时间，用于排序置顶。
+    void touch_file_record(const std::string &client_id, dw_protocol_t task_protocol,
+                           const std::string &task_natural_key) const;
     /// 载入指定客户端的全部文件记录（按 modified_at DESC）。
     std::vector<FileRecord> load_file_records(const std::string &client_id) const;
     /// 载入指定客户端某 save_path 下的文件记录（按 modified_at DESC）。
@@ -96,17 +84,24 @@ public:
     /// 按 save_path + root_name 同步文件记录状态（validate_local_tasks 用）。
     void update_file_record_status_by_name(const std::string &save_path, const std::string &root_name,
                                            int32_t status) const;
-    /// 同步文件记录的进度冗余字段（status/total_size/total_done），免全字段 UPDATE。
+    /// 同步文件记录的进度与错误信息冗余字段，免全字段 UPDATE。
     void sync_file_record_progress(dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                   int32_t status, int64_t total_size, int64_t total_done) const;
+                                   int32_t status, int64_t total_size, int64_t total_done,
+                                   int32_t reason, const std::string &message) const;
+    /// 任务状态迁移即时写（权威列）：QUEUED/DOWNLOADING/PAUSED/COMPLETED/ERROR 等关键迁移点调用，
+    /// 不受进度遥测节流影响；与 sync_file_record_progress 的差异为不带进度、可带错误文本。
+    void update_file_record_status(const std::string &client_id, dw_protocol_t task_protocol,
+                                   const std::string &task_natural_key,
+                                   dw_task_status_t status, dw_reason_t reason, const std::string &message) const;
     /// 按任务关联三要素（client_id + task_protocol + task_natural_key）更新文件记录的
-    /// root_name、full_path、file_type 和 ext（PARSED 后修正为判重后根名、
-    /// 磁盘根实体全路径、实际形态与文件后缀）。
+    /// save_path、original_root_name、root_name、full_path、file_type、ext
+    /// （PARSED 后修正为解析时保存目录、判重后根名、磁盘根实体全路径、实际形态、文件后缀）。
     /// full_path = save_path/root_name（目录与单文件统一公式）；
     /// ext 不含点（如 "mp4"），目录场景传空串保持 NULL。
     void update_file_record_meta(const std::string &client_id,
                                  dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                 const std::string &root_name, const std::string &full_path,
+                                 const std::string &task_save_path,
+                                 const std::string &original_root_name, const std::string &root_name, const std::string &full_path,
                                  bool file_type, const std::string &ext) const;
 
     // ---- 播放进度（独立表 play_progress，以完整路径为键）----

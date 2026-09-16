@@ -12,13 +12,6 @@
     {
       "name": "libtorrent",
       "default-features": false
-    },
-    {
-      "name": "libtorrent",
-      "features": [
-        "iconv"
-      ],
-      "platform": "!ios & !android"
     }
   ]
 }

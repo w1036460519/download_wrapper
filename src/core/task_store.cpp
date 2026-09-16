@@ -2,8 +2,9 @@
  * @file task_store.cpp
  * @brief 任务持久化存储层实现：SQLite 建表 / 读写与分片续传态序列化。
  *
- * 说明：本层不加锁、不涉及调度与内存注册表，仅围绕 sqlite3 连接完成 TaskRecord 与
- * resume_data 的存取。并发串行化由调用方（TaskManager 持有 mtx_）保证。
+ * 说明：本层不加锁、不涉及调度与内存注册表，仅围绕 sqlite3 连接完成 file_records
+ * （任务状态持久化权威）、resume_data 及进度缓存的存取。并发串行化由调用方
+ * （TaskManager 持有 mtx_）保证。
  */
 
 #include "task_store.h"
@@ -73,39 +74,10 @@ namespace dw {
             sqlite3_bind_int64(st, param_idx(st, name), val);
         }
 
-        void bind_double(sqlite3_stmt *st, const char *name, double val) {
-            sqlite3_bind_double(st, param_idx(st, name), val);
-        }
-
         void bind_blob(sqlite3_stmt *st, const char *name, const void *data, int size) {
             sqlite3_bind_blob(st, param_idx(st, name), data, size, SQLITE_TRANSIENT);
         }
 
-        /// 从查询行填充 TaskRecord（列序无关，按名取值）。
-        void fill_record(sqlite3_stmt *st, TaskRecord &r) {
-            const col_map cm(st);
-            r.client_id = cm.getText("client_id");
-            r.protocol = static_cast<dw_protocol_t>(cm.getInt("protocol"));
-            r.natural_key = cm.getText("natural_key");
-            r.name = cm.getText("name");
-            r.save_path = cm.getText("save_path");
-            r.magnet_link = cm.getText("magnet_link");
-            r.torrent_file = cm.getText("torrent_file");
-            r.file_indexes = split_ints(cm.getText("file_indexes"));
-            r.priority = cm.getInt("priority");
-            r.status = static_cast<dw_task_status_t>(cm.getInt("status"));
-            r.progress = cm.getDouble("progress");
-            r.total_size = cm.getInt64("total_size");
-            r.total_done = cm.getInt64("total_done");
-            r.support_range = cm.getInt("support_range");
-            r.etag = cm.getText("etag");
-            r.last_modified = cm.getText("last_modified");
-            r.created_at = cm.getInt64("created_at");
-            r.modified_at = cm.getInt64("modified_at");
-            r.source = static_cast<dw_source_t>(cm.getInt("source"));
-            r.content_root = cm.getText("content_root");
-            r.dup_checked = cm.getInt("dup_checked") != 0;
-        }
     } // namespace
 
     TaskStore::~TaskStore() {
@@ -131,32 +103,6 @@ namespace dw {
 
     void TaskStore::init_schema() const {
         constexpr auto sql = R"(
-            CREATE TABLE IF NOT EXISTS tasks (
-                client_id   TEXT NOT NULL,
-                protocol    INTEGER NOT NULL,
-                natural_key TEXT NOT NULL,
-                name TEXT,
-                save_path TEXT,
-                magnet_link TEXT,
-                torrent_file TEXT,
-                trackers TEXT,
-                file_indexes TEXT,
-                priority INTEGER,
-                status INTEGER,
-                progress REAL,
-                total_size INTEGER,
-                total_done INTEGER,
-                support_range INTEGER,
-                etag TEXT,
-                last_modified TEXT,
-                created_at INTEGER,
-                modified_at INTEGER,
-                source INTEGER DEFAULT 0,
-                content_root TEXT,
-                dup_checked INTEGER DEFAULT 0,
-                PRIMARY KEY (client_id, protocol, natural_key)
-            );
-
             CREATE TABLE IF NOT EXISTS resume_data (
                 client_id   TEXT NOT NULL,
                 protocol    INTEGER NOT NULL,
@@ -172,15 +118,20 @@ namespace dw {
                 type            INTEGER NOT NULL DEFAULT 0,
                 is_remote       INTEGER DEFAULT 0,
                 save_path       TEXT NOT NULL,
+                original_root_name TEXT NOT NULL DEFAULT '',  -- 重名/包装前的原始名称
                 root_name       TEXT NOT NULL,
                 full_path       TEXT,
                 file_type       INTEGER DEFAULT 1,
                 ext             TEXT,
+                parsed          INTEGER DEFAULT 0,             -- 元数据已解析标志
                 protocol        INTEGER,
                 natural_key     TEXT,
                 status          INTEGER DEFAULT 0,
                 total_size      INTEGER DEFAULT -1,
                 total_done      INTEGER DEFAULT 0,
+                priority        INTEGER DEFAULT 0,
+                reason          INTEGER DEFAULT 0,
+                message         TEXT NOT NULL DEFAULT '',
                 created_at      INTEGER,
                 modified_at     INTEGER
             );
@@ -209,169 +160,11 @@ namespace dw {
         sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
     }
 
-    std::vector<TaskRecord> TaskStore::load_active(const std::string &client_id) const {
-        // 载入排队 / 活跃任务（DOWNLOADING=0, QUEUED=4, RESOLVING=5, PARSED=6）；
-        // 暂停(1)/完成(2)/错误(3) 留库，按需回读，减小常驻内存。
-        std::vector<TaskRecord> out;
-        constexpr auto sql = "SELECT * FROM tasks WHERE client_id=:client_id AND status IN (0,4,5,6);";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        bind_text(st, ":client_id", client_id);
-
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            TaskRecord r;
-            fill_record(st, r);
-            out.push_back(std::move(r));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
-    std::vector<TaskRecord> TaskStore::load_all() const {
-        std::vector<TaskRecord> out;
-        constexpr auto sql = "SELECT * FROM tasks ORDER BY created_at DESC;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            TaskRecord r;
-            fill_record(st, r);
-            out.push_back(std::move(r));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
-    bool TaskStore::load_by_natural_key(const std::string &client_id, const dw_protocol_t protocol,
-                                        const std::string &natural_key, TaskRecord &out) const {
-        constexpr auto sql =
-                "SELECT * FROM tasks WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key LIMIT 1;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        bool found = false;
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            fill_record(st, out);
-            found = true;
-        }
-        sqlite3_finalize(st);
-        return found;
-    }
-
     void TaskStore::clear_local_tasks(const std::string &save_path) const {
-        constexpr auto sql = "DELETE FROM file_records WHERE save_path=:save_path AND type IN (1,2);";
+        constexpr auto sql = "DELETE FROM file_records WHERE save_path=:save_path AND type=0;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
         bind_text(st, ":save_path", save_path);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void TaskStore::insert(TaskRecord &r) const {
-        const int64_t now = now_unix_ms();
-        if (r.created_at == 0) r.created_at = now;
-        if (r.modified_at == 0) r.modified_at = now;
-        constexpr auto sql = R"(
-            INSERT INTO tasks (client_id, protocol, natural_key,
-                name, save_path,
-                magnet_link, torrent_file, file_indexes,
-                priority, status, progress, total_size, total_done,
-                support_range, etag, last_modified, created_at, modified_at,
-                source, content_root, dup_checked)
-            VALUES (:client_id, :protocol, :natural_key,
-                :name, :save_path,
-                :magnet_link, :torrent_file, :file_indexes,
-                :priority, :status, :progress, :total_size, :total_done,
-                :support_range, :etag, :last_modified, :created_at, :modified_at,
-                :source, :content_root, :dup_checked);
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-
-        const std::string indexes = join_ints(r.file_indexes);
-
-        bind_text(st, ":client_id", r.client_id);
-        bind_int(st, ":protocol", static_cast<int>(r.protocol));
-        bind_text(st, ":natural_key", r.natural_key);
-        bind_text(st, ":name", r.name);
-        bind_text(st, ":save_path", r.save_path);
-        bind_text(st, ":magnet_link", r.magnet_link);
-        bind_text(st, ":torrent_file", r.torrent_file);
-        bind_text(st, ":file_indexes", indexes);
-        bind_int(st, ":priority", r.priority);
-        bind_int(st, ":status", r.status);
-        bind_double(st, ":progress", r.progress);
-        bind_int64(st, ":total_size", r.total_size);
-        bind_int64(st, ":total_done", r.total_done);
-        bind_int(st, ":support_range", r.support_range);
-        bind_text(st, ":etag", r.etag);
-        bind_text(st, ":last_modified", r.last_modified);
-        bind_int64(st, ":created_at", r.created_at);
-        bind_int64(st, ":modified_at", r.modified_at);
-        bind_int(st, ":source", r.source);
-        bind_text(st, ":content_root", r.content_root);
-        bind_int(st, ":dup_checked", r.dup_checked ? 1 : 0);
-
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void TaskStore::update(const TaskRecord &r) const {
-        // 更新既有任务：按复合主键原地 UPDATE 全字段。
-        // modified_at 自动刷为 now_unix_ms。
-        const int64_t now = now_unix_ms();
-        const int64_t modified_at = r.modified_at != 0 ? r.modified_at : now;
-        constexpr auto sql = R"(
-            UPDATE tasks SET protocol=:protocol, name=:name, save_path=:save_path,
-                magnet_link=:magnet_link, torrent_file=:torrent_file, file_indexes=:file_indexes,
-                priority=:priority, status=:status, progress=:progress, total_size=:total_size, total_done=:total_done,
-                support_range=:support_range, etag=:etag, last_modified=:last_modified, created_at=:created_at, modified_at=:modified_at,
-                source=:source, content_root=:content_root, dup_checked=:dup_checked
-            WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-
-        const std::string indexes = join_ints(r.file_indexes);
-
-        bind_int(st, ":protocol", static_cast<int>(r.protocol));
-        bind_text(st, ":name", r.name);
-        bind_text(st, ":save_path", r.save_path);
-        bind_text(st, ":magnet_link", r.magnet_link);
-        bind_text(st, ":torrent_file", r.torrent_file);
-        bind_text(st, ":file_indexes", indexes);
-        bind_int(st, ":priority", r.priority);
-        bind_int(st, ":status", r.status);
-        bind_double(st, ":progress", r.progress);
-        bind_int64(st, ":total_size", r.total_size);
-        bind_int64(st, ":total_done", r.total_done);
-        bind_int(st, ":support_range", r.support_range);
-        bind_text(st, ":etag", r.etag);
-        bind_text(st, ":last_modified", r.last_modified);
-        bind_int64(st, ":created_at", r.created_at);
-        bind_int64(st, ":modified_at", modified_at);
-        bind_int(st, ":source", r.source);
-        bind_text(st, ":content_root", r.content_root);
-        bind_int(st, ":dup_checked", r.dup_checked ? 1 : 0);
-        bind_text(st, ":client_id", r.client_id);
-        bind_text(st, ":natural_key", r.natural_key);
-
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void TaskStore::update_status(const std::string &client_id, const dw_protocol_t protocol,
-                                  const std::string &natural_key, const int32_t status) const {
-        constexpr auto sql =
-                "UPDATE tasks SET status=:status WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_int(st, ":status", status);
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
@@ -390,8 +183,6 @@ namespace dw {
                 sqlite3_finalize(st);
             }
         };
-        // 删除任务数据
-        del_by_key("tasks");
         // 删除任务的恢复数据
         del_by_key("resume_data");
         // 删除任务的文件进度缓存
@@ -432,15 +223,15 @@ namespace dw {
                 sqlite3_finalize(st);
             }
         }
-        // 重置 tasks 表进度字段
+        // 重置 file_records 状态与进度（任务状态持久化权威）：状态回 RESOLVING（force 重加 = 重新解析）
         {
             constexpr auto sql = R"(
-                UPDATE tasks SET progress=0, total_size=0, total_done=0, status=:status, modified_at=:modified_at
+                UPDATE file_records SET status=:status, total_size=-1, total_done=0, reason=0, message='', modified_at=:modified_at
                 WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;
             )";
             sqlite3_stmt *st = nullptr;
             if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
-                bind_int(st, ":status", DW_TASK_STATUS_QUEUED);
+                bind_int(st, ":status", DW_TASK_STATUS_RESOLVING);
                 bind_int64(st, ":modified_at", now_unix_ms());
                 bind_text(st, ":client_id", client_id);
                 bind_int(st, ":protocol", static_cast<int>(protocol));
@@ -449,6 +240,28 @@ namespace dw {
                 sqlite3_finalize(st);
             }
         }
+    }
+
+    void TaskStore::update_file_record_status(const std::string &client_id, const dw_protocol_t task_protocol,
+                                              const std::string &task_natural_key,
+                                              const dw_task_status_t status, const dw_reason_t reason,
+                                              const std::string &message) const {
+        // 任务状态迁移即时写（权威列），不携带进度。
+        constexpr auto sql = R"(
+            UPDATE file_records SET status=:status, reason=:reason, message=:message, modified_at=:modified_at
+            WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;
+        )";
+        sqlite3_stmt *st = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
+        bind_int(st, ":status", static_cast<int>(status));
+        bind_int(st, ":reason", static_cast<int>(reason));
+        bind_text(st, ":message", message);
+        bind_int64(st, ":modified_at", now_unix_ms());
+        bind_text(st, ":client_id", client_id);
+        bind_int(st, ":protocol", static_cast<int>(task_protocol));
+        bind_text(st, ":natural_key", task_natural_key);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
     }
 
     void TaskStore::save_resume(const std::string &client_id, dw_protocol_t protocol,
@@ -517,15 +330,21 @@ namespace dw {
             r.type = static_cast<dw_source_t>(cm.getInt("type"));
             r.is_remote = cm.getInt("is_remote") != 0;
             r.save_path = cm.getText("save_path");
+            r.original_root_name = cm.getText("original_root_name");
             r.root_name = cm.getText("root_name");
             r.full_path = cm.getText("full_path");
             r.file_type = cm.getInt("file_type") != 0;
             r.ext = cm.getText("ext");
+            r.parsed = cm.getInt("parsed") != 0;
             r.task_protocol = static_cast<dw_protocol_t>(cm.getInt("protocol"));
             r.task_natural_key = cm.getText("natural_key");
             r.status = cm.getInt("status");
             r.total_size = cm.getInt64("total_size");
             r.total_done = cm.getInt64("total_done");
+            r.priority = cm.getInt("priority");
+            r.reason = cm.getInt("reason");
+            r.message = cm.getText("message");
+            // support_range/etag/last_modified 不再从 file_records 读取（已在 resume_data 表中）
             r.created_at = cm.getInt64("created_at");
             r.modified_at = cm.getInt64("modified_at");
         }
@@ -547,17 +366,32 @@ namespace dw {
         return exists;
     }
 
+    void TaskStore::touch_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
+                                     const std::string &task_natural_key) const {
+        constexpr auto sql =
+                "UPDATE file_records SET modified_at=:modified_at WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
+        sqlite3_stmt *st = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
+            bind_int64(st, ":modified_at", now_unix_ms());
+            bind_text(st, ":client_id", client_id);
+            bind_int(st, ":protocol", static_cast<int>(task_protocol));
+            bind_text(st, ":natural_key", task_natural_key);
+            sqlite3_step(st);
+            sqlite3_finalize(st);
+        }
+    }
+
     void TaskStore::insert_file_record(FileRecord &r) const {
         const int64_t now = now_unix_ms();
         if (r.created_at == 0) r.created_at = now;
         if (r.modified_at == 0) r.modified_at = now;
         constexpr auto sql = R"(
-            INSERT INTO file_records (client_id, type, is_remote, save_path, root_name,
-                full_path, file_type, ext, protocol, natural_key, status, total_size, total_done,
-                created_at, modified_at)
-            VALUES (:client_id, :type, :is_remote, :save_path, :root_name,
-                :full_path, :file_type, :ext, :protocol, :natural_key, :status, :total_size, :total_done,
-                :created_at, :modified_at);
+            INSERT INTO file_records (client_id, type, is_remote, save_path, original_root_name, root_name,
+                full_path, file_type, ext, parsed, protocol, natural_key, status, total_size, total_done,
+                priority, reason, message, created_at, modified_at)
+            VALUES (:client_id, :type, :is_remote, :save_path, :original_root_name, :root_name,
+                :full_path, :file_type, :ext, :parsed, :protocol, :natural_key, :status, :total_size, :total_done,
+                :priority, :reason, :message, :created_at, :modified_at);
         )";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
@@ -565,10 +399,12 @@ namespace dw {
         bind_int(st, ":type", r.type);
         bind_int(st, ":is_remote", r.is_remote ? 1 : 0);
         bind_text(st, ":save_path", r.save_path);
+        bind_text(st, ":original_root_name", r.original_root_name);
         bind_text(st, ":root_name", r.root_name);
         bind_text_or_null(st, ":full_path", r.full_path);
         bind_int(st, ":file_type", r.file_type ? 1 : 0);
         bind_text_or_null(st, ":ext", r.ext);
+        bind_int(st, ":parsed", r.parsed ? 1 : 0);
         if (r.has_task()) {
             bind_int(st, ":protocol", static_cast<int>(r.task_protocol));
             bind_text(st, ":natural_key", r.task_natural_key);
@@ -579,6 +415,9 @@ namespace dw {
         bind_int(st, ":status", r.status);
         bind_int64(st, ":total_size", r.total_size);
         bind_int64(st, ":total_done", r.total_done);
+        bind_int(st, ":priority", r.priority);
+        bind_int(st, ":reason", r.reason);
+        bind_text(st, ":message", r.message);
         bind_int64(st, ":created_at", r.created_at);
         bind_int64(st, ":modified_at", r.modified_at);
         sqlite3_step(st);
@@ -651,9 +490,11 @@ namespace dw {
 
     void TaskStore::sync_file_record_progress(const dw_protocol_t task_protocol, const std::string &task_natural_key,
                                               const int32_t status, const int64_t total_size,
-                                              const int64_t total_done) const {
+                                              const int64_t total_done, const int32_t reason,
+                                              const std::string &message) const {
         constexpr auto sql = R"(
-            UPDATE file_records SET status=:status, total_size=:total_size, total_done=:total_done, modified_at=:modified_at
+            UPDATE file_records SET status=:status, total_size=:total_size, total_done=:total_done,
+                reason=:reason, message=:message, modified_at=:modified_at
             WHERE protocol=:protocol AND natural_key=:natural_key;
         )";
         sqlite3_stmt *st = nullptr;
@@ -661,6 +502,8 @@ namespace dw {
         bind_int(st, ":status", status);
         bind_int64(st, ":total_size", total_size);
         bind_int64(st, ":total_done", total_done);
+        bind_int(st, ":reason", reason);
+        bind_text(st, ":message", message);
         bind_int64(st, ":modified_at", now_unix_ms());
         bind_int(st, ":protocol", static_cast<int>(task_protocol));
         bind_text(st, ":natural_key", task_natural_key);
@@ -670,14 +513,19 @@ namespace dw {
 
     void TaskStore::update_file_record_meta(const std::string &client_id,
                                             const dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                            const std::string &root_name, const std::string &full_path,
+                                            const std::string &task_save_path,
+                                            const std::string &original_root_name, const std::string &root_name, const std::string &full_path,
                                             const bool file_type, const std::string &ext) const {
         constexpr auto sql = R"(
-            UPDATE file_records SET root_name=:root_name, full_path=:full_path, file_type=:file_type, ext=:ext, modified_at=:modified_at
+            UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name, root_name=:root_name,
+                full_path=:full_path, file_type=:file_type, ext=:ext,
+                parsed=1, modified_at=:modified_at
             WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;
         )";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
+        bind_text(st, ":save_path", task_save_path);
+        bind_text(st, ":original_root_name", original_root_name);
         bind_text(st, ":root_name", root_name);
         bind_text(st, ":full_path", full_path);
         bind_int(st, ":file_type", file_type ? 1 : 0);

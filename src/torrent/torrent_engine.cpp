@@ -6,7 +6,7 @@
  *   - 单例 lt::session 管理所有 BT 任务；
  *   - A 线程每拍经 post_updates 触发 post_torrent_updates + 携变更门槛的续传检查点；
  *     alert 线程消费 state_update_alert 后经 post_engine_event 投递 STATUS_UPDATE 事件，
- *     B 线程消费后写入 TaskRecord 内存，A 线程下一拍直接从 TaskRecord 字段采集进度；
+ *     B 线程消费后写入 TaskRuntime 内存，A 线程下一拍直接从 TaskRuntime 字段采集进度；
  *   - alert 轮询线程另处理生命周期事件：完成时投递 DOWNLOAD_COMPLETED 并请求保存续传、
  *     阻断性错误投递 DOWNLOAD_FAILED、save_resume_data_alert 经 dw::post_resume_data 输出续传数据；
  *   - 只订阅 error / 完成 / 续传相关 alert，不处理 peer / piece / block 等细粒度事件。
@@ -16,8 +16,11 @@
 
 #include "core/task_manager.h"
 #include "internal/downloader_internal.h"
+#include "utils/memory_util.h"
 #include "utils/string_util.h"
 #include "utils/time_util.h"
+#include "utils/timer_util.h"
+#include "utils/unique_name.h"
 
 #include <libtorrent/session.hpp>
 #include <libtorrent/settings_pack.hpp>
@@ -27,8 +30,12 @@
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/load_torrent.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/alert_types.hpp>
+
+#include <fstream>
+#include <unordered_map>
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/hex.hpp>
@@ -56,128 +63,19 @@ namespace dw {
         std::unique_ptr<lt::session> g_session;
         // alert 轮询线程（jthread：停止请求 + 自动 join）
         std::jthread g_alert_thread;
+        // 恢复数据定时请求线程（每 5 秒）
+        std::jthread g_resume_thread;
         // 进度回调间隔（ms）
         int g_interval_ms = 1000;
         // BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文。
         // 默认 3.0（下载:上传=1:3）；init 从 cfg->seed_ratio_limit 读取（0=默认，<0=永久做种）。
         double g_seed_ratio_limit = 3.0;
+        // 默认 tracker 列表：init 从 cfg->trackers 拷贝，添加/恢复任务时统一注入。
+        std::vector<std::string> g_default_trackers;
         // 事件投递目标
-        class TaskManager* g_task_manager = nullptr;
-
-        // 前向声明：info_hash_hex 重载（定义在本文件下方）。
-        std::string info_hash_hex(const lt::torrent_handle &h);
-
-        // ---- 文件进度区间聚合（piece_finished_alert 驱动，bitfield 位运算）----
-        // 引擎侧完成区间合并，调用方直接保存 JSON 序列化后的完整区间集合。
-        // 阈值：1% 文件大小，兑底 4 个 piece。
-
-        // piece 完成处理：基于 bitfield 位运算收集文件级完整区间，达阈值上报 FILE_PROGRESS 事件。
-        // 仅内存操作 + 轻量事件投递，无 DB / IO（引擎回调性能约束）。
-        void handle_piece_finished(const lt::torrent_handle &h, lt::piece_index_t piece) {
-            if (!g_task_manager || !h.is_valid()) return;
-            std::shared_ptr<const lt::torrent_info> ti;
-            try {
-                ti = h.torrent_file();
-            } catch (...) {
-                return;
-            }
-            if (!ti) return;
-            const std::string key = info_hash_hex(h);
-            if (key.empty()) return;
-            const lt::file_storage &fs = ti->files();
-            const lt::piece_index_t last = ti->last_piece();
-            if (piece < lt::piece_index_t{0} || piece > last) return;
-
-            const int64_t piece_len = ti->piece_length();
-
-            // 1. 获取 bitfield（一次调用获取完整 piece 完成状态）
-            lt::torrent_status status = h.status(lt::torrent_handle::query_pieces);
-            const lt::bitfield &pieces = status.pieces;
-
-            // 2. 获取 save_path
-            std::string save_path;
-            try {
-                save_path = h.status(lt::torrent_handle::query_save_path).save_path;
-            } catch (...) {
-            }
-
-            // 3. 遍历文件，收集每个文件的完整区间
-            const int file_count = fs.num_files();
-            for (int i = 0; i < file_count; ++i) {
-                const lt::file_index_t idx{i};
-                if (fs.pad_file_at(idx)) continue;
-                const int64_t f_off = fs.file_offset(idx);
-                const int64_t f_size = fs.file_size(idx);
-                if (f_size <= 0) continue;
-                const int64_t f_end = f_off + f_size - 1;
-
-                // 计算文件的 piece 范围
-                const int f_piece_start = static_cast<int>(f_off / piece_len);
-                const int f_piece_end = static_cast<int>((f_off + f_size - 1) / piece_len);
-
-                // 判断 piece 是否在当前文件中
-                const int piece_idx = static_cast<int>(piece);
-                if (piece_idx < f_piece_start || piece_idx > f_piece_end) continue;
-
-                // 构建 file_event
-                EngineEvent ev;
-                ev.type = EngineEventType::FILE_PROGRESS;
-                ev.engine_key = key;
-                ev.protocol = DW_PROTOCOL_TORRENT;
-                ev.file_index = i;
-                ev.file_size = f_size;
-                ev.file_path = fs.file_path(idx);
-                if (!save_path.empty()) {
-                    ev.full_path = (std::filesystem::path(save_path) / fs.file_path(idx)).string();
-                }
-
-                // 阈值：1% 文件大小，兑底 4 个 piece 字节
-                const int64_t threshold = std::max(f_size / 100, 4 * piece_len);
-
-                // 从文件的开始 piece_index 遍历，计算连续区间
-                int j = f_piece_start;
-                while (j <= f_piece_end) {
-                    // 跳过未完成的 piece
-                    if (!pieces.get_bit(j)) {
-                        ++j;
-                        continue;
-                    }
-                    // 找到连续完成的起点
-                    int start = j;
-                    while (j <= f_piece_end && pieces.get_bit(j)) {
-                        ++j;
-                    }
-                    int end = j - 1;
-
-                    // 计算文件内的 byte 范围（闭区间）
-                    const int64_t range_start = std::max(
-                        static_cast<int64_t>(start) * piece_len, f_off) - f_off;
-                    const int64_t range_end = std::min(
-                        static_cast<int64_t>(end + 1) * piece_len - 1, f_end) - f_off;
-                    if (range_end < range_start) continue;
-
-                    const int64_t bytes = range_end - range_start + 1;
-                    if (bytes < threshold) continue;  // 未达阈值，跳过
-
-                    // 放入区间集合（std::map 自动按 offset_start 有序）
-                    ev.intervals[range_start] = range_end;
-                }
-
-                // 检查文件是否全部下载完成
-                if (ev.intervals.size() == 1) {
-                    auto it = ev.intervals.begin();
-                    if (it->first == 0 && it->second == f_size - 1) {
-                        log_i(key.c_str(), "文件已下载完成：%s", ev.file_path.c_str());
-                        continue;  // 跳过不发送事件
-                    }
-                }
-
-                // 发送事件（区间集合已完整，调用方直接序列化保存）
-                if (!ev.intervals.empty()) {
-                    g_task_manager->on_engine_event(std::move(ev));
-                }
-            }
-        }
+        class TaskManager *g_task_manager = nullptr;
+        // 重名处理：存储待迁移任务的原始名称（key → base_name），move_storage 完成后消费
+        std::unordered_map<std::string, std::string> g_pending_original_names;
 
         // 从 info_hash_t 提取 hex（优先 v2，回退 v1）
         std::string info_hash_hex(const lt::info_hash_t &ih) {
@@ -194,18 +92,158 @@ namespace dw {
             }
         }
 
+        lt::torrent_handle find_handle(const std::string &info_hash,
+                                       const std::string &client_id = {},
+                                       const dw_protocol_t protocol = DW_PROTOCOL_TORRENT) {
+            if (!g_session || info_hash.empty()) return {};
+            lt::sha1_hash h;
+            if (lt::aux::from_hex(info_hash, h.data())) {
+                if (auto th = g_session->find_torrent(h); th.is_valid()) return th;
+            }
+            for (const auto handles = g_session->get_torrents();
+                 const auto &th: handles) {
+                if (info_hash_hex(th) == info_hash) return th;
+            }
+            if (client_id.empty() || !g_task_manager) return {};
+            const auto resume = g_task_manager->load_resume(client_id, protocol, info_hash);
+            if (resume.empty()) return {};
+            try {
+                const lt::span<const char> buf(
+                    reinterpret_cast<const char *>(resume.data()),
+                    static_cast<std::ptrdiff_t>(resume.size()));
+                lt::add_torrent_params atp = lt::read_resume_data(buf);
+                for (const auto &t: g_default_trackers) {
+                    atp.trackers.emplace_back(t);
+                }
+                atp.flags = lt::torrent_flags::update_subscribe
+                            | lt::torrent_flags::need_save_resume
+                            | lt::torrent_flags::default_dont_download;
+                if (auto handle = g_session->add_torrent(std::move(atp)); handle.is_valid()) {
+                    log_i(info_hash.c_str(), "handle 构建成功");
+                    return handle;
+                }
+            } catch (const std::exception &e) {
+                log_e(info_hash.c_str(), "handle 构建失败: %s", e.what());
+            }
+            return {};
+        }
+
+        // 处理 piece 完成事件（piece_finished_alert）
+        // 基于 bitfield 位运算收集文件级区间
+        void handle_piece_finished(const lt::torrent_handle &h, const lt::piece_index_t piece) {
+            if (!g_task_manager || !h.is_valid()) return;
+            std::shared_ptr<const lt::torrent_info> ti;
+            try {
+                ti = h.torrent_file();
+            } catch (...) {
+                return;
+            }
+            if (!ti) return;
+            const std::string key = info_hash_hex(h);
+            if (key.empty()) return;
+            const lt::file_storage &fs = ti->layout();
+            if (const lt::piece_index_t last = ti->last_piece();
+                piece < lt::piece_index_t{0} || piece > last)
+                return;
+
+            const int64_t piece_len = ti->piece_length();
+
+            const lt::torrent_status status = h.status(lt::torrent_handle::query_pieces);
+            const lt::bitfield &pieces = status.pieces;
+
+            std::string save_path;
+            try {
+                save_path = h.status(lt::torrent_handle::query_save_path).save_path;
+            } catch (...) {
+                log_e(key.c_str(), "获取 save_path 异常");
+                return;
+            }
+            if (save_path.empty()) {
+                log_e(key.c_str(), "save_path 为空");
+                return;
+            }
+
+            const int file_count = fs.num_files();
+            for (int i = 0; i < file_count; ++i) {
+                const lt::file_index_t idx{i};
+                if (fs.pad_file_at(idx)) continue;
+                const int64_t f_off = fs.file_offset(idx);
+                const int64_t f_size = fs.file_size(idx);
+                if (f_size <= 0) continue;
+
+                const int64_t f_end = f_off + f_size - 1;
+
+                // 文件的 piece 范围
+                const int f_piece_start = static_cast<int>(f_off / piece_len);
+                const int f_piece_end = static_cast<int>((f_off + f_size - 1) / piece_len);
+
+                // 判断 piece 是否在当前文件中
+                if (const int piece_idx = static_cast<int>(piece);
+                    piece_idx < f_piece_start || piece_idx > f_piece_end)
+                    continue;
+
+                EngineEvent ev;
+                ev.type = EngineEventType::FILE_PROGRESS;
+                ev.engine_key = key;
+                ev.protocol = DW_PROTOCOL_TORRENT;
+                ev.client_id = g_task_manager->client_id();
+                ev.file_index = i;
+                ev.file_size = f_size;
+                ev.file_path = fs.file_path(idx);
+                ev.full_path = (std::filesystem::path(save_path) / fs.file_path(idx)).string();
+
+                // 阈值：1% 文件大小，兑底 4 个 piece 字节
+                const int64_t threshold = std::max(f_size / 100, 4 * piece_len);
+
+                // 从文件的开始 piece_index 遍历，计算连续区间
+                int j = f_piece_start;
+                while (j <= f_piece_end) {
+                    // 跳过未完成的 piece
+                    if (!pieces.get_bit(j)) {
+                        ++j;
+                        continue;
+                    }
+                    // 找到连续完成的起点
+                    const int start = j;
+                    while (j <= f_piece_end && pieces.get_bit(j)) {
+                        ++j;
+                    }
+                    const int end = j - 1;
+
+                    // 计算文件内的 byte 范围（闭区间）
+                    const int64_t range_start = std::max(static_cast<int64_t>(start) * piece_len, f_off) - f_off;
+                    const int64_t range_end = std::min(static_cast<int64_t>(end + 1) * piece_len - 1, f_end) - f_off;
+                    if (range_end < range_start) continue;
+
+                    if (const int64_t bytes = range_end - range_start + 1;
+                        bytes < threshold)
+                        continue; // 未达阈值，跳过
+
+                    // 放入区间集合（std::map 自动按 offset_start 有序）
+                    ev.intervals[range_start] = range_end;
+                }
+
+                // 发送事件（区间集合已完整，调用方直接序列化保存）
+                if (!ev.intervals.empty()) {
+                    g_task_manager->on_engine_event(std::move(ev));
+                }
+            }
+        }
+
         // 处理 state_update_alert 事件
         EngineEvent make_status_update_event(const lt::torrent_status &s, const std::string &key) {
             if (s.errc) {
                 log_e(key.c_str(), "任务发生错误. code: %d, msg: %s",
-                            s.errc.value(), s.errc.message().c_str());
+                      s.errc.value(), s.errc.message().c_str());
                 return EngineEvent{
                     .type = EngineEventType::DOWNLOAD_FAILED,
                     .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
+                    .protocol = DW_PROTOCOL_TORRENT,
+                    .client_id = g_task_manager->client_id()
                 };
             }
             EngineEvent ev;
+            ev.client_id = g_task_manager->client_id();
             ev.type = EngineEventType::STATUS_UPDATE;
             ev.engine_key = key;
             ev.protocol = DW_PROTOCOL_TORRENT;
@@ -219,60 +257,232 @@ namespace dw {
             return ev;
         }
 
-        // 请求保存恢复数据
-        void request_save_resume(const lt::torrent_handle &h, const bool force = false) {
-            if (!h.is_valid()) return;
+        /**
+         *  获取文件列表
+         * @param h lt::torrent_handle
+         * @param is_select 三态过滤（true=仅已选中，false=仅未选中，NULL=全部）
+         * @return utils::file_array
+         */
+        utils::file_array build_flat_file_list(
+            const lt::torrent_handle &h, const bool *is_select = nullptr) {
+            if (!h.is_valid()) return {nullptr, 0};
             try {
-                if (const lt::torrent_status st = h.status(); !st.has_metadata) return;
-            } catch (...) {
-                return;
-            }
-            try {
-                lt::resume_data_flags_t flags = lt::torrent_handle::save_info_dict;
-                if (!force) {
-                    flags |= lt::torrent_handle::if_download_progress
-                            | lt::torrent_handle::if_config_changed
-                            | lt::torrent_handle::if_state_changed
-                            | lt::torrent_handle::if_metadata_changed;
+                const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
+                if (!ti) return {nullptr, 0};
+                const std::string save_path = h.status().save_path;
+                const std::vector<lt::download_priority_t> priorities = h.get_file_priorities();
+                const lt::file_storage &fs = ti->layout();
+                const int file_count = fs.num_files();
+                if (file_count <= 0) return {nullptr, 0};
+
+                // 第一遍：计数
+                int32_t count = 0;
+                for (int i = 0; i < file_count; ++i) {
+                    const lt::file_index_t idx{i};
+                    if (fs.pad_file_at(idx)) continue;
+                    const bool selected = i >= static_cast<int>(priorities.size())
+                                          || priorities[static_cast<size_t>(i)] != lt::download_priority_t{0};
+                    if (is_select && *is_select != selected) continue;
+                    ++count;
                 }
-                h.save_resume_data(flags);
+                if (count <= 0) return {nullptr, 0};
+
+                // 分配连续数组
+                dw_file_info_t *arr = utils::alloc_file_list(count);
+                if (!arr) return {nullptr, 0};
+
+                // RAII：异常时释放已分配的数组
+                struct arr_guard {
+                    dw_file_info_t *p = nullptr;
+                    int32_t filled = 0;
+
+                    ~arr_guard() {
+                        if (!p) return;
+                        for (int32_t k = 0; k < filled; ++k) {
+                            std::free(p[k].name);
+                            std::free(p[k].full_path);
+                            std::free(p[k].ext);
+                            std::free(p[k].physical_path);
+                        }
+                        std::free(p);
+                    }
+                } guard{.p = arr, .filled = 0};
+
+                // 第二遍：填充
+                int32_t j = 0;
+                for (int i = 0; i < file_count; ++i) {
+                    const lt::file_index_t idx{i};
+                    if (fs.pad_file_at(idx)) continue;
+                    const bool selected = i >= static_cast<int>(priorities.size())
+                                          || priorities[static_cast<size_t>(i)] != lt::download_priority_t{0};
+                    if (is_select && *is_select != selected) continue;
+                    const std::string path = fs.file_path(idx);
+                    arr[j].index = i;
+                    arr[j].size = fs.file_size(idx);
+                    arr[j].offset = fs.file_offset(idx);
+                    arr[j].name = utils::dup_cstr(path);
+                    arr[j].full_path = utils::dup_cstr(
+                        save_path.empty() ? path : (std::filesystem::path(save_path) / path).string());
+                    const std::string ext = utils::file_extension(path);
+                    arr[j].ext = ext.empty() ? nullptr : utils::dup_cstr(ext);
+                    ++j;
+                    guard.filled = j;
+                }
+                guard.p = nullptr; // 成功，取消保护
+                return {arr, count};
             } catch (const std::exception &e) {
-                const std::string rsk = info_hash_hex(h);
-                log_e(rsk.c_str(), "请求恢复数据失败: %s", e.what());
+                log_e("", "文件列表构建异常: %s", e.what());
+                return {nullptr, 0};
             }
         }
 
-        // 前向声明：扁平文件列表构建（供 PARSED 事件与 fill_file_list 复用）。
-        // priorities 非空时仅收录非 dont_download 的文件（用户选中集）；空指针 = 不过滤。
-        std::vector<dw_file_info_t> build_flat_file_list(
-            const std::shared_ptr<const lt::torrent_info> &ti,
-            const std::vector<lt::download_priority_t> *priorities = nullptr);
+        // 处理解析完成事件（含重名检测与路径整理）
+        // 使用 orig_files() 获取原始文件结构检测磁盘重名；
+        // 重名时调用 move_storage 整体迁移，完成后由 storage_moved_alert 发送 PARSED 事件。
+        void handle_parsed(const lt::torrent_handle &h) {
+            if (!h.is_valid()) return;
+            const std::string key = info_hash_hex(h);
+            if (key.empty()) return;
 
-        // 构建解析完成事件
-        EngineEvent build_parsed_event(const lt::torrent_handle &h) {
             EngineEvent ev;
             ev.type = EngineEventType::PARSED;
             ev.protocol = DW_PROTOCOL_TORRENT;
-            if (!h.is_valid()) return ev;
-            ev.engine_key = info_hash_hex(h);
-            if (ev.engine_key.empty()) return ev;
-            try {
+            ev.client_id = g_task_manager->client_id();
+            ev.engine_key = key;
+
+            // 重名判定已完成：从 file_record.parsed 判断
+            if (g_task_manager) {
                 const lt::torrent_status st = h.status();
-                const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
-                if (!ti) {
-                    ev.engine_key.clear();
-                    return ev;
-                }
-                ev.name = ti->name();
                 ev.save_path = st.save_path;
-                // 仅上报待下载文件：dont_download 优先级的文件（未选中）不上报。
-                // 默认全选时所有文件均为 default/更高优先级，自然全部包含。
-                const auto priorities = h.get_file_priorities();
-                ev.files = build_flat_file_list(ti, &priorities);
-            } catch (...) {
-                ev.engine_key.clear(); // 异常时返回空事件
+                bool parsed = g_task_manager->get_or_register_file_record(
+                    g_task_manager->client_id(), DW_PROTOCOL_TORRENT, key, ev.save_path);
+                if (parsed) {
+                    log_i(key.c_str(), "已解析，跳过重名检测");
+                    g_task_manager->on_engine_event(std::move(ev));
+                    return;
+                }
             }
-            return ev;
+
+            auto send_error = [&](const std::string &msg) {
+                log_e(key.c_str(), "%s", msg.c_str());
+                if (g_task_manager) {
+                    ev.type = EngineEventType::DOWNLOAD_FAILED;
+                    ev.message = msg;
+                    g_task_manager->on_engine_event(ev);
+                }
+            };
+
+            const lt::torrent_status st = h.status();
+            const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
+            if (!ti) {
+                send_error("解析失败");
+                return;
+            }
+
+            const lt::file_storage &fs = ti->layout();
+
+            ev.name = ti->name();
+            ev.save_path = st.save_path;
+
+            // 收集根条目（过滤 pad 文件）
+            std::unordered_map<std::string, bool> root_entries;
+            for (lt::file_index_t i(0); i < fs.end_file(); ++i) {
+                if (fs.pad_file_at(i)) continue;
+                std::filesystem::path fp(fs.file_path(i));
+                std::string root = fp.begin() != fp.end() ? fp.begin()->string() : "";
+                if (root.empty() || root == "." || root == ".." || root == "/") continue;
+                bool is_dir = fp.has_parent_path();
+                root_entries.try_emplace(root, is_dir);
+                log_i(key.c_str(), "原始文件 -> %s", fp.string().c_str());
+            }
+
+            // 统计非 pad 文件数
+            int non_pad_count = 0;
+            for (lt::file_index_t i(0); i < fs.end_file(); ++i) {
+                if (!fs.pad_file_at(i)) ++non_pad_count;
+            }
+
+            // 确定 base_name / is_dir / ext
+            std::string base_name;
+            bool is_dir = true;
+            std::string ext;
+            // 单文件 torrent：根条目可能是前置目录，提取实际文件名
+            if (non_pad_count == 1) {
+                for (lt::file_index_t i(0); i < fs.end_file(); ++i) {
+                    if (fs.pad_file_at(i)) continue;
+                    std::filesystem::path fp(fs.file_path(i));
+                    base_name = fp.filename().string();
+                    is_dir = false;
+                    ext = fp.extension().string();
+                    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+                    break;
+                }
+            } else if (root_entries.size() == 1) {
+                base_name = root_entries.begin()->first;
+                is_dir = root_entries.begin()->second;
+                if (!is_dir) {
+                    ext = std::filesystem::path(base_name).extension().string();
+                    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+                }
+            } else if (root_entries.size() > 1) {
+                base_name = ev.name;
+                if (base_name.empty()) {
+                    base_name = std::filesystem::path(root_entries.begin()->first).stem().string();
+                }
+                is_dir = true;
+            }
+            ev.is_dir = is_dir;
+            ev.ext = ext;
+            log_i(key.c_str(), "根文件 -> %s(%s)", base_name.c_str(), is_dir ? "目录" : "文件");
+            if (base_name.empty()) {
+                send_error("无法确定文件名");
+                return;
+            }
+
+            // 检测磁盘重名
+            const bool needs_rename = std::filesystem::exists(
+                std::filesystem::path(ev.save_path) / base_name);
+
+            // 无重名：创建占位，直接发送 PARSED（含 content_root / is_dir / ext）
+            if (!needs_rename) {
+                ev.original_name = base_name; // 无重名时 original_name = content_root
+                ev.content_root = base_name;
+                std::filesystem::create_directories(ev.save_path);
+                if (is_dir) {
+                    std::filesystem::create_directories(
+                        std::filesystem::path(ev.save_path) / base_name);
+                } else {
+                    std::ofstream ofs(
+                        std::filesystem::path(ev.save_path) / base_name, std::ios::app);
+                }
+                log_i(key.c_str(), "解析完成");
+                if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
+                return;
+            }
+
+            // 磁盘重名：计算唯一目标名，调用 move_storage 整体迁移
+            std::string target_name;
+            if (!is_dir) {
+                const std::string stem = std::filesystem::path(base_name).stem().string();
+                const std::string new_stem = utils::acquire_wrapper_name(
+                    ev.save_path, stem, nullptr);
+                target_name = ext.empty() ? new_stem : new_stem + "." + ext;
+            } else {
+                target_name = utils::acquire_wrapper_name(
+                    ev.save_path, base_name, nullptr);
+            }
+            const std::string new_save_path =
+                    (std::filesystem::path(ev.save_path) / target_name).string();
+            log_i(key.c_str(), "重名 '%s' -> '%s'，调用 move_storage",
+                  base_name.c_str(), target_name.c_str());
+            // 存储原始名称，供 storage_moved_alert 处理时消费
+            g_pending_original_names[key] = base_name;
+            try {
+                h.move_storage(new_save_path);
+            } catch (const std::exception &e) {
+                log_e(key.c_str(), "move_storage 异常: %s", e.what());
+                send_error("move_storage 调用失败");
+            }
         }
 
         // 处理 alert
@@ -299,16 +509,15 @@ namespace dw {
                         g_task_manager->on_engine_event(EngineEvent{
                             .type = EngineEventType::DOWNLOAD_FAILED,
                             .engine_key = key,
-                            .protocol = DW_PROTOCOL_TORRENT
+                            .protocol = DW_PROTOCOL_TORRENT,
+                            .client_id = g_task_manager->client_id()
                         });
                     }
                 } else if (at->handle.is_valid()) {
                     // 添加任务成功
                     log_i(key.c_str(), "添加成功");
                     if (const lt::torrent_status st = at->handle.status(); st.has_metadata) {
-                        if (EngineEvent ev = build_parsed_event(at->handle); !ev.engine_key.empty()) {
-                            if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
-                        }
+                        handle_parsed(at->handle);
                     }
                 }
             }
@@ -316,9 +525,7 @@ namespace dw {
             else if (const auto *mr = lt::alert_cast<lt::metadata_received_alert>(a)) {
                 const std::string key = info_hash_hex(mr->handle);
                 log_i(key.c_str(), "元数据就绪");
-                if (EngineEvent ev = build_parsed_event(mr->handle); !ev.engine_key.empty()) {
-                    if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
-                }
+                handle_parsed(mr->handle);
             }
             // piece 完成：维护文件进度区间（连续达 1% 阈值后合并上报）
             else if (const auto *pf = lt::alert_cast<lt::piece_finished_alert>(a)) {
@@ -333,7 +540,8 @@ namespace dw {
                     g_task_manager->on_engine_event(EngineEvent{
                         .type = EngineEventType::DOWNLOAD_COMPLETED,
                         .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
                     });
                 }
             }
@@ -346,7 +554,8 @@ namespace dw {
                     g_task_manager->on_engine_event(EngineEvent{
                         .type = EngineEventType::DOWNLOAD_FAILED,
                         .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
                     });
                 }
             }
@@ -354,13 +563,57 @@ namespace dw {
             else if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
                 const std::string key = info_hash_hex(fe->handle);
                 log_e(key.c_str(), "文件错误 file: %s, msg: %s, errno: %d",
-                            fe->filename(), fe->error.message().c_str(), fe->error.value());
+                      fe->filename(), fe->error.message().c_str(), fe->error.value());
                 if (key.empty()) return;
                 if (g_task_manager) {
                     g_task_manager->on_engine_event(EngineEvent{
                         .type = EngineEventType::DOWNLOAD_FAILED,
                         .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
+                    });
+                }
+            }
+            // 种子冲突：两个磁力链接解析到同一 torrent，双方进入 error 状态
+            else if (const auto *tc = lt::alert_cast<lt::torrent_conflict_alert>(a)) {
+                const std::string key = info_hash_hex(tc->handle);
+                log_e(key.c_str(), "种子冲突: 两个磁力链接解析到同一 torrent");
+                if (key.empty()) return;
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_FAILED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
+                    });
+                }
+            }
+            // 元数据解析失败：info-hash 校验不通过，libtorrent 自动重试，重试耗尽后 torrent 进入 error 状态
+            else if (const auto *mf = lt::alert_cast<lt::metadata_failed_alert>(a)) {
+                const std::string key = info_hash_hex(mf->handle);
+                log_e(key.c_str(), "元数据解析失败: %s", mf->error.message().c_str());
+                if (key.empty()) return;
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_FAILED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
+                    });
+                }
+            }
+            // 存储移动失败：move_storage() 调用失败，torrent 进入 error 状态
+            else if (const auto *sm = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
+                const std::string key = info_hash_hex(sm->handle);
+                log_e(key.c_str(), "存储移动失败: %s, errno: %d",
+                      sm->error.message().c_str(), sm->error.value());
+                if (key.empty()) return;
+                if (g_task_manager) {
+                    g_task_manager->on_engine_event(EngineEvent{
+                        .type = EngineEventType::DOWNLOAD_FAILED,
+                        .engine_key = key,
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
                     });
                 }
             }
@@ -370,39 +623,62 @@ namespace dw {
                 if (key.empty()) return;
                 try {
                     const std::vector<char> buf = lt::write_resume_data_buf(rd->params);
-                    if (!buf.empty()) {
-                        EngineEvent ev;
-                        ev.type = EngineEventType::RESUME_DATA;
-                        ev.engine_key = key;
-                        ev.protocol = DW_PROTOCOL_TORRENT;
-                        ev.resume_data.assign(reinterpret_cast<const uint8_t *>(buf.data()),
-                                              reinterpret_cast<const uint8_t *>(buf.data()) + buf.size());
-                        if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
+                    if (!buf.empty() && g_task_manager) {
+                        g_task_manager->get_store().save_resume(
+                            g_task_manager->client_id(), DW_PROTOCOL_TORRENT, key,
+                            reinterpret_cast<const uint8_t *>(buf.data()), buf.size());
                     }
                 } catch (const std::exception &e) {
-                    log_e(key.c_str(), "断点续传数据处理失败: %s", e.what());
+                    log_e(key.c_str(), "断点续传数据保存失败: %s", e.what());
                 }
             }
-            // 存储路径迁移完成
+            // 存储迁移完成：从新 save_path 提取 content_root，发送 PARSED 事件
             else if (const auto *sm = lt::alert_cast<lt::storage_moved_alert>(a)) {
                 const std::string key = info_hash_hex(sm->handle);
                 if (key.empty()) return;
-                log_i(key.c_str(), "存储路径迁移完成 路径: %s", sm->storage_path());
-                if (EngineEvent ev = build_parsed_event(sm->handle); !ev.engine_key.empty()) {
-                    if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
+
+                const std::string new_path = sm->storage_path();
+                const std::string content_root =
+                        std::filesystem::path(new_path).filename().string();
+                // 从 pending map 取出原始名称（重名前的名字）
+                std::string original_name;
+                auto it = g_pending_original_names.find(key);
+                if (it != g_pending_original_names.end()) {
+                    original_name = it->second;
+                    g_pending_original_names.erase(it);
+                } else {
+                    original_name = content_root; // 兜底：无重名时相同
+                }
+                log_i(key.c_str(), "存储迁移完成 -> '%s'，content_root='%s'，original_name='%s'",
+                      new_path.c_str(), content_root.c_str(), original_name.c_str());
+
+                if (g_task_manager) {
+                    EngineEvent ev;
+                    ev.type = EngineEventType::PARSED;
+                    ev.protocol = DW_PROTOCOL_TORRENT;
+                    ev.client_id = g_task_manager->client_id();
+                    ev.engine_key = key;
+                    ev.original_name = original_name;
+                    ev.content_root = content_root;
+                    ev.save_path = new_path;
+                    ev.is_dir = true;
+                    ev.ext = "";
+                    g_task_manager->on_engine_event(std::move(ev));
                 }
             }
-            // 存储路径迁失败
+            // 存储迁移失败
             else if (const auto *smf = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
                 const std::string key = info_hash_hex(smf->handle);
                 if (key.empty()) return;
-                log_e(key.c_str(), "存储路径迁移失败 errno: %d, msg: %s",
-                            smf->error.value(), smf->error.message().c_str());
+                log_e(key.c_str(), "存储迁移失败: %s (op=%d)",
+                      smf->error.message().c_str(), static_cast<int>(smf->op));
                 if (g_task_manager) {
                     g_task_manager->on_engine_event(EngineEvent{
                         .type = EngineEventType::DOWNLOAD_FAILED,
                         .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id(),
+                        .message = smf->error.message().c_str()
                     });
                 }
             }
@@ -415,7 +691,8 @@ namespace dw {
                     g_task_manager->on_engine_event(EngineEvent{
                         .type = EngineEventType::PAUSED,
                         .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
                     });
                 }
             }
@@ -428,11 +705,12 @@ namespace dw {
                     g_task_manager->on_engine_event(EngineEvent{
                         .type = EngineEventType::RESUMED,
                         .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
+                        .protocol = DW_PROTOCOL_TORRENT,
+                        .client_id = g_task_manager->client_id()
                     });
                 }
             }
-            // 任务已从 session 移除（remove_torrent 不带 delete_files 收敛）
+            // 任务已从 session 移除（不删文件场景：remove_torrent 不带 delete_files）
             else if (const auto *tr = lt::alert_cast<lt::torrent_removed_alert>(a)) {
                 const std::string key = info_hash_hex(tr->info_hashes);
                 if (key.empty()) return;
@@ -442,11 +720,13 @@ namespace dw {
                         .type = EngineEventType::DELETED,
                         .engine_key = key,
                         .protocol = DW_PROTOCOL_TORRENT,
-                        .delete_files = 0 // 不删文件
+                        .client_id = g_task_manager->client_id(),
+                        .delete_files = 0 // 不删文件，仅回收内存与 DB
                     });
                 }
             }
-            // 任务文件删除完成（remove_torrent 带 delete_files 收敛）
+            // 任务文件删除完成（删文件场景：remove_torrent 带 delete_files）
+            // libtorrent 已删除下载文件，wrapper 负责清理包层目录（content_root）
             else if (const auto *td = lt::alert_cast<lt::torrent_deleted_alert>(a)) {
                 const std::string key = info_hash_hex(td->info_hashes);
                 if (key.empty()) return;
@@ -456,7 +736,8 @@ namespace dw {
                         .type = EngineEventType::DELETED,
                         .engine_key = key,
                         .protocol = DW_PROTOCOL_TORRENT,
-                        .delete_files = 1 // 引擎已删文件，wrapper 删包层目录
+                        .client_id = g_task_manager->client_id(),
+                        .delete_files = 1 // 引擎已删文件，wrapper 清理包层目录
                     });
                 }
             }
@@ -465,7 +746,7 @@ namespace dw {
                 const std::string key = info_hash_hex(tdf->info_hashes);
                 if (key.empty()) return;
                 log_e(key.c_str(), "任务文件删除失败: %s",
-                            tdf->error.message().c_str());
+                      tdf->error.message().c_str());
                 if (g_task_manager) {
                     g_task_manager->on_engine_event(EngineEvent{
                         .type = EngineEventType::DOWNLOAD_FAILED,
@@ -491,75 +772,66 @@ namespace dw {
                         std::this_thread::sleep_for(std::chrono::milliseconds(g_interval_ms));
                     }
                 } catch (const std::exception &e) {
-                    log_e("", "采集事件异常: %s", e.what());
+                    log_e("bt", "采集事件异常: %s", e.what());
                 } catch (...) {
-                    log_e("", "采集事件未知异常");
+                    log_e("bt", "采集事件未知异常");
                 }
             }
         }
 
-        // 获取 handle
-        lt::torrent_handle find_handle(const std::string &info_hash) {
-            if (!g_session || info_hash.empty()) return {};
-            lt::sha1_hash h;
-            if (lt::aux::from_hex(info_hash, h.data())) {
-                return g_session->find_torrent(h);
-            }
-            const auto handles = g_session->get_torrents();
-            for (const auto &th: handles) {
-                if (info_hash_hex(th) == info_hash) return th;
-            }
-            return {};
-        }
+        // 每 5 秒对发起元数据请求 save_resume_data，
+        void resume_loop(const std::stop_token &st) {
+            while (!st.stop_requested()) {
+                if (g_session) {
+                    try {
+                        int total = 0, downloading = 0, finished = 0, seeding = 0, paused = 0;
+                        int downloading_meta = 0, checking = 0, checking_resume = 0;
+                        for (const auto handles = g_session->get_torrents();
+                             const auto &h: handles) {
+                            try {
+                                if (!h.is_valid()) continue;
+                                const lt::torrent_status torrent_status = h.status();
+                                if (torrent_status.has_metadata
+                                    && torrent_status.state == lt::torrent_status::downloading) {
+                                    // 请求保存恢复数据
+                                    h.save_resume_data(lt::torrent_handle::save_info_dict
+                                                       | lt::torrent_handle::if_download_progress
+                                                       | lt::torrent_handle::if_config_changed
+                                                       | lt::torrent_handle::if_state_changed
+                                                       | lt::torrent_handle::if_metadata_changed);
+                                }
 
-        // 填充文件列表到 C 数组
-        int32_t fill_file_list(const std::shared_ptr<const lt::torrent_info> &ti,
-                               dw_file_info_t **out_files, int32_t *out_count) {
-            const auto files = build_flat_file_list(ti);
-            const auto count = static_cast<int32_t>(files.size());
-            *out_count = 0;
-            *out_files = static_cast<dw_file_info_t *>(
-                std::calloc(static_cast<size_t>(count > 0 ? count : 1), sizeof(dw_file_info_t)));
-            if (!*out_files) return -1;
-            for (int32_t i = 0; i < count; ++i) {
-                (*out_files)[i] = files[static_cast<size_t>(i)];
-            }
-            *out_count = count;
-            return 0;
-        }
-
-        // 扁平文件列表（可按 file_priorities 过滤未选中文件）
-        std::vector<dw_file_info_t> build_flat_file_list(
-            const std::shared_ptr<const lt::torrent_info> &ti,
-            const std::vector<lt::download_priority_t> *priorities) {
-            std::vector<dw_file_info_t> files;
-            const lt::file_storage &fs = ti->files();
-            const int file_count = fs.num_files();
-            if (file_count <= 0) return files;
-            files.reserve(file_count);
-
-            for (int i = 0; i < file_count; ++i) {
-                const lt::file_index_t idx{i};
-                // 过滤 pad 文件
-                if (fs.pad_file_at(idx)) continue;
-                // 过滤未选中文件（dont_download）：用户指定部分下载时仅上报选中集。
-                if (priorities && i < static_cast<int>(priorities->size())
-                    && (*priorities)[static_cast<size_t>(i)] == lt::download_priority_t{0}) {
-                    continue;
+                                // 数量统计
+                                ++total;
+                                if (torrent_status.flags & lt::torrent_flags::paused) ++paused;
+                                else
+                                    switch (torrent_status.state) {
+                                        case lt::torrent_status::downloading: ++downloading;
+                                            break;
+                                        case lt::torrent_status::finished: ++finished;
+                                            break;
+                                        case lt::torrent_status::seeding: ++seeding;
+                                            break;
+                                        case lt::torrent_status::downloading_metadata: ++downloading_meta;
+                                            break;
+                                        case lt::torrent_status::checking_files: ++checking;
+                                            break;
+                                        case lt::torrent_status::checking_resume_data: ++checking_resume;
+                                            break;
+                                        default: break;
+                                    }
+                            } catch (...) {
+                            }
+                        }
+                        log_i("bt", "任务状态统计: 总数=%d 下载中=%d 元数据=%d 校验=%d 校验resume=%d 已完成=%d 做种=%d 暂停=%d",
+                              total, downloading, downloading_meta, checking, checking_resume, finished, seeding,
+                              paused);
+                    } catch (const std::exception &e) {
+                        log_e("bt", "恢复数据定时请求异常: %s", e.what());
+                    }
                 }
-                const std::string path = fs.file_path(idx);
-                dw_file_info_t f{};
-                f.index = i;
-                f.size = fs.file_size(idx);
-                f.offset = fs.file_offset(idx);
-                f.name = utils::dup_cstr(path);
-                const std::string ext = dw::utils::file_extension(path);
-                f.ext = ext.empty() ? nullptr : utils::dup_cstr(ext);
-                f.status = 0; // 下载中
-                f.downloaded_bytes = 0; // PARSED 时刻无 piece 下载，初始为 0
-                files.push_back(f);
+                std::this_thread::sleep_for(std::chrono::seconds(5));
             }
-            return files;
         }
 
         // 操作结果
@@ -592,7 +864,7 @@ namespace dw {
         }
     }
 
-    int32_t TorrentEngine::init(const dw_config_t *cfg, TaskManager* task_manager) {
+    int32_t TorrentEngine::init(const dw_config_t *cfg, TaskManager *task_manager) {
         if (initialized_) {
             return 0;
         }
@@ -619,6 +891,15 @@ namespace dw {
                 if (cfg->seed_ratio_limit != 0.0) {
                     g_seed_ratio_limit = cfg->seed_ratio_limit;
                 }
+                // 默认 trackers：深拷贝到引擎内，避免依赖调用方指针生命周期。
+                g_default_trackers.clear();
+                if (cfg->trackers && cfg->tracker_count > 0) {
+                    for (int32_t i = 0; i < cfg->tracker_count; ++i) {
+                        if (cfg->trackers[i] && cfg->trackers[i][0]) {
+                            g_default_trackers.emplace_back(cfg->trackers[i]);
+                        }
+                    }
+                }
             }
             if (listen_port > 0) {
                 pack.set_str(lt::settings_pack::listen_interfaces,
@@ -627,20 +908,21 @@ namespace dw {
 
             g_session = std::make_unique<lt::session>(std::move(pack));
         } catch (const std::exception &e) {
-            log_e("", "初始化BT引擎失败: %s", e.what());
+            log_e("bt", "初始化引擎失败: %s", e.what());
             return -1;
         }
         if (!g_session || !g_session->is_valid()) {
-            log_e("", "初始化BT引擎失败");
+            log_e("bt", "初始化引擎失败");
             g_session.reset();
             return -1;
         }
 
         g_task_manager = task_manager;
         g_alert_thread = std::jthread(alert_loop);
+        g_resume_thread = std::jthread(resume_loop);
 
         initialized_ = true;
-        log_i("", "初始化BT引擎完成 interval: %dms", g_interval_ms);
+        log_i("bt", "初始化引擎完成 interval: %dms", g_interval_ms);
         return 0;
     }
 
@@ -648,8 +930,11 @@ namespace dw {
         if (!initialized_) {
             return;
         }
-        // 先停止 alert 采集线程，再销毁 session；
-        // wait_for_alert 不可被 stop_token 打断，退出延迟不超过一个采集节拍。
+        // 先停止工作线程，再销毁 session。
+        if (g_resume_thread.joinable()) {
+            g_resume_thread.request_stop();
+            g_resume_thread.join();
+        }
         if (g_alert_thread.joinable()) {
             g_alert_thread.request_stop();
             g_alert_thread.join();
@@ -657,31 +942,80 @@ namespace dw {
         g_session.reset();
 
         g_task_manager = nullptr;
+        g_default_trackers.clear();
         initialized_ = false;
-        log_i("", "销毁BT引擎完成");
+        log_i("bt", "销毁引擎完成");
+    }
+
+    void TorrentEngine::apply_file_priorities(const std::string &task_id,
+                                              const std::string &client_id,
+                                              const std::vector<int32_t> &priority_file_indexes) {
+        log_i(task_id.c_str(), "设置文件优先级: priority_indexes=%s count=%zu",
+              to_string(priority_file_indexes).c_str(), priority_file_indexes.size());
+        const lt::torrent_handle handle = find_handle(task_id, client_id);
+        if (!handle.is_valid()) {
+            log_e(task_id.c_str(), "handle 无效");
+            return;
+        }
+        const std::shared_ptr<const lt::torrent_info> ti = handle.torrent_file();
+        if (!ti) return;
+        const int n = ti->layout().num_files();
+        // 读取当前优先级，将已有 top_priority 重置为 default（适配取消优先）
+        std::vector<lt::download_priority_t> prio = handle.get_file_priorities();
+        if (static_cast<int>(prio.size()) < n) {
+            prio.resize(static_cast<size_t>(n), lt::dont_download);
+        }
+        for (auto &p: prio) {
+            if (p == lt::top_priority) p = lt::default_priority;
+        }
+        // priority_file_indexes: 优先下载，设为最高优先级
+        for (const int32_t idx: priority_file_indexes) {
+            if (idx >= 0 && idx < n) {
+                prio[static_cast<size_t>(idx)] = lt::top_priority;
+            }
+        }
+        try {
+            handle.prioritize_files(prio);
+        } catch (const std::exception &e) {
+            log_e(task_id.c_str(), "设置文件优先级失败: %s", e.what());
+        }
+        log_i(task_id.c_str(), "设置文件优先级完成");
+    }
+
+    void TorrentEngine::post_fail(const std::string &key, const std::string &message) {
+        if (!g_task_manager) return;
+        EngineEvent engine_event;
+        engine_event.type = EngineEventType::DOWNLOAD_FAILED;
+        engine_event.engine_key = key;
+        engine_event.protocol = DW_PROTOCOL_TORRENT;
+        engine_event.client_id = g_task_manager->client_id();
+        engine_event.message = message;
+        g_task_manager->on_engine_event(engine_event);
+    }
+
+    void TorrentEngine::post_error(const std::string &key, const std::string &message) {
+        if (!g_task_manager) return;
+        EngineEvent engine_event;
+        engine_event.type = EngineEventType::DOWNLOAD_FAILED;
+        engine_event.engine_key = key;
+        engine_event.protocol = DW_PROTOCOL_TORRENT;
+        engine_event.client_id = g_task_manager->client_id();
+        engine_event.reason = DW_REASON_ERROR;
+        engine_event.message = message;
+        g_task_manager->on_engine_event(engine_event);
     }
 
     int32_t TorrentEngine::add_task(const dw_task_params_t *params,
                                     dw_submit_result_t *out_result) {
-        const char *info_hash = dw_task_params_key(params, DW_PROTOCOL_TORRENT);
-        log_d(info_hash, "添加任务: %s", params ? to_string(*params).c_str() : "");
-        if (!info_hash || !info_hash[0]) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "info_hash 为空");
-            return -1;
-        }
+        log_i("", "添加任务: %s", params ? to_string(*params).c_str() : "");
         if (!params->save_path || !params->save_path[0]) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "save_path 为空");
+            log_e("", "save_path 无效");
+            set_result(out_result, "", DW_REASON_ERROR, "保存路径无效");
             return -1;
         }
         if (!g_session || !g_session->is_valid()) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "session 无效");
-            return -1;
-        }
-
-        const std::string key(info_hash);
-
-        if (lt::torrent_handle exist = find_handle(key); exist.is_valid()) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "下载任务已存在");
+            log_e("", "session 无效");
+            set_result(out_result, "", DW_REASON_ERROR, "下载引擎未启动");
             return -1;
         }
 
@@ -689,20 +1023,8 @@ namespace dw {
         atp.save_path = params->save_path;
         bool source_ok = false;
 
-        // resume_data > magnet_link > torrent_file > info_hash
-        if (params->resume_data && params->resume_data_size > 0) {
-            try {
-                const lt::span<const char> buf(
-                    reinterpret_cast<const char *>(params->resume_data),
-                    static_cast<std::ptrdiff_t>(params->resume_data_size));
-                lt::add_torrent_params resumed = lt::read_resume_data(buf);
-                atp = std::move(resumed);
-                source_ok = true;
-            } catch (const std::exception &e) {
-                log_d(info_hash, "resume_data 解析失败，回退: %s", e.what());
-            }
-        }
-        if (!source_ok && params->magnet_link && params->magnet_link[0]) {
+        // magnet_link > torrent_file > info_hash。
+        if (params->magnet_link && params->magnet_link[0]) {
             lt::error_code ec;
             lt::parse_magnet_uri(params->magnet_link, atp, ec);
             if (!ec) {
@@ -711,33 +1033,28 @@ namespace dw {
         }
         if (!source_ok && params->torrent_file && params->torrent_file[0]) {
             lt::error_code ec;
-            auto ti = std::make_shared<lt::torrent_info>(params->torrent_file, ec);
+            const lt::add_torrent_params loaded = lt::load_torrent_file(
+                params->torrent_file, ec, lt::load_torrent_limits{});
             if (!ec) {
-                atp.ti = ti;
+                atp.ti = loaded.ti;
+                source_ok = true;
+            }
+        }
+        if (!source_ok && params->magnet_link && params->magnet_link[0]) {
+            lt::sha1_hash h;
+            if (lt::aux::from_hex(std::string(params->magnet_link), h.data())) {
+                atp.info_hashes = lt::info_hash_t(h);
                 source_ok = true;
             }
         }
         if (!source_ok) {
-            // 用 key（info_hash 十六进制串）构造磁力链接
-            lt::error_code ec;
-            const std::string magnet = "magnet:?xt=urn:btih:" + key;
-            lt::parse_magnet_uri(magnet, atp, ec);
-            if (!ec) {
-                source_ok = true;
-            }
-        }
-        if (!source_ok) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "无法解析的下载任务");
+            log_e("", "无效下载任务");
+            set_result(out_result, "", DW_REASON_ERROR, "无效下载任务");
             return -1;
         }
 
-        // trackers
-        if (params->trackers && params->tracker_count > 0) {
-            for (int i = 0; i < params->tracker_count; ++i) {
-                if (params->trackers[i]) {
-                    atp.trackers.emplace_back(params->trackers[i]);
-                }
-            }
+        for (const auto &t: g_default_trackers) {
+            atp.trackers.emplace_back(t);
         }
         // web seeds
         if (params->url_seeds && params->url_seed_count > 0) {
@@ -756,158 +1073,107 @@ namespace dw {
         try {
             handle = g_session->add_torrent(std::move(atp));
         } catch (const std::exception &e) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, e.what());
+            log_e("", "任务添加失败: %s", e.what());
+            set_result(out_result, "", DW_REASON_ERROR, "任务添加失败");
             return -1;
         }
         if (!handle.is_valid()) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "add_torrent 返回无效句柄");
+            set_result(out_result, "", DW_REASON_ERROR, "任务添加失败");
             return -1;
         }
 
-        log_i(key.c_str(), "添加任务成功");
-        set_result(out_result, info_hash, DW_REASON_NONE, nullptr);
+        const std::string info_hash = info_hash_hex(handle);
+        log_i(info_hash.c_str(), "添加任务完成");
+
+        set_result(out_result, info_hash.c_str(), DW_REASON_NONE, nullptr);
+        out_result->info_hash = utils::dup_cstr(info_hash);
+
+        if (auto [files, count] = build_flat_file_list(handle); files && count > 0) {
+            out_result->files = files;
+            out_result->file_count = count;
+        }
         return 0;
     }
 
-    int32_t TorrentEngine::resume_task(const dw_task_params_t *params,
-                                       dw_submit_result_t *out_result) {
-        const char *info_hash = dw_task_params_key(params, DW_PROTOCOL_TORRENT);
-        log_d(info_hash, "恢复任务: %s", params ? to_string(*params).c_str() : "");
-        if (!info_hash || !info_hash[0]) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "info_hash 为空");
-            return -1;
+    void TorrentEngine::resume_task(const std::string &info_hash,
+                                    const std::string &client_id,
+                                    const std::vector<int32_t> &priority_file_indexes) {
+        log_i(info_hash.c_str(), "恢复任务");
+        if (info_hash.empty()) {
+            log_e("", "info_hash 为空");
+            return;
         }
         if (!g_session || !g_session->is_valid()) {
-            set_result(out_result, info_hash, DW_REASON_ERROR, "session 无效");
-            return -1;
+            log_e(info_hash.c_str(), "session 无效");
+            post_error(info_hash, "下载引擎未启动");
+            return;
         }
 
-        const std::string key(info_hash);
-
-        if (lt::torrent_handle handle = find_handle(key); !handle.is_valid()) {
-            // 重建：add_task 创建 handle，事件驱动状态流转，不在此 resume
-            dw_submit_result_t add_result{};
-            add_task(params, &add_result);
-            dw_submit_result_release(&add_result);
-            handle = find_handle(key);
-            if (!handle.is_valid()) {
-                set_result(out_result, key.c_str(), DW_REASON_ERROR, "重建 handle 失败");
-                return -1;
-            }
-            log_i(key.c_str(), "重建 handle 成功，等待事件驱动");
-            set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
-            return 0;
-        } else {
-            // handle 已存在：恢复下载
-            if (const lt::torrent_status ts = handle.status(); ts.errc) {
-                handle.clear_error();
-            }
-            // 设置文件优先级（无论是否暂停都需要设置）。
-            if (const std::shared_ptr<const lt::torrent_info> ti = handle.torrent_file(); ti) {
-                const int n = ti->files().num_files();
-                // 读取当前优先级，将已有 top_priority 重置为 default（适配取消优先）。
-                std::vector<lt::download_priority_t> prio = handle.get_file_priorities();
-                if (static_cast<int>(prio.size()) < n) {
-                    prio.resize(static_cast<size_t>(n), lt::dont_download);
-                }
-                for (auto &p: prio) {
-                    if (p == lt::top_priority) p = lt::default_priority;
-                }
-                // file_indexes: 控制是否下载，不在列表中的设为 dont_download。
-                if (params->file_indexes && params->file_index_size > 0) {
-                    for (int32_t i = 0; i < params->file_index_size; ++i) {
-                        if (params->file_indexes[i] >= 0 && params->file_indexes[i] < n) {
-                            prio[static_cast<size_t>(params->file_indexes[i])] = lt::default_priority;
-                        }
-                    }
-                }
-                // priority_file_indexes: 优先下载，设为最高优先级。
-                if (params->priority_file_indexes && params->priority_file_index_size > 0) {
-                    for (int32_t i = 0; i < params->priority_file_index_size; ++i) {
-                        if (params->priority_file_indexes[i] >= 0 && params->priority_file_indexes[i] < n) {
-                            prio[static_cast<size_t>(params->priority_file_indexes[i])] = lt::top_priority;
-                        }
-                    }
-                }
-                try {
-                    handle.prioritize_files(prio);
-                } catch (const std::exception &e) {
-                    log_e(key.c_str(), "设置文件优先级失败: %s", e.what());
-                }
-            }
-            try {
-                if (const lt::torrent_status st = handle.status(); st.flags & lt::torrent_flags::paused) {
-                    // 已暂停：调用 resume() 触发 torrent_resumed_alert → BT_RESUMED 事件。
-                    handle.set_flags(lt::torrent_flags::auto_managed);
-                    handle.resume();
-                    set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
-                    return 0;
-                }
-                // 非暂停状态：无需重复调用 handle.resume()，补发 BT_RESUMED 事件。
-            } catch (const std::exception &e) {
-                set_result(out_result, key.c_str(), DW_REASON_ERROR, e.what());
-                return -1;
-            }
-            // 重复操作补发恢复事件
-            if (g_task_manager) {
-                g_task_manager->on_engine_event(EngineEvent{
-                    .type = EngineEventType::RESUMED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT
-                });
-            }
+        const lt::torrent_handle handle = find_handle(info_hash, client_id);
+        if (!handle.is_valid()) {
+            log_e(info_hash.c_str(), "handle 获取失败");
+            post_error(info_hash, "任务不存在");
+            return;
         }
-        set_result(out_result, key.c_str(), DW_REASON_NONE, nullptr);
-        return 0;
+
+        if (const lt::torrent_status ts = handle.status(); ts.errc) {
+            handle.clear_error();
+        }
+
+        // 设置文件优先级
+        apply_file_priorities(info_hash, client_id, priority_file_indexes);
+        try {
+            if (const lt::torrent_status st = handle.status(); st.flags & lt::torrent_flags::paused) {
+                handle.set_flags(lt::torrent_flags::auto_managed);
+                handle.resume();
+            }
+        } catch (const std::exception &e) {
+            log_e(info_hash.c_str(), "handle 恢复失败: %s", e.what());
+            post_error(info_hash, "下载失败");
+        }
     }
 
-    int32_t TorrentEngine::pause_task(const char *task_id,
+    int32_t TorrentEngine::pause_task(const std::string &info_hash,
+                                      const std::string &client_id,
                                       dw_submit_result_t *out_result) {
-        log_d(task_id, "暂停任务");
-        if (!task_id || !task_id[0]) {
-            set_result(out_result, task_id, DW_REASON_ERROR, "任务标识为空");
+        log_i(info_hash.c_str(), "暂停任务");
+        if (info_hash.empty()) {
+            log_e("", "info_hash 为空");
+            set_result(out_result, info_hash.c_str(), DW_REASON_ERROR, "任务不存在");
             return -1;
         }
-        const std::string key(task_id);
-        if (const lt::torrent_handle handle = find_handle(key); handle.is_valid()) {
-            try {
-                const lt::torrent_status st = handle.status();
-                if (!(st.flags & lt::torrent_flags::paused)) {
-                    // 未暂停：调用 pause() 触发 torrent_paused_alert → BT_PAUSED 事件。
-                    handle.unset_flags(lt::torrent_flags::auto_managed);
-                    handle.pause();
-                    set_result(out_result, task_id, DW_REASON_NONE, nullptr);
-                    return 0;
-                }
-            } catch (const std::exception &e) {
-                set_result(out_result, task_id, DW_REASON_ERROR, e.what());
-                return -1;
+        const lt::torrent_handle handle = find_handle(info_hash, client_id);
+        if (!handle.is_valid()) {
+            log_e(info_hash.c_str(), "handle 获取失败");
+            set_result(out_result, info_hash.c_str(), DW_REASON_ERROR, "任务不存在");
+            return -1;
+        }
+        try {
+            if (const lt::torrent_status st = handle.status(); !(st.flags & lt::torrent_flags::paused)) {
+                handle.unset_flags(lt::torrent_flags::auto_managed);
+                handle.pause();
             }
+        } catch (const std::exception &e) {
+            log_e(info_hash.c_str(), "handle 暂停失败: %s", e.what());
+            set_result(out_result, info_hash.c_str(), DW_REASON_ERROR, "暂停失败");
+            return -1;
         }
-        // 重复操作补发暂停事件
-        if (g_task_manager) {
-            g_task_manager->on_engine_event(EngineEvent{
-                .type = EngineEventType::PAUSED,
-                .engine_key = key,
-                .protocol = DW_PROTOCOL_TORRENT
-            });
-        }
-        set_result(out_result, task_id, DW_REASON_NONE, nullptr);
+
+        set_result(out_result, info_hash.c_str(), DW_REASON_NONE, nullptr);
         return 0;
     }
 
-    int32_t TorrentEngine::delete_task(const char *task_id,
+    int32_t TorrentEngine::delete_task(const std::string &info_hash,
+                                       const std::string &client_id,
                                        const int32_t delete_files,
                                        dw_submit_result_t *out_result) {
-        log_d(task_id, "删除任务 delete_files=%d", delete_files);
-        if (!task_id || !task_id[0]) {
-            set_result(out_result, task_id, DW_REASON_ERROR, "任务标识为空");
+        log_i(info_hash.c_str(), "删除任务 delete_files=%d", delete_files);
+        if (info_hash.empty()) {
+            log_e("", "info_hash 为空");
+            set_result(out_result, info_hash.c_str(), DW_REASON_ERROR, "任务不存在");
             return -1;
         }
-        const std::string key(task_id);
-        if (const lt::torrent_handle handle = find_handle(key); handle.is_valid()) {
-            // handle 有效：移出 session，由 torrent_removed_alert / torrent_deleted_alert
-            // 触发 DELETED 事件通知 wrapper 回收资源。
+        if (const lt::torrent_handle handle = find_handle(info_hash, client_id); handle.is_valid()) {
             try {
                 if (g_session) {
                     const auto opt = delete_files
@@ -916,33 +1182,22 @@ namespace dw {
                     g_session->remove_torrent(handle, opt);
                 }
             } catch (const std::exception &e) {
-                set_result(out_result, task_id, DW_REASON_ERROR, e.what());
+                log_e(info_hash.c_str(), "handle 删除失败: %s", e.what());
+                set_result(out_result, info_hash.c_str(), DW_REASON_ERROR, "删除失败");
                 return -1;
             }
-            set_result(out_result, task_id, DW_REASON_NONE, nullptr);
-            return 0;
         }
-        // handle 无效：任务不在会话，按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
-        // 直接投递 DELETED 事件，wrapper 据此回收资源 + 按标识删文件。
-        if (g_task_manager) {
-            g_task_manager->on_engine_event(EngineEvent{
-                .type = EngineEventType::DELETED,
-                .engine_key = key,
-                .protocol = DW_PROTOCOL_TORRENT,
-                .delete_files = delete_files
-            });
-        }
-        set_result(out_result, task_id, DW_REASON_NONE, nullptr);
+        set_result(out_result, info_hash.c_str(), DW_REASON_NONE, nullptr);
         return 0;
     }
 
-    bool TorrentEngine::task_released(const char *task_id) {
-        if (!task_id || !task_id[0]) return true;
+    bool TorrentEngine::task_released(const std::string &task_id) {
+        if (task_id.empty()) return true;
         // session 已销毁 / 未初始化：全部存储句柄已关闭，视为已释放。
         if (!initialized_ || !g_session) return true;
         // remove_torrent 后 handle 在 libtorrent 内部任务（disk-io 等）释放引用
         // 前仍有效；find_handle 失效即代表移除收敛、文件句柄已关闭。
-        return !find_handle(std::string(task_id)).is_valid();
+        return !find_handle(task_id).is_valid();
     }
 
     void TorrentEngine::sweep() {
@@ -969,108 +1224,56 @@ namespace dw {
         }
     }
 
-    int32_t TorrentEngine::move_storage(const char *task_id, const char *new_save_path) {
-        if (!task_id || !task_id[0] || !new_save_path || !new_save_path[0]) {
-            log_e(task_id, "迁移参数为空");
-            return -1;
-        }
-        const std::string key(task_id);
-        const lt::torrent_handle h = find_handle(key);
-        if (!h.is_valid()) {
-            log_e(key.c_str(), "迁移 handle 无效");
-            return -1;
-        }
-
-        // 已一致则空操作（去尾分隔符后比较，容忍书写差异），供调度幂等重入校验。
-        const auto trim_sep = [](std::string s) {
-            while (s.size() > 1 && (s.back() == '/' || s.back() == '\\')) s.pop_back();
-            return s;
-        };
-        try {
-            const std::string cur =
-                    h.status(lt::torrent_handle::query_save_path).save_path;
-            if (trim_sep(cur) == trim_sep(new_save_path)) return 0;
-        } catch (const std::exception &e) {
-            log_e(key.c_str(), "迁移查询当前路径异常: %s", e.what());
-            return -1;
-        }
-
-        // 零字节落盘时段（default_dont_download）move_storage 仅创建目标目录并改
-        // 内部 save_path，storage_moved_alert 异步收敛后投递 PARSED 事件通知调度侧放行。
-        try {
-            h.move_storage(std::string(new_save_path));
-        } catch (const std::exception &e) {
-            log_e(key.c_str(), "迁移发起失败: %s", e.what());
-            return -1;
-        }
-        log_i(key.c_str(), "迁移发起: -> '%s'", new_save_path);
-        return 1;
-    }
-
-    bool TorrentEngine::get_file_path(const char *task_id, int32_t file_index,
+    bool TorrentEngine::get_file_path(const std::string &task_id, int32_t file_index,
                                       std::string &out_path, int64_t &out_size) {
-        if (!task_id || !task_id[0] || file_index < 0) return false;
-        const lt::torrent_handle h = find_handle(std::string(task_id));
+        if (task_id.empty() || file_index < 0) return false;
+        const lt::torrent_handle h = find_handle(task_id);
         if (!h.is_valid()) return false;
         try {
             const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
-            if (!ti || file_index >= ti->files().num_files()) return false;
+            if (!ti || file_index >= ti->layout().num_files()) return false;
             const lt::file_index_t idx{file_index};
             // 物理路径 = handle 当前 save_path / 文件相对路径（move_storage 后自动跟随）。
             const std::string save_path =
                     h.status(lt::torrent_handle::query_save_path).save_path;
-            out_path = (std::filesystem::path(save_path) / ti->files().file_path(idx)).string();
-            out_size = ti->files().file_size(idx);
+            if (save_path.empty()) {
+                log_e(task_id.c_str(), "save_path 为空");
+                return false;
+            }
+            out_path = (std::filesystem::path(save_path) / ti->layout().file_path(idx)).string();
+            out_size = ti->layout().file_size(idx);
             return true;
         } catch (const std::exception &e) {
-            log_e(task_id, "文件路径查询异常: %s", e.what());
+            log_e(task_id.c_str(), "文件路径查询异常: %s", e.what());
             return false;
         }
     }
 
-    std::vector<dw_file_info_t> TorrentEngine::get_file_list(const char *task_id) {
-        std::vector<dw_file_info_t> out;
-        if (!task_id || !task_id[0]) return out;
-        const lt::torrent_handle h = find_handle(std::string(task_id));
-        if (!h.is_valid()) return out;
-        try {
-            const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
-            if (!ti) return out;
-            // 优先级口径与 PARSED 上报一致：仅选中文件（dont_download 不含）。
-            const auto priorities = h.get_file_priorities();
-            out = build_flat_file_list(ti, &priorities);
-        } catch (const std::exception &e) {
-            log_e(task_id, "文件列表查询异常: %s", e.what());
-            out.clear();
-        }
-        return out;
+    utils::file_array TorrentEngine::get_file_list(const std::string &task_id) {
+        if (task_id.empty()) return {nullptr, 0};
+        const lt::torrent_handle h = find_handle(task_id);
+        if (!h.is_valid()) return {nullptr, 0};
+        // 优先级口径与 PARSED 上报一致：仅选中文件（dont_download 不含）。
+        const bool selected = true;
+        return build_flat_file_list(h, &selected);
     }
 
     void TorrentEngine::post_updates() {
-        // 节拍入口（A 线程调用）：
-        //   1) post_torrent_updates：触发引擎收集变更任务状态，结果经 state_update_alert
-        //      异步回 alert 线程，由 handle_alert 投递 STATUS_UPDATE 事件；
-        //   2) 续传检查点：对有元数据任务请求 save_resume_data（携变更门槛，无变化
-        //      不产生 alert），结果经 save_resume_data_alert → post_resume_data 输出。
+        // 节拍入口（A 线程调用）：仅触发状态更新，续传由独立定时线程负责。
         if (!g_session) return;
         try { g_session->post_torrent_updates(); } catch (...) {
         }
-        std::vector<lt::torrent_handle> handles;
-        try { handles = g_session->get_torrents(); } catch (...) { return; }
-        for (const auto &h: handles) {
-            request_save_resume(h);
-        }
     }
 
-    char *TorrentEngine::magnet_to_info_hash(const char *magnet_link) {
-        if (!magnet_link || !magnet_link[0]) {
+    char *TorrentEngine::magnet_to_info_hash(const std::string &magnet_link) {
+        if (magnet_link.empty()) {
             return nullptr;
         }
         lt::error_code ec;
         lt::add_torrent_params atp;
         lt::parse_magnet_uri(magnet_link, atp, ec);
         if (ec) {
-            log_e("", "解析磁力链接失败: %s", ec.message().c_str());
+            log_e("bt", "解析磁力链接失败: %s", ec.message().c_str());
             return nullptr;
         }
         std::string s;
@@ -1084,16 +1287,18 @@ namespace dw {
         return utils::dup_cstr(s);
     }
 
-    char *TorrentEngine::torrent_file_to_info_hash(const char *torrent_file_path) {
-        if (!torrent_file_path || !torrent_file_path[0]) {
+    char *TorrentEngine::torrent_file_to_info_hash(const std::string &torrent_file_path) {
+        if (torrent_file_path.empty()) {
             return nullptr;
         }
         lt::error_code ec;
-        const auto ti = std::make_shared<lt::torrent_info>(torrent_file_path, ec);
+        lt::add_torrent_params loaded = lt::load_torrent_file(
+            torrent_file_path, ec, lt::load_torrent_limits{});
         if (ec) {
-            log_e("", "加载 .torrent 文件失败: %s", ec.message().c_str());
+            log_e("bt", "加载 .torrent 文件失败: %s", ec.message().c_str());
             return nullptr;
         }
+        const std::shared_ptr<const lt::torrent_info> ti = loaded.ti;
         const lt::info_hash_t ih = ti->info_hashes();
         std::string s;
         if (ih.has_v2()) {
@@ -1106,83 +1311,30 @@ namespace dw {
         return utils::dup_cstr(s);
     }
 
-    char *TorrentEngine::info_hash_to_magnet(const char *task_id) {
-        log_d(task_id, "info_hash_to_magnet 进入");
-        if (!task_id || !task_id[0]) {
+    char *TorrentEngine::info_hash_to_magnet(const std::string &task_id) {
+        log_i(task_id.c_str(), "info_hash_to_magnet 进入");
+        if (task_id.empty()) {
             return nullptr;
         }
-        const lt::torrent_handle handle = find_handle(std::string(task_id));
+        const lt::torrent_handle handle = find_handle(task_id);
         if (!handle.is_valid()) {
-            log_e(task_id, "info_hash_to_magnet 任务不存在");
+            log_e(task_id.c_str(), "info_hash_to_magnet 任务不存在");
             return nullptr;
         }
         try {
-            const std::string magnet = lt::make_magnet_uri(handle);
+            // ABI=100（deprecated-functions=OFF）下 handle 重载不可用，手工构造 atp 生成。
+            lt::add_torrent_params atp;
+            atp.info_hashes = handle.info_hashes();
+            atp.name = handle.status(lt::torrent_handle::query_name).name;
+            for (const auto &te: handle.trackers()) atp.trackers.push_back(te.url);
+            const std::string magnet = lt::make_magnet_uri(atp);
             if (magnet.empty()) return nullptr;
-            log_i(task_id, "info_hash_to_magnet 成功");
+            log_i(task_id.c_str(), "info_hash_to_magnet 成功");
             return utils::dup_cstr(magnet);
         } catch (const std::exception &e) {
-            log_e(task_id, "生成磁力链接失败: %s", e.what());
+            log_e(task_id.c_str(), "生成磁力链接失败: %s", e.what());
             return nullptr;
         }
-    }
-
-    int32_t TorrentEngine::parse_torrent_file(const char *torrent_file_path,
-                                              char **out_name,
-                                              char **out_info_hash,
-                                              dw_file_info_t **out_files,
-                                              int32_t *out_count) {
-        if (!torrent_file_path || !out_name || !out_info_hash || !out_files || !out_count) {
-            return -1;
-        }
-        *out_name = nullptr;
-        *out_info_hash = nullptr;
-        *out_files = nullptr;
-        *out_count = 0;
-
-        lt::error_code ec;
-        const auto ti = std::make_shared<lt::torrent_info>(torrent_file_path, ec);
-        if (ec) {
-            log_e("", "解析 .torrent 文件失败: %s", ec.message().c_str());
-            return -1;
-        }
-
-        // 种子名称
-        const std::string name = ti->name();
-        *out_name = utils::dup_cstr(name);
-        if (!*out_name) {
-            return -1;
-        }
-
-        // info_hash
-        const lt::info_hash_t &hashes = ti->info_hashes();
-        std::string info_hash_str;
-        if (hashes.has_v2()) {
-            info_hash_str = lt::aux::to_hex(hashes.v2);
-        } else if (hashes.has_v1()) {
-            info_hash_str = lt::aux::to_hex(hashes.v1);
-        } else {
-            log_e("", ".torrent 文件无有效 info_hash");
-            std::free(*out_name);
-            *out_name = nullptr;
-            return -1;
-        }
-        *out_info_hash = utils::dup_cstr(info_hash_str);
-        if (!*out_info_hash) {
-            std::free(*out_name);
-            *out_name = nullptr;
-            return -1;
-        }
-
-        // 文件列表
-        if (fill_file_list(ti, out_files, out_count) != 0) {
-            std::free(*out_name);
-            *out_name = nullptr;
-            std::free(*out_info_hash);
-            *out_info_hash = nullptr;
-            return -1;
-        }
-        return 0;
     }
 
     // Piece→文件窗口裁剪共享逻辑：遍历与文件 [f_off, f_end] 重叠的已下载 piece，
@@ -1211,13 +1363,13 @@ namespace dw {
         }
     }
 
-    std::vector<dw_byte_range_t> TorrentEngine::get_file_ranges(const char *task_id,
+    std::vector<dw_byte_range_t> TorrentEngine::get_file_ranges(const std::string &task_id,
                                                                 int32_t file_index) {
         std::vector<dw_byte_range_t> ranges;
-        if (!task_id || !task_id[0] || file_index < 0) {
+        if (task_id.empty() || file_index < 0) {
             return ranges;
         }
-        const lt::torrent_handle handle = find_handle(std::string(task_id));
+        const lt::torrent_handle handle = find_handle(task_id);
         if (!handle.is_valid()) {
             return ranges;
         }
@@ -1232,7 +1384,7 @@ namespace dw {
             return ranges;
         }
         try {
-            const lt::file_storage &fs = ti->files();
+            const lt::file_storage &fs = ti->layout();
             if (file_index >= fs.num_files()) {
                 return ranges;
             }
@@ -1255,89 +1407,38 @@ namespace dw {
                                             }
                                         });
         } catch (const std::exception &e) {
-            log_e(task_id, "get_file_ranges 异常: %s", e.what());
+            log_e(task_id.c_str(), "get_file_ranges 异常: %s", e.what());
             ranges.clear();
         }
         return ranges;
     }
 
-    int32_t TorrentEngine::set_playing_file(const char *task_id,
-                                            int32_t file_index,
-                                            int64_t byte_offset) {
-        if (!task_id || !task_id[0] || file_index < 0) {
-            return -1;
-        }
-        const lt::torrent_handle handle = find_handle(std::string(task_id));
+    int32_t TorrentEngine::apply_file_selection(const std::string &task_id,
+                                                const std::vector<int32_t> &file_indexes) {
+        if (task_id.empty()) return -1;
+        lt::torrent_handle handle = find_handle(task_id);
         if (!handle.is_valid()) {
-            log_e(task_id, "set_playing_file 任务不存在");
-            return -1;
-        }
-        try {
-            std::shared_ptr<const lt::torrent_info> ti = handle.torrent_file();
-            if (!ti) {
-                return -1; // 元数据未就绪
-            }
-            const lt::file_storage &fs = ti->files();
-            if (file_index >= fs.num_files()) {
-                return -1;
-            }
-            const lt::file_index_t fidx{file_index};
-            const int64_t f_off = fs.file_offset(fidx);
-            const int64_t f_size = fs.file_size(fidx);
-            const int32_t piece_len = fs.piece_length();
-            if (f_size <= 0 || piece_len <= 0) {
-                return -1;
-            }
-            const int64_t off = (byte_offset > 0) ? byte_offset : 0;
-            const int start_piece = static_cast<int>((f_off + off) / piece_len);
-            const int last_piece = static_cast<int>((f_off + f_size - 1) / piece_len);
-            // readahead 窗口 N 片，按递增 deadline 提优（越靠前越紧急）。
-            constexpr int kReadaheadPieces = 8;
-            constexpr int kDeadlineStepMs = 1000;
-            for (int i = 0; i < kReadaheadPieces; ++i) {
-                const int p = start_piece + i;
-                if (p > last_piece) break;
-                handle.set_piece_deadline(lt::piece_index_t{p}, i * kDeadlineStepMs);
-            }
-        } catch (const std::exception &e) {
-            log_e(task_id, "set_playing_file 失败: %s", e.what());
-            return -1;
-        }
-        log_d(task_id,
-                    "set_playing_file 成功 file_index=%d offset=%lld",
-                    file_index, (long long)byte_offset);
-        return 0;
-    }
-
-    int32_t TorrentEngine::apply_file_selection(const char *task_id,
-                                                const int32_t *file_indexes,
-                                                int32_t count) {
-        if (!task_id || !task_id[0]) return -1;
-        lt::torrent_handle handle = find_handle(std::string(task_id));
-        if (!handle.is_valid()) {
-            log_e(task_id, "apply_file_selection 任务不存在");
+            log_e(task_id.c_str(), "apply_file_selection 任务不存在");
             return -1;
         }
         std::shared_ptr<const lt::torrent_info> ti;
         try { ti = handle.torrent_file(); } catch (...) { ti = nullptr; }
         if (!ti) {
             // 调度出口以 metadata_ready && naming_ready 合取为前提，正常不应到此。
-            log_e(task_id, "apply_file_selection 元数据未就绪");
+            log_e(task_id.c_str(), "apply_file_selection 元数据未就绪");
             return -1;
         }
         try {
-            const int n = ti->files().num_files();
+            const int n = ti->layout().num_files();
             // 全量显式定型：磁力（default_dont_download 物化全 0）与 .torrent（默认全 4）
             // 添加路径的初始优先级不同，统一覆写为确认意图，消除路径差异。
-            // count<=0 = 全部默认优先级；count>0 = 选中默认、其余不下载。
+            // 空 = 全部默认优先级；非空 = 选中默认、其余不下载。
             std::vector<lt::download_priority_t> prio(
                 static_cast<size_t>(n > 0 ? n : 0),
-                count > 0 ? lt::dont_download : lt::default_priority);
-            if (count > 0 && file_indexes) {
-                for (int32_t i = 0; i < count; ++i) {
-                    if (file_indexes[i] >= 0 && file_indexes[i] < n) {
-                        prio[static_cast<size_t>(file_indexes[i])] = lt::default_priority;
-                    }
+                file_indexes.empty() ? lt::default_priority : lt::dont_download);
+            for (const int32_t idx: file_indexes) {
+                if (idx >= 0 && idx < n) {
+                    prio[static_cast<size_t>(idx)] = lt::default_priority;
                 }
             }
             handle.prioritize_files(prio);
@@ -1346,11 +1447,11 @@ namespace dw {
             handle.set_flags(lt::torrent_flags::auto_managed);
             handle.resume();
         } catch (const std::exception &e) {
-            log_e(task_id, "apply_file_selection 失败: %s", e.what());
+            log_e(task_id.c_str(), "apply_file_selection 失败: %s", e.what());
             return -1;
         }
-        log_i(task_id,
-                    "apply_file_selection 成功 count=%d (<=0 即全部)", count);
+        log_i(task_id.c_str(),
+              "apply_file_selection 成功 count=%zu (空即全部)", file_indexes.size());
         return 0;
     }
 } // namespace dw

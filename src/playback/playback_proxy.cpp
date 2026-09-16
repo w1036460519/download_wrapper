@@ -208,11 +208,9 @@ private:
         }
 
         // ---- 获取文件路径与总大小 ----
-        const dw_task_key_t task_key{
-            static_cast<dw_protocol_t>(protocol_), natural_key_.c_str()};
         char*    raw_path = nullptr;
         int64_t  file_size = -1;
-        if (dw_get_task_file_info(client_id_.c_str(), &task_key,
+        if (dw_get_task_file_info(client_id_.c_str(), natural_key_.c_str(),
                                   static_cast<int32_t>(file_index_),
                                   &raw_path, &file_size) != 0 || !raw_path) {
             send_error(http::status::not_found, "Task or file not found");
@@ -264,11 +262,9 @@ private:
         auto self = shared_from_this();
 
         // ---- 查询已下载分段（优先缓存，按状态区分） ----
-        const dw_task_key_t task_key{
-            static_cast<dw_protocol_t>(protocol_), natural_key_.c_str()};
         dw_byte_range_t* ranges     = nullptr;
         int32_t          range_count = 0;
-        const int32_t rc = dw_get_file_ranges(client_id_.c_str(), &task_key,
+        const int32_t rc = dw_get_file_ranges(client_id_.c_str(), natural_key_.c_str(),
                                               static_cast<int32_t>(file_index_),
                                               &ranges, &range_count);
 
@@ -564,17 +560,17 @@ void dw_proxy_stop(void) {
     dw::playback::g_port = 0;
 }
 
-const char* dw_proxy_get_url(const char* client_id, const dw_task_key_t* key, int file_index) {
-    if (!client_id || !key || !key->natural_key) {
+const char* dw_proxy_get_url(const char* client_id, dw_protocol_t protocol, const char* natural_key, int file_index) {
+    if (!client_id || !natural_key) {
         return "";
     }
     static thread_local std::string url;
     const char *type_str =
-        key->protocol == DW_PROTOCOL_TORRENT ? "bt" : "http";
+        protocol == DW_PROTOCOL_TORRENT ? "bt" : "http";
     url = "http://127.0.0.1:" + std::to_string(dw::playback::g_port) +
           "/file?client_id=" + client_id +
           "&type=" + type_str +
-          "&key=" + key->natural_key +
+          "&key=" + natural_key +
           "&file=" + std::to_string(file_index);
     return url.c_str();
 }

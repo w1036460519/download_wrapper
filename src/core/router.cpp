@@ -16,6 +16,7 @@ namespace dw {
 
     TaskManager *Router::route(const std::string &client_id) const {
         if (is_local(client_id)) {
+            log_i("", "路由到本机");
             return task_manager_.get();
         }
         // 远程任务：未来返回 RemoteProxy

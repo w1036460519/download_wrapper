@@ -274,6 +274,7 @@ struct dl_part_ctx {
 /* ===================== 任务运行时上下文 ===================== */
 struct dl_task_ctx {
     std::string url;
+    std::string client_id; // 客户端标识（用于恢复数据直接落库）
     std::string output_path; // 落盘目录（= 上层传入的 save_path，开始即定名，无临时目录）
     std::string filename;
     std::string full_file_path;

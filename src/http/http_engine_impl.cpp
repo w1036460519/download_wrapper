@@ -7,7 +7,7 @@
  *     探测即下载——首个连接（探测窗口 Range: 0-n）就是 part 0 的正式下载流，
  *     首笔 body 到达时定名建文件切分片，其余分片动态挂入同一 multi；
  *   - 进度由 worker 线程经 push_progress 推入 TaskManager 内存（按门槛节流），
- *     A 线程下一拍直接从 TaskRecord 字段采集；resume 由 worker 按推进门槛自推；
+ *     A 线程下一拍直接从 TaskRuntime 字段采集；resume 由 worker 按推进门槛自推；
  *   - 回调中共享字段用 mutex / atomic 保护。
  */
 
@@ -863,18 +863,13 @@ namespace dw {
             }
 
             void emit_resume(dl_task_ctx *tCtx) {
-                if (!tCtx) return;
+                if (!tCtx || !g_task_manager) return;
                 const std::string blob = serialize_resume(tCtx);
                 if (blob.empty()) return;
-                EngineEvent ev;
-                ev.type = EngineEventType::RESUME_DATA;
-                ev.engine_key = tCtx->url;
-                ev.protocol = DW_PROTOCOL_HTTP;
-                ev.resume_data.assign(reinterpret_cast<const uint8_t *>(blob.data()),
-                                      reinterpret_cast<const uint8_t *>(blob.data()) + blob.size());
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(std::move(ev));
-                }
+                // 直接落库，不经 TaskManager 事件通道。
+                g_task_manager->get_store().save_resume(
+                    tCtx->client_id, DW_PROTOCOL_HTTP, tCtx->url,
+                    reinterpret_cast<const uint8_t *>(blob.data()), blob.size());
             }
 
             // worker 线程按门槛异步上报 resume：仅支持续传、且总已下载相比上次有推进时触发。
@@ -1239,6 +1234,7 @@ namespace dw {
             std::unique_ptr<dl_task_ctx> task_create_new(const char *url, const char *output_path) {
                 auto tCtx = std::make_unique<dl_task_ctx>();
                 tCtx->url = url;
+                tCtx->client_id = g_task_manager ? g_task_manager->client_id() : "";
                 tCtx->output_path = output_path;
                 // filename 留空：由探测阶段从 URL 或 Content-Disposition 响应头解析。
                 tCtx->total_size = -1;

@@ -4,13 +4,13 @@
  *
  * 设计要点：
  *   - 注册表仅常驻排队 / 活跃任务（DOWNLOADING/QUEUED），
- *     暂停 / 完成 / 错误任务落库后从内存移除，按需经 add/resume/list 回读；
+ *     暂停 / 完成 / 错误任务状态即时投影至 file_records 后从内存移除，按需经 add/resume/list 回读；
  *     引擎仅持有当前活跃任务的运行时句柄；
  *   - 注册表 key 为 union_id（"client_id|type|raw_key" 格式），client_id 过滤在 API 入口校验；
  *   - 控制接口统一接 (proto, natural_key)，client_id 从 session 取；
- *   - TaskKey 包装结构已剔除，主键三字段平铺于 TaskRecord；
+ *   - TaskKey 包装结构已剔除，主键三字段平铺于 FileRecord；
  *   - 事件驱动模型：引擎经 post_engine_event 投递事件（STATUS_UPDATE/PARSED/DOWNLOAD_FAILED/
- *     DOWNLOAD_COMPLETED），B 线程消费并更新 TaskRecord 内存，A 线程按固定周期读取并转发上层；
+ *     DOWNLOAD_COMPLETED），B 线程消费并更新 FileRecord 内存，A 线程按固定周期读取并转发上层；
  *   - 断点续传经 on_resume_data 汇入持久化（HTTP worker 线程自推 / BT save_resume_data_alert 事件驱动）；
  *   - 并发准入：活跃任务数 < max_concurrent_downloads 才准入下载，其余置 QUEUED；
  *   - 调度纯事件驱动：状态跃迁释放许可 / 新增 / 恢复 / 调整优先级时唤醒调度线程；
@@ -22,6 +22,7 @@
 #include "download_wrapper/download_wrapper.h"
 #include "task_record.h"
 #include "task_store.h"
+#include "utils/memory_util.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -64,15 +65,15 @@ namespace dw {
         // ---- 控制操作（C ABI 转发到此） ----
 
         /// 添加任务。
+        /// @param client_id 客户端标识（必填）。
         /// @param force 强制重新添加：清理内存与 DB 中的旧记录（含 resume_data），从零开始；
         ///              false 时若任务已存在则仅刷新 created_at 用于排序置顶。
-        int32_t add(dw_protocol_t proto, const dw_task_params_t *params, dw_submit_result_t *out,
-                    bool force = false);
+        int32_t add(dw_protocol_t proto, const std::string &client_id, const dw_task_params_t *params,
+                    dw_submit_result_t *out, bool force = false);
 
-        int32_t pause(dw_protocol_t proto, const std::string &natural_key, dw_submit_result_t *out);
+        int32_t pause(dw_protocol_t proto, const std::string &natural_key, dw_submit_result_t *out) const;
 
         int32_t resume(dw_protocol_t proto, const std::string &natural_key,
-                       const char **trackers, int32_t tracker_count,
                        dw_submit_result_t *out);
 
         /// 删除任务：标记 DELETING + 调引擎 delete_task(delete_files)；
@@ -83,16 +84,17 @@ namespace dw {
         int32_t set_priority(dw_protocol_t proto, const std::string &natural_key,
                              const int32_t *priority_file_indexes, int32_t priority_file_index_size);
 
-        /// 设置播放提优标识：写入 playing_file_index/byte_offset，唤醒调度器。
-        /// 调度器负责任务准入与 piece deadline 设置，API 层不直接操作引擎。
-        /// 任务不在内存时从 DB 加载并重新登记；已完成任务拒绝（返回 false）。
-        /// 非 DOWNLOADING 态任务转 QUEUED 等待调度器准入。
-        /// @return true=成功设置，false=任务不存在或已完成。
-        bool set_playing(dw_protocol_t proto, const std::string &natural_key, int32_t file_index, int64_t byte_offset);
+        /// 读取断点续传数据（三要素定位）；不存在返回空 vector。
+        std::vector<uint8_t> load_resume(const std::string &client_id, dw_protocol_t proto,
+                                         const std::string &natural_key);
+
+        /// 读取任务保存目录（三要素定位）；任务不存在返回空串。
+        std::string load_save_path(const std::string &client_id, dw_protocol_t proto,
+                                   const std::string &natural_key);
 
         /// 按 (proto, natural_key) 查询任务记录：内存优先，DB 命中时注册入内存。
         /// 供低频工具函数（磁力/文件列表）定位任务。命中返回 true。
-        bool load_task_record(dw_protocol_t proto, const std::string &natural_key, TaskRecord &out_record);
+        bool load_task_record(dw_protocol_t proto, const std::string &natural_key, FileRecord &out_record);
 
         // ---- 边下边播缓存（直落 task_store，与协议无关） ----
 
@@ -121,24 +123,22 @@ namespace dw {
         /// 事件经值语义拷贝后投递，线程安全。
         void on_engine_event(EngineEvent event);
 
-        // ---- 唯一名定名（add 内部使用） ----
-        /// 持 mtx_ 抢占唯一 wrapper 名：以磁盘为唯一判重真相源（不查库），候选名未
-        /// 被占用即立即创建 wrapper 目录物化占位（"定名即持有"），冲突则整名尾部
-        /// 自增 (n) 作为 wrapper 名。随后回写 name=wrapper、save_path=原 dir（不变）、
-        /// filename=inner_name（仅在 !multi_file 时有值）并落库。
-        /// 返回 wrapper 名（可能含 (n) 后缀）；任务未知时仅抢名返回不落库。
-        /// @param wrapper_name 期望的 wrapper 名（basename，去后缀）。
-        /// @param inner_name   内部文件名（HTTP/BT 单文件，含后缀）；BT 多文件传空。
-        /// @param multi_file   是否多文件 BT（仅决定 filename 是否被记录）。
-        std::string resolve_and_record_name(const char *engine_key, dw_protocol_t proto,
-                                            const std::string &dir, const std::string &wrapper_name,
-                                            const std::string &inner_name, bool multi_file);
-
         // ---- 快照查询 ----
         int32_t list(dw_task_snapshot_t **out_tasks, int32_t *out_count);
 
         /// 从数据库加载全部文件目录记录（UI 渲染主表）。
         std::vector<FileRecord> list_file_records();
+
+        /// 同步文件记录到内存缓存（供外部经 store 操作后调用，持 mtx_）。
+        /// 缓存未加载时直接返回；已加载时按三要素定位插入或刷新 modified_at。
+        void sync_file_record_cache(const std::string &client_id, dw_protocol_t proto,
+                                    const std::string &natural_key, const FileRecord *fr = nullptr);
+
+        /// 获取或注册文件记录：已存在则返回其 parsed 状态；否则新建一条（parsed=false）。
+        /// 用于引擎在重名检测前查询文件记录的解析状态。
+        /// @return true=已解析（引擎可跳过重名检测），false=未解析或新建。
+        bool get_or_register_file_record(const std::string &client_id, dw_protocol_t proto,
+                                          const std::string &natural_key, const std::string &save_path);
 
         /// 设置流量闸门：allowed=false 时逐任务暂停所有活跃下载（BT/HTTP）并回落 QUEUED，
         /// 调度线程不再准入新任务；true 时唤醒调度按 QUEUED→准入路径自动重启。
@@ -153,8 +153,8 @@ namespace dw {
                                int32_t file_index, std::string &out_path, int64_t &out_size);
 
         /// 任务文件列表：BT 引擎实时查询（选中文件，handle 离线返回空）；
-        /// HTTP 从任务记录推导单文件条目。节点字符串堆分配，调用方负责 free。
-        std::vector<dw_file_info_t> load_files(dw_protocol_t proto, const std::string &natural_key);
+        /// HTTP 从任务记录推导单文件条目。连续数组由 alloc_file_list 分配，调用方负责释放。
+        utils::file_array load_files(dw_protocol_t proto, const std::string &natural_key);
 
         // ---- 本地文件浏览与管理 ----
 
@@ -167,21 +167,21 @@ namespace dw {
         int32_t validate_local_tasks(const std::string &save_path,
                                      int32_t *out_invalidated_count);
 
-        /// 全量清理指定 save_path 下的非下载任务（source IN (1,2)）：DB + 物理文件。
+        /// 全量清理指定 save_path 下的本地文件条目（type=0）：DB + 物理文件。
         int32_t clear_local_tasks(const std::string &save_path);
 
-        /// 删除单个本地文件条目（type=1）：仅 DB + 磁盘清理，不涉及 engine 层。
-        /// 下载任务（source=0）拒绝，应走 dw_delete_task。
+        /// 删除单个本地文件条目（type=0）：仅 DB + 磁盘清理，不涉及 engine 层。
+        /// 下载任务（type=1/2）拒绝，应走 dw_delete_task。
         int32_t delete_local_entry(const std::string &save_path, const std::string &root_name);
 
         // ---- 路径与展示辅助（静态，不依赖实例态） ----
 
-        /// 根据 TaskRecord 计算磁盘根路径。
-        /// 统一为 save_path / name（name 即 wrapper 名，去后缀，冲突时含 (n) 后缀）。
-        static std::string disk_root_path(const TaskRecord &rec);
+        /// 根据 FileRecord 计算磁盘根路径。
+        /// 统一为 save_path / root_name。
+        static std::string disk_root_path(const FileRecord &rec);
 
-        /// 根据 TaskRecord 计算展示名：name（已含可能的去重后缀）。
-        static std::string display_name(const TaskRecord &rec);
+        /// 根据 FileRecord 计算展示名：root_name（已含可能的去重后缀）。
+        static std::string display_name(const FileRecord &rec);
 
         /// 当前本机 clientId（init 注入，跨所有方法使用）。
         const std::string &client_id() const { return client_id_; }
@@ -194,18 +194,10 @@ namespace dw {
         TaskStore &get_store() { return store_; }
 
     private:
-        // 校验动作（下载前统一关卡）：A 线程锁内收集，锁外执行引擎调用，
-        // 通过后回锁迁 DOWNLOADING（未通过保持原态下拍再查）。
-        struct ResolveAction {
-            TaskRecord rec; // 锁内记录快照
-            std::vector<uint8_t> resume; // HTTP 续传存档（BT 引擎侧 add 时已装载，恒空）
-        };
-
-        // A 线程采集（持 mtx_，单段）：遍历下载中/解析中任务，直接读 TaskRecord 已被引擎推入
-        // 的进度字段；判终态 → 置 schedule_needed_ → 收集 RESOLVING 校验动作 → push 转发记录。
+        // A 线程采集（持 mtx_，单段）：遍历活跃任务，直接读 FileRecord 已被引擎推入
+        // 的进度字段；判终态 → 置 schedule_needed_ → push 转发记录。
         // 落库 / 区间快照 / 注销均延后到 B 线程。
-        void collect_progress_locked(std::vector<TaskRecord> &fwd_records,
-                                     std::vector<ResolveAction> &resolve_actions);
+        void collect_progress_locked(std::vector<FileRecord> &fwd_records);
 
         // A 线程（轻量）：周期遍历内存 + 转发回调，不落库 / 不快照 / 不移除 / 不 sweep。
         // stop_token 由 jthread 自动传入，stop() 请求停止后唤醒等待点并退出循环。
@@ -215,48 +207,33 @@ namespace dw {
         void maintenance_loop(std::stop_token st);
 
         // B 线程消费单个引擎事件（PARSED/DOWNLOAD_FAILED/DOWNLOAD_COMPLETED/STATUS_UPDATE/
-        // RESUME_DATA/BT_PAUSED/BT_RESUMED/DELETED）。
+        // RESUME_DATA/PAUSED/RESUMED/DELETED）。
         void consume_engine_event(EngineEvent event);
 
-        // B 线程持锁持久化：为下载中 / 终态任务落区间快照（引擎 ctx 尚在），刷写脏进度与暂存续传，最后注销终态任务。
+        // B 线程持锁持久化：为下载中 / 终态任务落区间快照（引擎 ctx 尚在），同步进度遥测与暂存续传，最后注销终态任务。
         void maintenance_persist_locked();
 
         // 统一进度转发：由记录（权威态 + 采集遥测）构造 dw_progress_t 发上层（不持 mtx_）；
         // remaining/eta 由 total_size/total_done/download_rate 现算。QUEUED/PAUSED 合成帧同走此路径，
         // 遥测字段已在状态迁移时归零。
-        void emit_progress(const TaskRecord &rec);
-
-        // 播放提优动作：run_schedule 收集，maintenance_loop 锁外执行引擎调用。
-        struct PlayingAction {
-            dw_protocol_t protocol;
-            std::string key; // 引擎键（BT=info_hash）
-            int32_t file_index;
-            int64_t byte_offset;
-        };
+        void emit_progress(const FileRecord &rec);
 
         // 准入队列中任务直到占满并发额度（在调度线程，准入操作均在释锁后执行）。
-        // 同时处理播放提优：收集 piece deadline 动作交调用方锁外执行。
-        void run_schedule(std::unique_lock<std::mutex> &lock,
-                          std::vector<PlayingAction> &playing_actions);
+        void run_schedule(std::unique_lock<std::mutex> &lock);
 
-        // 播放提优：暂停下载速率最低的 DOWNLOADING 任务释放名额（持 mtx_）。
-        // 返回被暂停任务的引擎键与协议，供调用方锁外调 pause_task；无活跃任务返回 false。
-        bool pause_slowest_downloading_locked(std::string &out_key, dw_protocol_t &out_proto);
-
-        // 从 TaskRecord 构建引擎参数（不持 mtx_）；resume 为续传存档，可为空。
-        static dw_task_params_t build_task_params(const TaskRecord &task_record,
-                                                  const std::vector<uint8_t> &resume);
-
-        // 在引擎恢复任务（不持 mtx_）；resume_task 携带 resume_data，双行为：
-        // handle 存在直接恢复，不存在则用 resume_data/参数重建。
-        bool call_resume_task(const TaskRecord &task_record, const std::vector<uint8_t> &resume);
+        // 在引擎恢复任务（不持 mtx_）；引擎内部经三要素自取 resume_data，双行为：
+        // handle/ctx 存在直接恢复，不存在则重建。
+        bool call_resume_task(const FileRecord &task_record);
 
         // 复位运行态遥测（速率/探测/原因/消息）：任务离开活跃态转 PAUSED/QUEUED 时调用，避免合成帧残留旧速率。
-        static void reset_live_telemetry(TaskRecord &rec);
+        static void reset_live_telemetry(FileRecord &rec);
 
         // ---- 内部工具 ----
         int32_t active_count_locked() const; // 占用下载额度的任务数
-        void flush_dirty_locked(); // 刷写全部脏任务进度 + A 线程暂存续传到库（假定已持 mtx_）
+        void flush_dirty_locked(); // 同步任务进度遥测到 file_records（节流写，假定已持 mtx_）
+
+        // 确保 file_cache_ 已从 DB 全量加载（假定已持 mtx_；已加载则幂等跳过）。
+        void ensure_file_cache_locked();
 
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
         IDownloadEngine *engine_of(dw_protocol_t proto) const;
@@ -268,51 +245,40 @@ namespace dw {
                                       int32_t file_index, std::string &out_path,
                                       int64_t &out_size);
 
-        // 定名落库（假定已持 mtx_）：抢占唯一 wrapper 名并创建 wrapper 目录占位 →
-        // 回写 name=wrapper（可能含 (n) 后缀）、save_path=原 dir（不变）、filename=inner_name
-        // （仅在 !multi_file 时记录）并 update。返回 wrapper 名（可能含 (n) 后缀），
-        // 调用方据此与原名比较判是否发生去重包层。
-        // wrapper_name 重复（同 wrapper 已定名）时为幂等重入：补齐占位物化并原样返回。
-        std::string resolve_and_record_name_locked(TaskRecord &rec,
-                                                   const std::string &dir,
-                                                   const std::string &wrapper_name,
-                                                   const std::string &inner_name,
-                                                   bool multi_file);
+        // 内存注册：union_id → FileRecord，无冗余索引。
+        void register_task(FileRecord task_record);
 
-        // 内存注册：union_id → TaskRecord，无冗余索引。
-        void register_task(TaskRecord task_record);
-
-        // 按 natural_key 查询任务：内存优先，未命中则从 DB 加载并注册入内存。
-        // 成功返回内存中任务的指针（可直接修改）；任务不存在返回 nullptr。持 mtx_ 调用。
-        TaskRecord *load_task_record_locked(const std::string &client_id, dw_protocol_t proto,
+        // 按 natural_key 查询任务：内存优先，未命中则从 file_records（状态持久化权威）
+        // 重建并注册入内存。成功返回内存中任务的指针（可直接修改）；
+        // 任务不存在返回 nullptr。持 mtx_ 调用。
+        FileRecord *load_task_record_locked(const std::string &client_id, dw_protocol_t proto,
                                             const std::string &natural_key);
 
         // 注销：清 tasks_，union_id 定位。
         void unregister_task(const std::string &union_id);
 
-
-        // 错误任务重新入队前的残留态清理：两协议均清 resume_data（进度缓存保留供重启恢复）；
-        // HTTP 额外复位进度令其从零重下并避免 UI 残留旧进度。非错误态直接跳过。
-        void reset_error_task_for_restart(TaskRecord &task_record);
-
         // HTTP 周期快照：单文件已下载连续区间全量重写落库（file_index=0）；
         // BT 进度由 FILE_PROGRESS 事件（piece 驱动）增量维护不经此路径。
         // 供任务未加载进引擎时的播放兜底。假定已持 mtx_，仅短暂访问引擎自有锁，无死锁。
         // 同时检查文件/任务级完成条件。
-        void snapshot_segments_locked(TaskRecord &task_record);
+        void snapshot_segments_locked(FileRecord &task_record);
 
         std::mutex mtx_;
         std::condition_variable cv_;
-        // 任务主表：union_id → TaskRecord。仅常驻活跃/排队任务，暂停/完成/错误
-        // 落库后由 unregister_task 清出。
-        std::unordered_map<std::string, TaskRecord> tasks_;
+        // 任务主表：union_id → FileRecord。仅常驻活跃/排队任务，暂停/完成/错误
+        // 状态投影至 file_records 后由 unregister_task 清出。
+        std::unordered_map<std::string, FileRecord> tasks_;
         // Boost.Asio 事件队列：引擎 alert 经此投递，B 线程 maintenance_loop 中 poll 消费。
         boost::asio::io_context event_ioc_;
 
-        // 分段内存缓存已移除：dw_get_file_ranges 直接经 DB 读取最新快照。
+        // 文件目录内存缓存：三要素平铺，key = union_id(client_id|protocol|natural_key)。
+        // 懒加载：首次 list_file_records() 从 DB 全量载入，后续直接返回缓存。
+        // 写穿：insert/update/delete 同步更新缓存；无法定位 key 的操作直接失效重载。
+        std::unordered_map<std::string, FileRecord> file_cache_;
+        bool file_cache_loaded_ = false;
 
         TaskStore store_; // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
-        std::jthread worker_; // A 线程：轻量采集 + 回调（析构兑底自动请求停止并 join）
+        std::jthread worker_; // A 线程：轻量采集 + 回调（析构兜底自动请求停止并 join）
         std::jthread maintenance_; // B 线程：持久化 + 区间快照 + 终态注销 + 准入 + sweep
         std::atomic<bool> running_{false}; // 生命周期标志：start 准入 / stop 幂等守卫 / run_schedule 准入闸门
         bool schedule_needed_ = false; // 调度线程需被唤醒

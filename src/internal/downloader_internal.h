@@ -53,10 +53,15 @@ namespace dw {
         EngineEventType type; // 事件类型（决定其余字段语义）
         std::string engine_key; // 引擎侧标识（BT=info_hash，HTTP=url）
         dw_protocol_t protocol = DW_PROTOCOL_TORRENT; // 来源协议
+        std::string client_id;
 
         // PARSED 事件字段
         std::string name; // 种子/文件名（HTTP 探测定名或 BT 元数据）
         std::string save_path; // 引擎当前 save_path
+        std::string original_name; // 重名/包装前的原始目录/文件名（未重名时与 content_root 相同）
+        std::string content_root; // 磁盘根目录名（重名判定后的最终名称）
+        bool is_dir = true; // 内容是否为目录（单文件无父路径 = false）
+        std::string ext; // 文件后缀（仅单文件时有值，不含 '.'）
         std::vector<dw_file_info_t> files; // 节点树（深拷贝，仅 PARSED 使用）
 
         // DOWNLOAD_FAILED 事件字段
@@ -147,6 +152,14 @@ namespace dw {
         }
     }
 
+    // ---- std::vector<int32_t> 序列化（调试日志用）----
+
+    inline std::string to_string(const std::vector<int32_t> &v) {
+        boost::json::array arr;
+        for (const int32_t x: v) arr.push_back(x);
+        return boost::json::serialize(arr);
+    }
+
     // ---- dw_file_info_t 序列化（调试日志用）----
 
     inline std::string to_string(const dw_file_info_t &f) {
@@ -169,11 +182,12 @@ namespace dw {
         obj["type"] = to_string(e.type);
         obj["key"] = e.engine_key;
         obj["protocol"] = to_string(e.protocol);
+        obj["client_id"] = e.client_id;
         obj["name"] = e.name;
         obj["save_path"] = e.save_path;
         // 文件列表：序列化每个文件信息
         boost::json::array files_arr;
-        for (const auto &f : e.files) {
+        for (const auto &f: e.files) {
             files_arr.push_back(boost::json::parse(to_string(f)));
         }
         obj["files"] = std::move(files_arr);
@@ -196,7 +210,7 @@ namespace dw {
         obj["file_size"] = e.file_size;
         // 区间集合序列化
         boost::json::array intervals_arr;
-        for (const auto &[start, end] : e.intervals) {
+        for (const auto &[start, end]: e.intervals) {
             boost::json::array interval;
             interval.push_back(start);
             interval.push_back(end);
@@ -215,7 +229,6 @@ namespace dw {
         obj["info_hash"] = p.info_hash ? p.info_hash : "";
         obj["magnet"] = p.magnet_link ? p.magnet_link : "";
         obj["torrent"] = p.torrent_file ? p.torrent_file : "";
-        obj["trackers"] = p.tracker_count;
         obj["file_indexes"] = p.file_index_size;
         obj["priority_file_indexes"] = p.priority_file_index_size;
         obj["url_seeds"] = p.url_seed_count;
@@ -268,7 +281,7 @@ namespace dw {
 
         std::unique_ptr<HttpEngine> http_engine;
         std::unique_ptr<TorrentEngine> torrent_engine;
-        std::unique_ptr<Router> router;  // L2 路由层
+        std::unique_ptr<Router> router; // L2 路由层
 
         std::atomic<dw_progress_cb> progress_cb{nullptr};
         std::atomic<dw_log_cb> log_cb{nullptr};
@@ -318,12 +331,13 @@ namespace dw {
      *（函数名 / 行号），替代早期宏方案的 __FUNCTION__ / __LINE__ 捕获。
      */
     struct log_site {
-        const char *trace_id;      // 追踪 ID；NULL 或空串按无关联任务处理
-        std::source_location loc;  // 调用点位置：构造时（即日志调用处）捕获
+        const char *trace_id; // 追踪 ID；NULL 或空串按无关联任务处理
+        std::source_location loc; // 调用点位置：构造时（即日志调用处）捕获
 
         log_site(const char *tid,
                  std::source_location l = std::source_location::current())
-            : trace_id(tid), loc(l) {}
+            : trace_id(tid), loc(l) {
+        }
     };
 
     /**
@@ -331,7 +345,7 @@ namespace dw {
      *
      * 纯文本调用（无可变参）内部经 "%s" 转发，文本不会被解释为格式串。
      */
-    template <typename... Args>
+    template<typename... Args>
     void log_at(dw_log_level_t level, log_site site, const char *fmt, Args... args) {
         if constexpr (sizeof...(Args) == 0) {
             emit_logf(level, site.trace_id, site.loc.function_name(),
@@ -355,19 +369,19 @@ namespace dw {
      * @param args 与格式串对应的可变参数，可省略（纯文本调用）。
      * @return 无。投递失败 / 未配置回调的兑底（输出 stderr）由 emit_logf 内部统一处理。
      */
-    template <typename... Args>
+    template<typename... Args>
     void log_i(log_site site, const char *fmt, Args... args) {
         log_at(DW_LOG_INFO, site, fmt, args...);
     }
 
     /// DEBUG 级别快捷日志：参数语义与错误处理同 log_i。
-    template <typename... Args>
+    template<typename... Args>
     void log_d(log_site site, const char *fmt, Args... args) {
         log_at(DW_LOG_DEBUG, site, fmt, args...);
     }
 
     /// ERROR 级别快捷日志：参数语义与错误处理同 log_i。
-    template <typename... Args>
+    template<typename... Args>
     void log_e(log_site site, const char *fmt, Args... args) {
         log_at(DW_LOG_ERROR, site, fmt, args...);
     }

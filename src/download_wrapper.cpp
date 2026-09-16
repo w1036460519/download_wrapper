@@ -10,6 +10,7 @@
 #include "core/task_manager.h"
 #include "http/http_engine.h"
 #include "torrent/torrent_engine.h"
+#include "utils/memory_util.h"
 #include "utils/string_util.h"
 #include "utils/time_util.h"
 
@@ -32,12 +33,6 @@ namespace dw {
             g_downloader = std::make_unique<dw_downloader>();
         }
 
-        /// C ABI 的 dw_task_key_t 提取 natural_key。key 为空或 natural_key 为 NULL 返回空串。
-        std::string natural_key_of(const dw_task_key_t *key) {
-            if (!key || !key->natural_key) return "";
-            return key->natural_key;
-        }
-
         /// 释放配置中所有深拷贝的字符串字段。
         void free_config_strings(dw_config_t &cfg) {
             std::free(const_cast<char *>(cfg.proxy));
@@ -47,6 +42,12 @@ namespace dw {
             std::free(const_cast<char *>(cfg.ca_bundle));
             std::free(const_cast<char *>(cfg.work_dir));
             std::free(const_cast<char *>(cfg.client_id));
+            if (cfg.trackers) {
+                for (int32_t i = 0; i < cfg.tracker_count; ++i) {
+                    std::free(const_cast<char *>(cfg.trackers[i]));
+                }
+                std::free(cfg.trackers);
+            }
             cfg = {};
         }
 
@@ -62,6 +63,19 @@ namespace dw {
             dst.ca_bundle = utils::dup_cstr(src.ca_bundle);
             dst.work_dir = utils::dup_cstr(src.work_dir);
             dst.client_id = utils::dup_cstr(src.client_id);
+            // trackers 数组深拷贝：dst = src 后指针指向 src 数组，置空后重建副本
+            dst.trackers = nullptr;
+            dst.tracker_count = 0;
+            if (src.trackers && src.tracker_count > 0) {
+                if (auto *arr = static_cast<const char **>(
+                        std::malloc(sizeof(const char *) * src.tracker_count))) {
+                    for (int32_t i = 0; i < src.tracker_count; ++i) {
+                        arr[i] = utils::dup_cstr(src.trackers[i] ? src.trackers[i] : "");
+                    }
+                    dst.trackers = arr;
+                    dst.tracker_count = src.tracker_count;
+                }
+            }
         }
     } // namespace
 
@@ -265,9 +279,10 @@ DW_API void dw_set_progress_callback(const dw_progress_cb cb) {
         log_e("", "进度回调注册失败: 下载器已销毁");
         return;
     }
+    if (dw::g_downloader->progress_cb.load() == cb) return;
     log_i("", "注册进度回调: enabled=%d", cb != nullptr);
     std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-    dw::g_downloader->progress_cb = cb;
+    dw::g_downloader->progress_cb.store(cb);
 }
 
 DW_API void dw_set_log_callback(const dw_log_cb cb) {
@@ -275,24 +290,26 @@ DW_API void dw_set_log_callback(const dw_log_cb cb) {
         log_e("", "日志回调注册失败: 下载器已销毁");
         return;
     }
+    if (dw::g_downloader->log_cb.load() == cb) return;
     log_i("", "注册日志回调: enabled=%d", cb != nullptr);
     std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-    dw::g_downloader->log_cb = cb;
+    dw::g_downloader->log_cb.store(cb);
 }
 
 /* ------------------------------------------------------------------ */
 /*  任务接口                                                          */
 /* ------------------------------------------------------------------ */
 
-DW_API int32_t dw_add_task(dw_protocol_t protocol,
+DW_API int32_t dw_add_task(const dw_protocol_t protocol,
+                           const char *client_id,
                            const dw_task_params_t *params,
                            dw_submit_result_t *out_result,
                            const int32_t force) {
     auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params || !out_result) {
+    if (!d || !d->initialized.load() || !client_id || !params || !out_result) {
         log_e("",
-              "失败: 参数非法 d=%p init=%d params=%p out=%p",
-              d, d ? d->initialized.load() : 0, params, out_result);
+              "添加任务失败: 参数非法 d=%p init=%d client_id=%p params=%p out=%p",
+              d, d && d->initialized.load(), client_id, params, out_result);
         if (out_result) {
             out_result->code = DW_REASON_ERROR;
             out_result->message = nullptr;
@@ -303,12 +320,15 @@ DW_API int32_t dw_add_task(dw_protocol_t protocol,
     if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
         out_result->code = DW_REASON_ERROR;
         out_result->message = nullptr;
-        log_e("", "失败: 未知协议 protocol=%d", protocol);
+        log_e("", "添加任务失败: 未知协议 protocol=%s", dw::to_string(protocol));
         return -1;
     }
 
+    const std::string task_key = dw_task_params_key(params, protocol) ? dw_task_params_key(params, protocol) : "";
+    log_i(task_key.c_str(), "添加任务开始: protocol=%s client_id=%s force=%d",
+          dw::to_string(protocol), client_id, force);
+
     // 路由到 TaskManager（目前仅支持本机）
-    const std::string client_id = params->client_id ? params->client_id : "";
     dw::TaskManager *tm = nullptr;
     if (d->router) {
         tm = d->router->route(client_id);
@@ -316,22 +336,56 @@ DW_API int32_t dw_add_task(dw_protocol_t protocol,
     if (!tm) {
         out_result->code = DW_REASON_ERROR;
         out_result->message = nullptr;
-        log_e("", "失败: 路由失败 client_id=%s", client_id.c_str());
+        log_e(task_key.c_str(), "添加任务失败: 路由失败 client_id=%s", client_id);
         return -1;
     }
 
-    // 入队 + 调度由 TaskManager 统一接管，引擎启动由调度线程按并发额度触发。
-    return tm->add(protocol, params, out_result, force != 0);
+    const int32_t rc = tm->add(protocol, client_id, params, out_result, force != 0);
+    if (rc != 0 || out_result->code != DW_REASON_NONE) {
+        log_e(task_key.c_str(), "添加任务失败: rc=%d code=%d", rc, out_result->code);
+        return rc;
+    }
+
+    // FileRecord 维护：force 时刷新时间戳置顶，否则幂等插入占位。
+    auto &store = tm->get_store();
+    const std::string save_path = params->save_path ? params->save_path : "";
+    {
+        std::lock_guard<std::mutex> lock(tm->get_mutex());
+        if (force && store.has_file_record(client_id, protocol, task_key)) {
+            store.touch_file_record(client_id, protocol, task_key);
+            tm->sync_file_record_cache(client_id, protocol, task_key);
+        } else if (!store.has_file_record(client_id, protocol, task_key)) {
+            dw::FileRecord fr;
+            fr.client_id = client_id;
+            // 任务类型按协议细化：HTTP=1，BT=2（本地文件条目=0）。
+            fr.type = (protocol == DW_PROTOCOL_HTTP) ? DW_SOURCE_TASK_FILE : DW_SOURCE_REMOTE_FILE;
+            fr.is_remote = false;
+            fr.save_path = save_path;
+            fr.original_root_name = task_key; // 占位，PARSED 时经 update_file_record_meta 修正
+            fr.root_name = task_key; // 占位，PARSED 时经 update_file_record_meta 修正
+            fr.file_type = true;     // 默认目录
+            fr.task_protocol = protocol;
+            fr.task_natural_key = task_key;
+            fr.status = DW_TASK_STATUS_RESOLVING; // 解析中：与 TaskManager.add 状态机对齐，PARSED 后转 QUEUED
+            fr.created_at = dw::utils::now_unix_ms();
+            fr.modified_at = fr.created_at;
+            store.insert_file_record(fr);
+            tm->sync_file_record_cache(client_id, protocol, task_key, &fr);
+        }
+    }
+
+    log_i(task_key.c_str(), "添加任务完成: rc=%d code=%d", rc, out_result->code);
+    return rc;
 }
 
-DW_API int32_t dw_pause_task(const char *client_id,
-                             const dw_task_key_t *key,
+DW_API int32_t dw_pause_task(const dw_protocol_t protocol,
+                             const char *client_id,
+                             const char *natural_key,
                              dw_submit_result_t *out_result) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id || !out_result) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p out=%p",
-              d, d ? d->initialized.load() : 0, client_id, out_result);
+        log_e("", "暂停任务失败: 参数非法 d=%p init=%d client_id=%p out=%p",
+              d, d && d->initialized.load(), client_id, out_result);
         if (out_result) {
             out_result->code = DW_REASON_ERROR;
             out_result->message = nullptr;
@@ -341,36 +395,33 @@ DW_API int32_t dw_pause_task(const char *client_id,
     out_result->code = DW_REASON_NONE;
     out_result->message = nullptr;
 
-    // 协议由 protocol 推导：HTTP/BT 走引擎，LOCAL 仅为内存态迁移。
-    if (key && key->protocol == DW_PROTOCOL_LOCAL) {
-        return 0;
-    }
+    const std::string nk = natural_key ? natural_key : "";
+    log_i(nk.c_str(), "暂停任务开始: protocol=%s client_id=%s", dw::to_string(protocol), client_id);
 
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
     if (!tm) {
         out_result->code = DW_REASON_ERROR;
+        log_e(nk.c_str(), "暂停任务失败: 路由失败");
         return -1;
     }
 
-    const dw_protocol_t proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    const std::string nk = dw::natural_key_of(key);
-    const int32_t rc = tm->pause(proto, nk, out_result);
-    if (rc != 0) {
+    if (const int32_t rc = tm->pause(protocol, nk, out_result); rc != 0) {
         out_result->code = DW_REASON_ERROR;
+        log_e(nk.c_str(), "暂停任务失败: rc=%d", rc);
         return rc;
     }
+    log_i(nk.c_str(), "暂停任务完成");
     return 0;
 }
 
-DW_API int32_t dw_resume_task(const char *client_id,
-                              const dw_task_key_t *key,
-                              const char **trackers, int32_t tracker_count,
+DW_API int32_t dw_resume_task(const dw_protocol_t protocol,
+                              const char *client_id,
+                              const char *natural_key,
                               dw_submit_result_t *out_result) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id || !out_result) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p out=%p",
-              d, d ? d->initialized.load() : 0, client_id, out_result);
+        log_e("", "恢复任务失败: 参数非法 d=%p init=%d client_id=%p out=%p",
+              d, d && d->initialized.load(), client_id, out_result);
         if (out_result) {
             out_result->code = DW_REASON_ERROR;
             out_result->message = nullptr;
@@ -380,31 +431,35 @@ DW_API int32_t dw_resume_task(const char *client_id,
     out_result->code = DW_REASON_NONE;
     out_result->message = nullptr;
 
+    const std::string nk = natural_key ? natural_key : "";
+    log_i(nk.c_str(), "恢复任务开始: protocol=%s client_id=%s", dw::to_string(protocol), client_id);
+
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
     if (!tm) {
         out_result->code = DW_REASON_ERROR;
+        log_e(nk.c_str(), "恢复任务失败: 路由失败");
         return -1;
     }
 
-    const dw_protocol_t proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    const std::string nk = dw::natural_key_of(key);
-    const int32_t rc = tm->resume(proto, nk, trackers, tracker_count, out_result);
+    const int32_t rc = tm->resume(protocol, nk, out_result);
     if (rc != 0) {
         out_result->code = DW_REASON_ERROR;
+        log_e(nk.c_str(), "恢复任务失败: rc=%d", rc);
         return rc;
     }
+    log_i(nk.c_str(), "恢复任务完成");
     return 0;
 }
 
-DW_API int32_t dw_delete_task(const char *client_id,
-                              const dw_task_key_t *key,
-                              int32_t delete_files,
+DW_API int32_t dw_delete_task(const dw_protocol_t protocol,
+                              const char *client_id,
+                              const char *natural_key,
+                              const int32_t delete_files,
                               dw_submit_result_t *out_result) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id || !out_result) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p out=%p",
-              d, d ? d->initialized.load() : 0, client_id, out_result);
+        log_e("", "删除任务失败: 参数非法 d=%p init=%d client_id=%p out=%p",
+              d, d && d->initialized.load(), client_id, out_result);
         if (out_result) {
             out_result->code = DW_REASON_ERROR;
             out_result->message = nullptr;
@@ -414,10 +469,12 @@ DW_API int32_t dw_delete_task(const char *client_id,
     out_result->code = DW_REASON_NONE;
     out_result->message = nullptr;
 
-    // LOCAL 任务已迁移到 file_records，不走引擎 + 任务中枢。
-    // 调用方应使用 dw_delete_local_entry(client_id, save_path, root_name)。
-    if (key && key->protocol == DW_PROTOCOL_LOCAL) {
-        log_e("", "LOCAL 任务请使用 dw_delete_local_entry");
+    const std::string nk = natural_key ? natural_key : "";
+    log_i(nk.c_str(), "删除任务开始: protocol=%s client_id=%s delete_files=%d", dw::to_string(protocol), client_id,
+          delete_files);
+
+    if (protocol == DW_PROTOCOL_LOCAL) {
+        log_e(nk.c_str(), "删除任务失败: LOCAL 任务请使用 dw_delete_local_entry");
         if (out_result) {
             out_result->code = DW_REASON_ERROR;
             out_result->message = nullptr;
@@ -428,16 +485,17 @@ DW_API int32_t dw_delete_task(const char *client_id,
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
     if (!tm) {
         out_result->code = DW_REASON_ERROR;
+        log_e(nk.c_str(), "删除任务失败: 路由失败");
         return -1;
     }
 
-    const dw_protocol_t proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    const std::string nk = dw::natural_key_of(key);
-    const int32_t rc = tm->remove(proto, nk, delete_files, out_result);
+    const int32_t rc = tm->remove(protocol, nk, delete_files, out_result);
     if (rc != 0) {
         out_result->code = DW_REASON_ERROR;
+        log_e(nk.c_str(), "删除任务失败: rc=%d", rc);
         return rc;
     }
+    log_i(nk.c_str(), "删除任务完成");
     return 0;
 }
 
@@ -448,77 +506,54 @@ DW_API int32_t dw_delete_task(const char *client_id,
 DW_API char *dw_magnet_to_info_hash(const char *magnet_link) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !magnet_link) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d magnet_link=%p",
-              d, d ? d->initialized.load() : 0, magnet_link);
+        log_e("", "失败: 参数非法 d=%p init=%d magnet_link=%p",
+              d, d && d->initialized.load(), magnet_link);
         return nullptr;
     }
     return dw::TorrentEngine::magnet_to_info_hash(magnet_link);
 }
 
 DW_API char *dw_torrent_file_to_info_hash(const char *torrent_file_path) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !torrent_file_path) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d path=%p",
-              d, d ? d->initialized.load() : 0, torrent_file_path);
+    if (auto *d = dw::global_downloader();
+        !d || !d->initialized.load() || !torrent_file_path) {
+        log_e("", "失败: 参数非法 d=%p init=%d path=%p",
+              d, d && d->initialized.load(), torrent_file_path);
         return nullptr;
     }
     return dw::TorrentEngine::torrent_file_to_info_hash(torrent_file_path);
 }
 
-DW_API char *dw_info_hash_to_magnet(const char *client_id, const dw_task_key_t *key) {
+DW_API char *dw_info_hash_to_magnet(const char *client_id, const char *natural_key) {
     auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !client_id || !key) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p key=%p",
-              d, d ? d->initialized.load() : 0, client_id, key);
+    if (!d || !d->initialized.load() || !client_id || !natural_key) {
+        log_e("", "失败: 参数非法 d=%p init=%d client_id=%p natural_key=%p",
+              d, d && d->initialized.load(), client_id, natural_key);
         return nullptr;
     }
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
     if (!tm) return nullptr;
 
     // 按任务键回读 info_hash（BT 的 natural_key 即 info_hash）。
-    dw::TaskRecord task_record;
-    const dw_protocol_t proto = key->protocol;
-    if (!tm->load_task_record(proto, dw::natural_key_of(key), task_record)) {
-        log_e("", "失败: 任务不存在 protocol=%d natural_key=%s",
-              key->protocol, key->natural_key ? key->natural_key : "");
+    dw::FileRecord task_record;
+    const dw_protocol_t proto = DW_PROTOCOL_TORRENT;
+    if (!tm->load_task_record(proto, natural_key, task_record)) {
+        log_e("", "失败: 任务不存在 protocol=%s natural_key=%s",
+              dw::to_string(proto), natural_key);
         return nullptr;
     }
-    return dw::TorrentEngine::info_hash_to_magnet(task_record.natural_key.c_str());
-}
-
-DW_API int32_t dw_parse_torrent_file(const char *torrent_file_path,
-                                     char **out_name,
-                                     char **out_info_hash,
-                                     dw_file_info_t **out_files,
-                                     int32_t *out_count) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !torrent_file_path ||
-        !out_name || !out_info_hash || !out_files || !out_count) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d path=%p",
-              d, d ? d->initialized.load() : 0, torrent_file_path);
-        return -1;
-    }
-    return dw::TorrentEngine::parse_torrent_file(torrent_file_path,
-                                                 out_name,
-                                                 out_info_hash,
-                                                 out_files,
-                                                 out_count);
+    return dw::TorrentEngine::info_hash_to_magnet(task_record.task_natural_key.c_str());
 }
 
 DW_API int32_t dw_get_file_list(const char *client_id,
-                                const dw_task_key_t *key,
+                                const char *natural_key,
                                 dw_file_info_t **out_files,
                                 int32_t *out_count) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id ||
-        !key || !out_files || !out_count) {
+        !natural_key || !out_files || !out_count) {
         log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p key=%p",
-              d, d ? d->initialized.load() : 0, client_id, key);
+              "失败: 参数非法 d=%p init=%d client_id=%p natural_key=%p",
+              d, d && d->initialized.load(), client_id, natural_key);
         return -1;
     }
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
@@ -529,20 +564,19 @@ DW_API int32_t dw_get_file_list(const char *client_id,
 
     // 文件清单实时查询：BT 经 handle 在线查询（选中文件），HTTP 从任务记录推导；
     // downloaded_bytes 由进度缓存聚合回填。
-    const dw_protocol_t proto = key->protocol;
-    const auto files = tm->load_files(proto, dw::natural_key_of(key));
-    if (files.empty()) {
+    // 协议类型从任务记录推导（natural_key 唯一对应一个任务）。
+    dw::FileRecord task_record;
+    if (!tm->load_task_record(DW_PROTOCOL_HTTP, natural_key, task_record) &&
+        !tm->load_task_record(DW_PROTOCOL_TORRENT, natural_key, task_record)) {
         return -1;
     }
-    const int32_t n = static_cast<int32_t>(files.size());
-    auto *arr = static_cast<dw_file_info_t *>(
-        std::calloc(static_cast<size_t>(n), sizeof(dw_file_info_t)));
-    if (!arr) return -1;
-    for (int32_t i = 0; i < n; ++i) {
-        arr[i] = files[static_cast<size_t>(i)];
+    const dw_protocol_t proto = task_record.task_protocol;
+    auto [files, count] = tm->load_files(proto, natural_key);
+    if (!files || count <= 0) {
+        return -1;
     }
-    *out_files = arr;
-    *out_count = n;
+    *out_files = files;
+    *out_count = count;
     return 0;
 }
 
@@ -551,16 +585,16 @@ DW_API int32_t dw_get_file_list(const char *client_id,
 /* ------------------------------------------------------------------ */
 
 DW_API int32_t dw_get_file_ranges(const char *client_id,
-                                  const dw_task_key_t *key,
+                                  const char *natural_key,
                                   int32_t file_index,
                                   dw_byte_range_t **out_ranges,
                                   int32_t *out_count) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id ||
-        !key || !out_ranges || !out_count) {
+        !natural_key || !out_ranges || !out_count) {
         log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p key=%p",
-              d, d ? d->initialized.load() : 0, client_id, key);
+              "失败: 参数非法 d=%p init=%d client_id=%p natural_key=%p",
+              d, d ? d->initialized.load() : 0, client_id, natural_key);
         return -1;
     }
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
@@ -569,8 +603,15 @@ DW_API int32_t dw_get_file_ranges(const char *client_id,
     *out_ranges = nullptr;
     *out_count = 0;
 
-    const dw_protocol_t proto = key->protocol;
-    const std::string nk = dw::natural_key_of(key);
+    const std::string nk = natural_key;
+
+    // 协议类型从任务记录推导（natural_key 唯一对应一个任务）。
+    dw::FileRecord task_record;
+    if (!tm->load_task_record(DW_PROTOCOL_HTTP, nk, task_record) &&
+        !tm->load_task_record(DW_PROTOCOL_TORRENT, nk, task_record)) {
+        return 2;
+    }
+    const dw_protocol_t proto = task_record.task_protocol;
 
     // ---- 1. 优先读内存缓存（B 线程周期从引擎拉取更新） ----
     std::vector<dw_byte_range_t> vec = tm->get_cached_segments(proto, nk, file_index);
@@ -626,16 +667,16 @@ DW_API void dw_byte_range_free(dw_byte_range_t *ranges, int32_t count) {
 }
 
 DW_API int32_t dw_get_task_file_info(const char *client_id,
-                                     const dw_task_key_t *key,
+                                     const char *natural_key,
                                      int32_t file_index,
                                      char **out_path,
                                      int64_t *out_size) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id ||
-        !key || !out_path || !out_size) {
+        !natural_key || !out_path || !out_size) {
         log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p key=%p",
-              d, d ? d->initialized.load() : 0, client_id, key);
+              "失败: 参数非法 d=%p init=%d client_id=%p natural_key=%p",
+              d, d ? d->initialized.load() : 0, client_id, natural_key);
         return -1;
     }
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
@@ -646,13 +687,19 @@ DW_API int32_t dw_get_task_file_info(const char *client_id,
 
     // 物理路径与大小统一经 TaskManager 解析：
     // HTTP 从任务记录推导（wrapper 模型），BT 经引擎 handle 实时查询。
-    const dw_protocol_t proto = key->protocol;
-    const std::string nk = dw::natural_key_of(key);
+    // 协议类型从任务记录推导（natural_key 唯一对应一个任务）。
+    dw::FileRecord task_record;
+    if (!tm->load_task_record(DW_PROTOCOL_HTTP, natural_key, task_record) &&
+        !tm->load_task_record(DW_PROTOCOL_TORRENT, natural_key, task_record)) {
+        return -1;
+    }
+    const dw_protocol_t proto = task_record.task_protocol;
+    const std::string nk = natural_key;
     std::string file_path;
     int64_t file_size = -1;
     if (!tm->resolve_file_path(proto, nk, file_index, file_path, file_size)) {
         log_e("", "失败: 无法解析文件路径 protocol=%d natural_key=%s fi=%d",
-              key->protocol, key->natural_key ? key->natural_key : "", file_index);
+              proto, natural_key, file_index);
         return -1;
     }
 
@@ -667,46 +714,13 @@ DW_API int32_t dw_get_task_file_info(const char *client_id,
     return 0;
 }
 
-DW_API int32_t dw_set_playing_file(const char *client_id,
-                                   const dw_task_key_t *key,
-                                   int32_t file_index,
-                                   int64_t byte_offset,
-                                   dw_submit_result_t *out_result) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !client_id || !out_result) {
-        log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p out=%p",
-              d, d ? d->initialized.load() : 0, client_id, out_result);
-        if (out_result) {
-            out_result->code = DW_REASON_ERROR;
-            out_result->message = nullptr;
-        }
-        return -1;
-    }
-    auto *tm = d->router ? d->router->route(client_id) : nullptr;
-    if (!tm) {
-        out_result->code = DW_REASON_ERROR;
-        return -1;
-    }
-    out_result->message = nullptr;
-
-    // 仅写播放标识，由调度器统一处理任务准入与 piece deadline 设置。
-    const dw_protocol_t play_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    if (!tm->set_playing(play_proto, dw::natural_key_of(key), file_index, byte_offset)) {
-        out_result->code = DW_REASON_ERROR;
-        return -1;
-    }
-    out_result->code = DW_REASON_NONE;
-    return 0;
-}
-
 DW_API int32_t dw_set_play_position(const char *client_id,
-                                    const dw_task_key_t *key,
+                                    const char *natural_key,
                                     int32_t file_index,
                                     int64_t position_ms,
                                     dw_submit_result_t *out_result) {
     auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !client_id || !out_result) {
+    if (!d || !d->initialized.load() || !client_id || !natural_key || !out_result) {
         log_e("",
               "失败: 参数非法 d=%p init=%d client_id=%p out=%p",
               d, d ? d->initialized.load() : 0, client_id, out_result);
@@ -722,19 +736,26 @@ DW_API int32_t dw_set_play_position(const char *client_id,
         return -1;
     }
     // 播放进度直落 task_store，与协议无关。
-    const dw_protocol_t pp_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    tm->set_play_position(pp_proto, dw::natural_key_of(key), file_index, position_ms);
+    // 协议类型从任务记录推导（natural_key 唯一对应一个任务）。
+    dw::FileRecord task_record;
+    if (!tm->load_task_record(DW_PROTOCOL_HTTP, natural_key, task_record) &&
+        !tm->load_task_record(DW_PROTOCOL_TORRENT, natural_key, task_record)) {
+        out_result->code = DW_REASON_ERROR;
+        return -1;
+    }
+    const dw_protocol_t pp_proto = task_record.task_protocol;
+    tm->set_play_position(pp_proto, natural_key, file_index, position_ms);
     out_result->code = DW_REASON_NONE;
     out_result->message = nullptr;
     return 0;
 }
 
 DW_API int32_t dw_get_play_position(const char *client_id,
-                                    const dw_task_key_t *key,
+                                    const char *natural_key,
                                     int32_t file_index,
                                     int64_t *out_position_ms) {
     auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !client_id || !out_position_ms) {
+    if (!d || !d->initialized.load() || !client_id || !natural_key || !out_position_ms) {
         log_e("",
               "失败: 参数非法 d=%p init=%d client_id=%p out=%p",
               d, d ? d->initialized.load() : 0, client_id, out_position_ms);
@@ -746,8 +767,15 @@ DW_API int32_t dw_get_play_position(const char *client_id,
         if (out_position_ms) *out_position_ms = 0;
         return -1;
     }
-    const dw_protocol_t gp_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    *out_position_ms = tm->get_play_position(gp_proto, dw::natural_key_of(key), file_index);
+    // 协议类型从任务记录推导（natural_key 唯一对应一个任务）。
+    dw::FileRecord task_record;
+    if (!tm->load_task_record(DW_PROTOCOL_HTTP, natural_key, task_record) &&
+        !tm->load_task_record(DW_PROTOCOL_TORRENT, natural_key, task_record)) {
+        if (out_position_ms) *out_position_ms = 0;
+        return -1;
+    }
+    const dw_protocol_t gp_proto = task_record.task_protocol;
+    *out_position_ms = tm->get_play_position(gp_proto, natural_key, file_index);
     return 0;
 }
 
@@ -778,21 +806,27 @@ DW_API int32_t dw_list_tasks(const char *client_id,
 }
 
 DW_API int32_t dw_set_task_priority(const char *client_id,
-                                    const dw_task_key_t *key,
+                                    const char *natural_key,
                                     const int32_t *priority_file_indexes,
                                     const int32_t priority_file_index_size) {
     auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !client_id || !key) {
+    if (!d || !d->initialized.load() || !client_id || !natural_key) {
         log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p key=%p",
-              d, d ? d->initialized.load() : 0, client_id, key);
+              "失败: 参数非法 d=%p init=%d client_id=%p natural_key=%p",
+              d, d ? d->initialized.load() : 0, client_id, natural_key);
         return -1;
     }
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
     if (!tm) return -1;
 
-    const dw_protocol_t sp_proto = key ? key->protocol : DW_PROTOCOL_HTTP;
-    return tm->set_priority(sp_proto, dw::natural_key_of(key),
+    // 协议类型从任务记录推导（natural_key 唯一对应一个任务）。
+    dw::FileRecord task_record;
+    if (!tm->load_task_record(DW_PROTOCOL_HTTP, natural_key, task_record) &&
+        !tm->load_task_record(DW_PROTOCOL_TORRENT, natural_key, task_record)) {
+        return -1;
+    }
+    const dw_protocol_t sp_proto = task_record.task_protocol;
+    return tm->set_priority(sp_proto, natural_key,
                             priority_file_indexes, priority_file_index_size);
 }
 
@@ -801,15 +835,15 @@ DW_API int32_t dw_set_task_priority(const char *client_id,
 /* ------------------------------------------------------------------ */
 
 DW_API int32_t dw_load_task_files(const char *client_id,
-                                  const dw_task_key_t *key,
+                                  const char *natural_key,
                                   dw_file_info_t **out_files,
                                   int32_t *out_count) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id ||
-        !key || !out_files || !out_count) {
+        !natural_key || !out_files || !out_count) {
         log_e("",
-              "失败: 参数非法 d=%p init=%d client_id=%p key=%p out_files=%p out_count=%p",
-              d, d ? d->initialized.load() : 0, client_id, key, out_files, out_count);
+              "失败: 参数非法 d=%p init=%d client_id=%p natural_key=%p out_files=%p out_count=%p",
+              d, d ? d->initialized.load() : 0, client_id, natural_key, out_files, out_count);
         if (out_files) *out_files = nullptr;
         if (out_count) *out_count = 0;
         return -1;
@@ -821,34 +855,23 @@ DW_API int32_t dw_load_task_files(const char *client_id,
         return -1;
     }
     // 实时查询文件清单（task_files 表已移除）：BT 经引擎 handle，HTTP 由任务记录推导。
-    const dw_protocol_t lf_proto = key->protocol;
-    auto file_vec = tm->load_files(lf_proto, dw::natural_key_of(key));
-    if (file_vec.empty()) {
+    // 协议类型从任务记录推导（natural_key 唯一对应一个任务）。
+    dw::FileRecord task_record;
+    if (!tm->load_task_record(DW_PROTOCOL_HTTP, natural_key, task_record) &&
+        !tm->load_task_record(DW_PROTOCOL_TORRENT, natural_key, task_record)) {
+        if (out_files) *out_files = nullptr;
+        if (out_count) *out_count = 0;
+        return -1;
+    }
+    const dw_protocol_t lf_proto = task_record.task_protocol;
+    auto [files, count] = tm->load_files(lf_proto, natural_key);
+    if (!files || count <= 0) {
         *out_files = nullptr;
         *out_count = 0;
         return -1;
     }
-    // 转为堆数组：直接移交 file_vec 各节点的字符串所有权（库内已堆分配），
-    // 避免二次拷贝与释放遗漏；调用方经 dw_file_list_free 统一释放。
-    const int32_t n = static_cast<int32_t>(file_vec.size());
-    dw_file_info_t *arr = static_cast<dw_file_info_t *>(
-        std::malloc(sizeof(dw_file_info_t) * n));
-    if (!arr) {
-        // 分配失败：释放已持有的堆字符串，避免泄露。
-        for (auto &f: file_vec) {
-            std::free(f.name);
-            std::free(f.ext);
-            std::free(f.physical_path);
-        }
-        *out_files = nullptr;
-        *out_count = 0;
-        return -1;
-    }
-    for (int32_t i = 0; i < n; ++i) {
-        arr[i] = file_vec[i]; // 结构拷贝（含指针），所有权转移至 arr
-    }
-    *out_files = arr;
-    *out_count = n;
+    *out_files = files;
+    *out_count = count;
     return 0;
 }
 
@@ -899,27 +922,39 @@ DW_API int32_t dw_validate_local_tasks(const char *client_id,
 DW_API int32_t dw_clear_local_tasks(const char *client_id, const char *save_path) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id || !save_path) {
-        log_e("", "失败: 参数非法");
+        log_e("", "清理本地任务失败: 参数非法");
         return -1;
     }
+    log_i("", "清理本地任务开始: client_id=%s save_path=%s", client_id, save_path);
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
-    if (!tm) return -1;
-    return tm->clear_local_tasks(save_path);
+    if (!tm) {
+        log_e("", "清理本地任务失败: 路由失败");
+        return -1;
+    }
+    const int32_t rc = tm->clear_local_tasks(save_path);
+    log_i("", "清理本地任务完成: rc=%d", rc);
+    return rc;
 }
 
 DW_API int32_t dw_delete_local_entry(const char *client_id, const char *save_path, const char *root_name) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !client_id) {
-        log_e("", "失败: 未初始化");
+        log_e("", "删除本地条目失败: 未初始化");
         return -1;
     }
     if (!save_path || !root_name) {
-        log_e("", "失败: 参数非法");
+        log_e("", "删除本地条目失败: 参数非法");
         return -1;
     }
+    log_i("", "删除本地条目开始: client_id=%s root_name=%s", client_id, root_name);
     auto *tm = d->router ? d->router->route(client_id) : nullptr;
-    if (!tm) return -1;
-    return tm->delete_local_entry(save_path, root_name);
+    if (!tm) {
+        log_e("", "删除本地条目失败: 路由失败");
+        return -1;
+    }
+    const int32_t rc = tm->delete_local_entry(save_path, root_name);
+    log_i("", "删除本地条目完成: rc=%d", rc);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -927,29 +962,13 @@ DW_API int32_t dw_delete_local_entry(const char *client_id, const char *save_pat
 /* ------------------------------------------------------------------ */
 
 DW_API void dw_submit_result_release(dw_submit_result_t *result) {
-    if (!result) {
-        return;
-    }
-    if (result->message) {
-        std::free(result->message);
-        result->message = nullptr;
-    }
+    // 释放逻辑统一收敛至内存工具（message/files/info_hash）。
+    dw::utils::free_submit_result_fields(*result);
 }
 
 DW_API void dw_file_list_free(dw_file_info_t *files, int32_t count) {
-    if (!files || count <= 0) {
-        return;
-    }
-    // 释放各节点由库分配的全部字符串字段。
-    for (int32_t i = 0; i < count; ++i) {
-        std::free(files[i].name);
-        std::free(files[i].ext);
-        std::free(files[i].physical_path);
-        files[i].name = nullptr;
-        files[i].ext = nullptr;
-        files[i].physical_path = nullptr;
-    }
-    std::free(files);
+    // 释放逻辑统一收敛至内存工具（各节点字符串 + 数组本体）。
+    dw::utils::free_file_list(files, count);
 }
 
 DW_API void dw_task_list_free(dw_task_snapshot_t *tasks, int32_t count) {
@@ -957,8 +976,8 @@ DW_API void dw_task_list_free(dw_task_snapshot_t *tasks, int32_t count) {
         return;
     }
     for (int32_t i = 0; i < count; ++i) {
-        if (tasks[i].key.natural_key) {
-            std::free(const_cast<char *>(tasks[i].key.natural_key));
+        if (tasks[i].natural_key) {
+            std::free(const_cast<char *>(tasks[i].natural_key));
         }
         std::free(tasks[i].url);
         std::free(tasks[i].info_hash);
@@ -1009,15 +1028,19 @@ DW_API int32_t dw_list_file_records(const char *client_id,
         arr[i].type = r.type;
         arr[i].is_remote = r.is_remote;
         arr[i].save_path = dw::utils::dup_cstr(r.save_path);
+        arr[i].original_root_name = dw::utils::dup_cstr(r.original_root_name);
         arr[i].root_name = dw::utils::dup_cstr(r.root_name);
         arr[i].full_path = dw::utils::dup_cstr(r.full_path);
         arr[i].file_type = r.file_type;
+        arr[i].ext = dw::utils::dup_cstr(r.ext);
+        arr[i].parsed = r.parsed;
         arr[i].task_protocol = r.task_protocol;
         arr[i].task_natural_key = dw::utils::dup_cstr(r.task_natural_key);
         // 字符串复制失败（内存不足）：回滚已分配的字段与数组，
         // 不向调用方返回含 NULL 字段的半成品快照。
         if (!arr[i].client_id || !arr[i].save_path ||
-            !arr[i].root_name || !arr[i].full_path || !arr[i].task_natural_key) {
+            !arr[i].original_root_name || !arr[i].root_name || !arr[i].full_path ||
+            !arr[i].ext || !arr[i].task_natural_key || !arr[i].message) {
             log_e("", "失败: 文件记录字符串复制内存不足 i=%d n=%d", i, n);
             dw_file_record_list_free(arr, i + 1);
             *out_records = nullptr;
@@ -1027,6 +1050,9 @@ DW_API int32_t dw_list_file_records(const char *client_id,
         arr[i].status = r.status;
         arr[i].total_size = r.total_size;
         arr[i].total_done = r.total_done;
+        arr[i].priority = r.priority;
+        arr[i].reason = r.reason;
+        arr[i].message = dw::utils::dup_cstr(r.message);
         arr[i].created_at = r.created_at;
         arr[i].modified_at = r.modified_at;
     }
@@ -1040,11 +1066,28 @@ DW_API void dw_file_record_list_free(dw_file_record_t *records, int32_t count) {
     for (int32_t i = 0; i < count; ++i) {
         std::free(records[i].client_id);
         std::free(records[i].save_path);
+        std::free(records[i].original_root_name);
         std::free(records[i].root_name);
         std::free(records[i].full_path);
+        std::free(records[i].ext);
         std::free(records[i].task_natural_key);
+        std::free(records[i].message);
     }
     std::free(records);
+}
+
+DW_API int32_t dw_get_or_register_file_record(const char *client_id,
+                                               dw_protocol_t protocol,
+                                               const char *natural_key,
+                                               const char *save_path,
+                                               bool *out_parsed) {
+    if (!client_id || !natural_key || !out_parsed) return -1;
+    if (!dw::g_downloader) return -1;
+    auto *tm = dw::g_downloader->router ? dw::g_downloader->router->task_manager() : nullptr;
+    if (!tm) return -1;
+    const std::string sp = save_path ? save_path : "";
+    *out_parsed = tm->get_or_register_file_record(client_id, protocol, natural_key, sp);
+    return 0;
 }
 
 DW_API void dw_free(void *ptr) {
