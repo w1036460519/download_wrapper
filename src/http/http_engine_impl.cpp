@@ -464,6 +464,17 @@ namespace dw {
              *                     Part 3: 构造 + 分类 + 聚合
              * ===================================================================== */
 
+            int active_downloading_tasks() {
+                // try_lock：拿不到任务表锁时退化为 1，宁可限速偏保守也不引入锁序风险。
+                std::unique_lock<std::mutex> lk(g_map_mtx, std::try_to_lock);
+                if (!lk.owns_lock()) return 1;
+                int count = 0;
+                for (const auto &[_, tCtx]: g_tasks) {
+                    if (tCtx && tCtx->status == DW_TASK_STATUS_DOWNLOADING) ++count;
+                }
+                return count > 0 ? count : 1;
+            }
+
             CURL *build_easy_for_part(dl_task_ctx *tCtx, dl_part_ctx *pCtx) {
                 CurlEasyGuard easy_guard(curl_easy_init());
                 if (!easy_guard) return nullptr;
@@ -499,6 +510,16 @@ namespace dw {
                 curl_easy_setopt(curl, CURLOPT_USERAGENT,
                                  (g_cfg.user_agent && *g_cfg.user_agent) ? g_cfg.user_agent : "download_wrapper/2.0");
                 curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+                // 全局下载限速：libcurl 仅提供单连接级限速（无跨 multi 的总量控制），
+                // 故按「活跃任务数 × 本任务分片数」均摊到每个 easy handle。
+                // 任务数变化后已建立的 handle 沿用旧配额，下一次分片重建时校正。
+                if (g_cfg.download_rate_limit > 0) {
+                    const int64_t parts = std::max<int64_t>(1, static_cast<int64_t>(tCtx->parts.size()));
+                    const int64_t divisor = static_cast<int64_t>(active_downloading_tasks()) * parts;
+                    const int64_t per_conn = std::max<int64_t>(1, g_cfg.download_rate_limit / divisor);
+                    curl_easy_setopt(curl, CURLOPT_MAX_RECV_SPEED_LARGE, static_cast<curl_off_t>(per_conn));
+                }
 
                 int64_t restart = part.start + part.done;
                 int64_t rend = part.end;

@@ -60,14 +60,15 @@ typedef enum {
 } dw_protocol_t;
 
 /**
- * 任务唯一键：(protocol, natural_key) 二元组。
+ * 任务唯一键约定：(protocol, natural_key) 二元组，无对应结构体，所有接口平铺传参。
  *
- *   - 输入时（函数入参）：natural_key 由调用方持有，调用期间须保持有效。
- *   - 输出时（dw_progress_t / dw_task_snapshot_t 内嵌字段）：natural_key 由库
- *     分配并随宿主结构体一同释放（dw_free / dw_task_list_free）。
+ * natural_key 的取值按协议区分：HTTP=url，TORRENT=info_hash，LOCAL=content_root。
+ *   - 入参：由调用方持有，调用期间须保持有效。
+ *   - 出参（dw_progress_t / dw_task_snapshot_t 内字段）：由库分配，随宿主结构体
+ *     一同释放（dw_free / dw_task_list_free），不得单独 free。
  *
- * clientId 不在此结构中：clientId 由 App 启动时经 dw_config_t 注入 session，所有任务的 clientId
- * 均取自 session 配置；本机任务不需要每调用携带，多客户端 / 远端任务处理暂未实现。
+ * client_id 不属于唯一键语义：由 App 启动时经 dw_config_t 注入 session，作为
+ * 独立入参随接口传递；多客户端 / 远端任务处理暂未实现。
  */
 
 /**
@@ -158,21 +159,20 @@ typedef void (*dw_log_cb)(dw_log_level_t level,
 /* ================================================================== */
 
 /* ------------------------------------------------------------------ */
-/*  dw_file_info_t — BT 文件信息                                     */
+/*  dw_file_info_t — 文件信息（HTTP / BT 通用）                      */
 /* ------------------------------------------------------------------ */
 
 /**
  * 单个文件信息（扁平文件列表）。
  *
- * name 为相对路径（含目录），ext 为后缀（不含点）。
- * name / ext 由库分配，统一经 dw_file_list_free 释放。
- * HTTP 任务不使用。
+ * name 为相对路径（含目录），full_path 为落盘的完整物理路径，ext 为后缀（不含点）。
+ * name / full_path / ext 由库分配，统一经 dw_file_list_free 释放，调用方不得单独 free。
+ * BT 与 HTTP 均填充 full_path，调用方无需自行拼接路径。
  */
 typedef struct dw_file_info {
-    int32_t index; /**< libtorrent 文件索引（用于设置优先级）。 */
+    int32_t index; /**< 任务内文件索引（BT 为 libtorrent 文件索引，HTTP 恒 0）。 */
     char *name; /**< 相对路径（含目录）。 */
     char *full_path; /**< 完整物理路径（save_path + name）。 */
-    char *physical_path; /**< 完整物理路径（含 save_path + content_root 前缀）。 */
     int64_t size; /**< 文件字节数。 */
     char *ext; /**< 后缀（不含点，如 mkv）；可为 NULL。 */
     int32_t status; /**< 文件状态：0=下载中，1=磁盘已删除，2=完成正常。 */
@@ -288,14 +288,15 @@ typedef struct dw_task_params {
     /* ===== 队列（通用，追加保持 ABI 兼容） ===== */
 
     int32_t priority; /**< 队列优先级：越大越优先，默认 0；同级按提交顺序 FIFO。 */
-    dw_source_t source; /**< 来源枚举，默认 DW_SOURCE_LOCAL_TASK。 */
+    /* 注：来源（dw_source_t）不在本结构体中，由库内按 protocol 推导：
+     *     HTTP → DW_SOURCE_TASK_FILE，TORRENT → DW_SOURCE_REMOTE_FILE。 */
 } dw_task_params_t;
 
 #ifdef __cplusplus
 /**
  * 按协议提取任务参数中的识别键：HTTP 返回 url，BT 返回 info_hash，其余返回 NULL。
  */
-static const char *dw_task_params_key(const dw_task_params_t *p, const dw_protocol_t proto) {
+inline const char *dw_task_params_key(const dw_task_params_t *p, const dw_protocol_t proto) {
     if (!p) return nullptr;
     switch (proto) {
         case DW_PROTOCOL_HTTP: return p->url;
@@ -480,7 +481,14 @@ DW_API void dw_destroy(void);
 /**
  * 动态更新配置。
  *
- * 仅更新可热更新的字段（如限速、代理等），不影响已运行任务的核心参数。
+ * 完整配置会被库内深拷保存，但仅下列字段会即时生效：
+ *   - download_rate_limit / upload_rate_limit：下发至 BT session；HTTP 侧均摊到各分片连接
+ *     （新建连接即时生效，已建立连接下一次重建时校正）；
+ *   - seed_ratio_limit：做种分享率上限；
+ *   - max_concurrent_downloads：调度并发上限（调高即时准入排队任务，调低不中断已运行任务）；
+ *   - HTTP 超时 / 重试次数 / 默认分片数 / SSL 校验开关（对后续新建连接生效）。
+ *
+ * 代理、user_agent、ca_bundle、listen_port、work_dir、client_id、trackers 仅在 dw_init 时生效。
  *
  * @param cfg  新配置指针，不可为 NULL。
  * @return     0=成功，-1=失败。
@@ -821,11 +829,12 @@ DW_API int32_t dw_load_task_files(const char *client_id,
 /* ================================================================== */
 
 /**
- * 增量扫描本地文件任务。
+ * 增量扫描本地文件条目。
  *
- * 扫描 save_path 目录，将非下载任务占用且尚未登记的条目注册为本地文件任务
- * （source=1，status=COMPLETED）。已有任务不做任何处理（增量添加，不删除旧记录）。
- * 仅返回本次新增的任务快照，返回的数组经 dw_task_list_free 释放。
+ * 扫描 save_path 目录，将非下载任务占用且尚未登记的条目注册为本地文件条目
+ * （source=DW_SOURCE_LOCAL_FILE，protocol=DW_PROTOCOL_LOCAL，status=COMPLETED）。
+ * 已登记条目不做任何处理（增量添加，不删旧记录）。
+ * 仅返回本次新增的快照，返回的数组经 dw_task_list_free 释放。
  *
  * @param client_id    客户端标识（必填）。
  * @param save_path    下载目录路径。
@@ -839,14 +848,14 @@ DW_API int32_t dw_scan_local_tasks(const char *client_id,
                                    int32_t *out_count);
 
 /**
- * 校验本地文件任务的存在性。
+ * 校验本地文件条目的存在性。
  *
- * 遍历 save_path 下所有 source=1 且未失效的任务，检查物理文件是否仍存在。
- * 不存在的任务状态迁移为 INVALIDATED。
+ * 遍历 save_path 下所有 source=DW_SOURCE_LOCAL_FILE 的条目，检查物理文件是否仍存在。
+ * 不存在的条目状态迁移为 INVALIDATED。
  *
  * @param client_id              客户端标识（必填）。
  * @param save_path              下载目录路径。
- * @param out_invalidated_count  输出：本次新标记为失效的任务数量（可为 NULL）。
+ * @param out_invalidated_count  输出：本次新标记为失效的条目数量（可为 NULL）。
  * @return                       0=成功，-1=失败。
  */
 DW_API int32_t dw_validate_local_tasks(const char *client_id,
@@ -854,9 +863,9 @@ DW_API int32_t dw_validate_local_tasks(const char *client_id,
                                        int32_t *out_invalidated_count);
 
 /**
- * 全量清理指定 save_path 下的非下载任务（source IN (1,2)）。
+ * 全量清理指定 save_path 下的本地文件条目（source=DW_SOURCE_LOCAL_FILE）。
  *
- * 删除物理文件 + DB 记录，不涉及 engine 层。
+ * 删除物理文件 + DB 记录，不涉及 engine 层；HTTP / BT 下载任务不受影响。
  *
  * @param client_id  客户端标识（必填）。
  * @param save_path  下载目录路径。
@@ -865,15 +874,15 @@ DW_API int32_t dw_validate_local_tasks(const char *client_id,
 DW_API int32_t dw_clear_local_tasks(const char *client_id, const char *save_path);
 
 /**
- * 删除本地文件条目（type=1）。
+ * 删除单个本地文件条目（source=DW_SOURCE_LOCAL_FILE）。
  *
  * 仅 DB + 磁盘清理，不涉及 engine 层。
- * 下载任务（source=0）拒绝，应走 dw_delete_task。
+ * 目标条目为 HTTP / BT 下载任务时拒绝并返回 -1，应走 dw_delete_task。
  *
  * @param client_id   客户端标识（必填）。
  * @param save_path   保存目录路径。
  * @param root_name   根条目名（file_records.root_name）。
- * @return            0=成功，-1=失败（参数非法或不存在）。
+ * @return            0=成功，-1=失败（参数非法、不存在或类型不匹配）。
  */
 DW_API int32_t dw_delete_local_entry(const char *client_id, const char *save_path, const char *root_name);
 
@@ -920,6 +929,213 @@ DW_API void dw_file_record_list_free(dw_file_record_t *records, int32_t count);
  * @param ptr  待释放的内存指针，NULL 时无操作。
  */
 DW_API void dw_free(void *ptr);
+
+/* ================================================================== */
+/*                       P2P 连接（多端共享）                          */
+/* ================================================================== */
+
+/**
+ * P2P 连接句柄（不透明）。
+ *
+ * 经 dw_p2p_create 创建，dw_p2p_destroy 释放。每个句柄对应一条独立的
+ * DataChannel 连接；多连接并发互不干扰。
+ */
+typedef struct dw_p2p_handle_s *dw_p2p_handle;
+
+/**
+ * P2P 连接状态。
+ *
+ * 状态跃迁由状态回调异步通知，调用方不应主动轮询。
+ */
+typedef enum {
+    DW_P2P_STATE_NEW         = 0, /**< 已创建，未开始信令 */
+    DW_P2P_STATE_WAIT_ANSWER = 1, /**< 已生成 offer 码，等待对端回复 */
+    DW_P2P_STATE_CONNECTING  = 2, /**< 已接收对端信令，ICE 协商中 */
+    DW_P2P_STATE_CONNECTED   = 3, /**< DataChannel 已建立，可收发数据 */
+    DW_P2P_STATE_FAILED      = 4, /**< 连接失败（信令错 / ICE 不通 / 对端关闭） */
+    DW_P2P_STATE_CLOSED      = 5  /**< 已主动关闭或资源已释放 */
+} dw_p2p_state_t;
+
+/**
+ * P2P 角色。
+ *
+ * 发起方生成 offer 码；应答方生成 answer 码。角色在 dw_p2p_generate_offer
+ * / dw_p2p_accept_offer 调用时由库内自动确定，调用方无需手动设置。
+ */
+typedef enum {
+    DW_P2P_ROLE_INITIATOR = 0, /**< 发起方（生成 offer） */
+    DW_P2P_ROLE_RESPONDER = 1  /**< 应答方（生成 answer） */
+} dw_p2p_role_t;
+
+/**
+ * P2P 错误码。
+ */
+typedef enum {
+    DW_P2P_OK              =  0, /**< 成功 */
+    DW_P2P_ERR_NULL        = -1, /**< 参数为空 */
+    DW_P2P_ERR_STATE       = -2, /**< 当前状态不允许该操作 */
+    DW_P2P_ERR_DECODE      = -3, /**< 信令码解码失败（格式错 / 校验失败） */
+    DW_P2P_ERR_TRANSPORT   = -4, /**< 底层传输错误（含 libwebrtc 异常） */
+    DW_P2P_ERR_NOT_READY   = -5, /**< 连接尚未建立 */
+    DW_P2P_ERR_BUFFER      = -6  /**< 输出缓冲区不足 */
+} dw_p2p_error_t;
+
+/**
+ * P2P 连接信息（dw_p2p_get_info 输出）。
+ *
+ * 字符串字段由库内分配，调用方使用 dw_p2p_info_release 释放。
+ */
+typedef struct {
+    dw_p2p_state_t state;        /**< 当前连接状态 */
+    dw_p2p_role_t  role;         /**< 本端角色 */
+    int64_t        bytes_sent;   /**< 累计发送字节 */
+    int64_t        bytes_recv;   /**< 累计接收字节 */
+    const char    *remote_peer;  /**< 对端标识（连接建立后有效，未连接为 NULL） */
+    const char    *local_addr;   /**< 本端候选地址（可选，调试用） */
+    const char    *remote_addr;  /**< 对端候选地址（可选，调试用） */
+} dw_p2p_info_t;
+
+/**
+ * 状态变更回调。
+ *
+ * @param user_data  调用方透传指针。
+ * @param state      新状态。
+ * @param error      失败时的错误码；成功跃迁为 DW_P2P_OK。
+ */
+typedef void (*dw_p2p_state_cb)(void *user_data, dw_p2p_state_t state, int32_t error);
+
+/**
+ * 数据接收回调。
+ *
+ * @param user_data  调用方透传指针。
+ * @param data       数据指针，仅在回调周期内有效。
+ * @param len        数据字节数。
+ */
+typedef void (*dw_p2p_data_cb)(void *user_data, const uint8_t *data, size_t len);
+
+/**
+ * 创建 P2P 连接实例。
+ *
+ * @param out_handle  输出句柄指针，不可为 NULL。
+ * @return            0=成功，-1=失败。
+ */
+DW_API int32_t dw_p2p_create(dw_p2p_handle *out_handle);
+
+/**
+ * 销毁 P2P 连接并释放资源。
+ *
+ * 已建立的连接会先发送 Close 消息再释放；句柄置为无效。
+ *
+ * @param handle  连接句柄，NULL 时无操作。
+ */
+DW_API void dw_p2p_destroy(dw_p2p_handle handle);
+
+/**
+ * 注册状态变更回调。
+ *
+ * @param handle      连接句柄。
+ * @param cb          回调函数指针，NULL 表示取消注册。
+ * @param user_data   回调透传指针，可 NULL。
+ */
+DW_API void dw_p2p_set_state_callback(dw_p2p_handle handle,
+                                      dw_p2p_state_cb cb,
+                                      void *user_data);
+
+/**
+ * 注册数据接收回调。
+ *
+ * @param handle      连接句柄。
+ * @param cb          回调函数指针，NULL 表示取消注册。
+ * @param user_data   回调透传指针，可 NULL。
+ */
+DW_API void dw_p2p_set_data_callback(dw_p2p_handle handle,
+                                     dw_p2p_data_cb cb,
+                                     void *user_data);
+
+/**
+ * 生成 offer 码（发起方第一步）。
+ *
+ * 库内启动本地 ICE 采集，完成后将 SDP + 候选编码为文本码写入 out_code。
+ * 调用方将该码经任何带外通道（扫码 / 复制粘贴）交给对端。
+ *
+ * @param handle     连接句柄。
+ * @param out_code   输出缓冲区。
+ * @param code_size  缓冲区字节容量。推荐 >= 4096。
+ * @return           0=成功；DW_P2P_ERR_BUFFER=缓冲区不足（所需大小写入 out_required）；
+ *                   其他负值=失败。
+ */
+DW_API int32_t dw_p2p_generate_offer(dw_p2p_handle handle,
+                                     char *out_code, size_t code_size,
+                                     size_t *out_required);
+
+/**
+ * 接收 offer 码并生成 answer 码（应答方）。
+ *
+ * 解析对端 offer、启动本地 ICE、生成 answer 码写入 out_code。
+ *
+ * @param handle      连接句柄。
+ * @param offer_code  对端 offer 码（NUL 结尾）。
+ * @param out_code    输出缓冲区。
+ * @param code_size   缓冲区字节容量。
+ * @param out_required 缓冲区不足时所需大小，可 NULL。
+ * @return            0=成功；DW_P2P_ERR_DECODE=信令码无效；其他同 dw_p2p_generate_offer。
+ */
+DW_API int32_t dw_p2p_accept_offer(dw_p2p_handle handle,
+                                   const char *offer_code,
+                                   char *out_code, size_t code_size,
+                                   size_t *out_required);
+
+/**
+ * 接收 answer 码并完成连接（发起方）。
+ *
+ * 解析对端 answer 后 ICE 协商开始；状态回调会通知 CONNECTED 或 FAILED。
+ *
+ * @param handle       连接句柄。
+ * @param answer_code  对端 answer 码（NUL 结尾）。
+ * @return             0=已接受（异步等待 CONNECTED）；DW_P2P_ERR_DECODE=信令码无效。
+ */
+DW_API int32_t dw_p2p_accept_answer(dw_p2p_handle handle,
+                                    const char *answer_code);
+
+/**
+ * 发送二进制数据。
+ *
+ * 仅在 CONNECTED 状态可用。库内不保留 data 指针，调用方可立即释放。
+ *
+ * @param handle  连接句柄。
+ * @param data    数据指针。
+ * @param len     数据字节数。
+ * @return        0=已入队；DW_P2P_ERR_NOT_READY=连接未建立；
+ *                DW_P2P_ERR_TRANSPORT=底层发送失败。
+ */
+DW_API int32_t dw_p2p_send(dw_p2p_handle handle,
+                           const void *data, size_t len);
+
+/**
+ * 查询连接信息。
+ *
+ * @param handle  连接句柄。
+ * @param out     输出结构体指针。
+ * @return        0=成功；-1=参数无效。
+ */
+DW_API int32_t dw_p2p_get_info(dw_p2p_handle handle, dw_p2p_info_t *out);
+
+/**
+ * 释放 dw_p2p_info_t 中库分配的字符串字段。
+ *
+ * @param info  信息结构体指针，NULL 时无操作。
+ */
+DW_API void dw_p2p_info_release(dw_p2p_info_t *info);
+
+/**
+ * 主动关闭连接。
+ *
+ * 句柄仍有效，可重新走信令流程建立新连接；彻底释放请调 dw_p2p_destroy。
+ *
+ * @param handle  连接句柄。
+ * @return        0=成功；-1=参数无效。
+ */
+DW_API int32_t dw_p2p_close(dw_p2p_handle handle);
 
 #ifdef __cplusplus
 } /* extern "C" */

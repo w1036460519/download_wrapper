@@ -9,6 +9,9 @@ env:
   # 注意：msys2 上游镜像会定期清理旧包，过老的 tag 会导致 pkgconfig 等 msys 依赖下载失败，
   # 需保持相对较新的 release tag
   VCPKG_REF: '2026.06.24'
+  # libwebrtc 自构建产物版本（build-libwebrtc.yml 发布的 release tag）；
+  # P2P 打洞库，通过 GitHub Release 预编译二进制提供，不走 vcpkg
+  LIBWEBRTC_RELEASE_TAG: 'libwebrtc-v1'
   # 说明：vcpkg 的 x-gha 后端已于 2025 年 4 月随 GitHub Actions Cache API 变更被移除，
   # 故不再配置 VCPKG_BINARY_SOURCES。vcpkg 默认启用 files provider，将二进制归档写入
   # 各平台默认缓存目录，该目录由下方 actions/cache 步骤跨次构建持久化。
@@ -115,6 +118,60 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y autoconf automake libtool pkg-config
 
+      # ── 下载 libwebrtc 预编译产物（P2P 模块依赖） ──
+      # 从自建 build-libwebrtc.yml 的 Release 下载（含 include/ + lib/ + src/），
+      # 解压到 third_party/libwebrtc/ 供 CMakeLists.txt 的 DW_LIBWEBRTC_DIR 消费。
+      # 若该平台尚无可用产物，优雅跳过 P2P 模块（下载主流程不受影响）。
+      - name: Download libwebrtc
+        shell: bash
+        run: |
+          set -eu
+          REPO="${{ github.repository }}"
+          TAG="$LIBWEBRTC_RELEASE_TAG"
+          DEST="$PWD/third_party/libwebrtc"
+          mkdir -p "$DEST"
+
+          # 矩阵名 → 产物 zip 名映射
+          case "${{ matrix.name }}" in
+            macos-*)              ASSET="libwebrtc-macos-release.zip" ;;
+            linux-x64)            ASSET="libwebrtc-linux-x64-release.zip" ;;
+            linux-arm64)          ASSET="libwebrtc-linux-arm64-release.zip" ;;
+            windows-x64)          ASSET="libwebrtc-windows-x64-release.zip" ;;
+            windows-arm64)        ASSET="libwebrtc-windows-arm64-release.zip" ;;
+            android-arm64)        ASSET="libwebrtc-android-arm64-release.zip" ;;
+            android-x64)          ASSET="libwebrtc-android-x64-release.zip" ;;
+            ios-arm64)            ASSET="libwebrtc-ios-arm64-release.zip" ;;
+            ios-simulator-*)      ASSET="libwebrtc-ios-simulator-release.zip" ;;
+            *)                    ASSET="" ;;
+          esac
+
+          if [ -z "$ASSET" ]; then
+            echo "跳过: 未知平台 ${{ matrix.name }}，P2P 模块未启用"
+            exit 0
+          fi
+
+          URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+          echo "下载 libwebrtc: $URL"
+          if curl -fSL --max-time 300 "$URL" -o libwebrtc.zip 2>/dev/null; then
+            # zip 内含 libwebrtc-pkg/ 顶层目录，提取后移动子内容
+            unzip -q libwebrtc.zip -d lw_tmp
+            if [ -d "lw_tmp/libwebrtc-pkg" ]; then
+              cp -r lw_tmp/libwebrtc-pkg/* "$DEST/"
+            else
+              cp -r lw_tmp/* "$DEST/"
+            fi
+            rm -rf lw_tmp libwebrtc.zip
+            echo "== libwebrtc 目录结构 =="
+            find "$DEST" -maxdepth 2 -type f | head -20
+            echo "include/ 文件数: $(find "$DEST/include" -type f 2>/dev/null | wc -l)"
+            echo "lib/ 文件数: $(find "$DEST/lib" -type f 2>/dev/null | wc -l)"
+            echo "src/ 文件数: $(find "$DEST/src" -type f 2>/dev/null | wc -l)"
+          else
+            echo "警告: libwebrtc 产物下载失败（${ASSET}），P2P 模块将跳过"
+            echo "       下载主流程不受影响"
+            rm -rf "$DEST"
+          fi
+
       # ---------- macOS：universal 单文件 ----------
       - name: Build (macOS universal)
         if: matrix.name == 'macos-universal'
@@ -125,13 +182,16 @@ jobs:
           # 与主库、App 一致，避免最终 dylib 的 minos 被抬到构建机 SDK 版本。
           export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
 
+          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
+
           # arm64
           cmake -B build-arm64 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DVCPKG_TARGET_TRIPLET=arm64-osx \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
           cmake --build build-arm64 --config Release
 
           # x86_64
@@ -140,7 +200,8 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DVCPKG_TARGET_TRIPLET=x64-osx \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
           cmake --build build-x64 --config Release
 
           # 合并为 universal binary
@@ -176,10 +237,12 @@ jobs:
           if [[ "${{ matrix.name }}" == "windows-arm64" ]]; then
             ARCH_FLAG="-A ARM64"
           fi
+          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
             -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR" \
             $ARCH_FLAG
           cmake --build build --config Release
 
@@ -204,6 +267,7 @@ jobs:
         run: |
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
           export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
+          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
@@ -211,7 +275,8 @@ jobs:
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DDW_BUILD_SHARED=OFF \
             -DVCPKG_TARGET_TRIPLET=arm64-ios \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
           cmake --build build --config Release
 
           mkdir -p dist
@@ -232,6 +297,8 @@ jobs:
           TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
           export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
 
+          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
+
           # arm64 模拟器（Apple Silicon Mac）
           cmake -B build-sim-arm64 \
             -DCMAKE_BUILD_TYPE=Release \
@@ -240,7 +307,8 @@ jobs:
             -DCMAKE_OSX_SYSROOT=iphonesimulator \
             -DDW_BUILD_SHARED=OFF \
             -DVCPKG_TARGET_TRIPLET=arm64-ios-simulator \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
           cmake --build build-sim-arm64 --config Release
 
           # x86_64 模拟器（Intel Mac）
@@ -251,7 +319,8 @@ jobs:
             -DCMAKE_OSX_SYSROOT=iphonesimulator \
             -DDW_BUILD_SHARED=OFF \
             -DVCPKG_TARGET_TRIPLET=x64-ios-simulator \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
           cmake --build build-sim-x64 --config Release
 
           mkdir -p dist
@@ -298,13 +367,15 @@ jobs:
             ANDROID_TRIPLET="x64-android"
           fi
 
+          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DVCPKG_TARGET_TRIPLET="$ANDROID_TRIPLET" \
             -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
             -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
             -DANDROID_ABI="$ABI" \
-            -DANDROID_PLATFORM=android-28
+            -DANDROID_PLATFORM=android-28 \
+            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
           cmake --build build --config Release
 
           mkdir -p dist

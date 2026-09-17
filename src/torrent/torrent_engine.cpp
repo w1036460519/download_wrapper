@@ -302,7 +302,6 @@ namespace dw {
                             std::free(p[k].name);
                             std::free(p[k].full_path);
                             std::free(p[k].ext);
-                            std::free(p[k].physical_path);
                         }
                         std::free(p);
                     }
@@ -924,6 +923,28 @@ namespace dw {
         initialized_ = true;
         log_i("bt", "初始化引擎完成 interval: %dms", g_interval_ms);
         return 0;
+    }
+
+    void TorrentEngine::update_config(const dw_config_t *cfg) {
+        if (!initialized_ || !cfg || !g_session) return;
+        try {
+            lt::settings_pack pack;
+            // libtorrent 以 0 表示不限速，故无需区分“未设置”与“取消限速”，直接下发。
+            pack.set_int(lt::settings_pack::download_rate_limit,
+                         cfg->download_rate_limit > 0 ? cfg->download_rate_limit : 0);
+            pack.set_int(lt::settings_pack::upload_rate_limit,
+                         cfg->upload_rate_limit > 0 ? cfg->upload_rate_limit : 0);
+            g_session->apply_settings(std::move(pack));
+        } catch (const std::exception &e) {
+            log_e("bt", "配置热更新失败: %s", e.what());
+            return;
+        }
+        // 做种分享率上限：0 保持库内默认，非 0（含负数=永久做种）以配置为准。
+        if (cfg->seed_ratio_limit != 0.0) {
+            g_seed_ratio_limit = cfg->seed_ratio_limit;
+        }
+        log_i("bt", "[EVENT] BT 配置热更新: down=%d B/s up=%d B/s ratio=%.2f",
+              cfg->download_rate_limit, cfg->upload_rate_limit, g_seed_ratio_limit);
     }
 
     void TorrentEngine::destroy() {

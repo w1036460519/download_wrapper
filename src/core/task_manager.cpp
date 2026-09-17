@@ -254,7 +254,12 @@ namespace dw {
                                                         params->file_indexes + params->file_index_size);
                     }
                     task_record.priority = params->priority;
-                    task_record.type = params->source;
+                    // 来源由协议完全决定，不由调用方传入：避免上层遗漏赋值时
+                    // 以 DW_SOURCE_LOCAL_FILE 错误入库，导致下载任务被当作本地文件条目。
+                    task_record.type = (proto == DW_PROTOCOL_TORRENT)
+                                           ? DW_SOURCE_REMOTE_FILE
+                                           : DW_SOURCE_TASK_FILE;
+                    task_record.is_remote = true; // 下载任务均为远程来源
                     task_record.created_at = now_unix_ms();
                     // 占位后续事件回调修正
                     task_record.root_name = key;
@@ -754,7 +759,9 @@ namespace dw {
             const FileRecord &fr = *all[i];
             dw_task_snapshot_t s{};
             s.protocol = fr.task_protocol;
-            s.natural_key = utils::dup_cstr(union_id_of(fr.client_id, fr.task_protocol, fr.task_natural_key));
+            // 契约要求纯 natural_key（HTTP=url / BT=info_hash / LOCAL=content_root）：
+            // client_id 由调用方自身持有，不得混入，否则 App 回传的 key 无法命中记录。
+            s.natural_key = utils::dup_cstr(fr.task_natural_key);
             // FFI 输出保持 url/info_hash 分离：按协议从 natural_key 填充
             s.url = utils::dup_cstr(fr.task_protocol == DW_PROTOCOL_HTTP ? fr.task_natural_key : std::string());
             s.info_hash = utils::dup_cstr(
@@ -1122,6 +1129,19 @@ namespace dw {
     }
 
 
+    void TaskManager::set_max_concurrent(int32_t value) {
+        const int32_t next = value > 0 ? value : 3;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (max_concurrent_ == next) return; // 未变，幂等跳过
+            max_concurrent_ = next;
+            schedule_needed_ = true; // 调高时由调度线程准入 QUEUED 任务
+        }
+        cv_.notify_all();
+        log_i("", "[EVENT] 并发上限调整: max_concurrent=%d", next);
+    }
+
+
     // ---- 任务文件实时查询 ----
 
     utils::file_array TaskManager::load_files(dw_protocol_t proto, const std::string &natural_key) {
@@ -1152,8 +1172,8 @@ namespace dw {
                 if (arr) {
                     arr[0].index = 0;
                     arr[0].name = utils::dup_cstr(rec_ptr->original_root_name);
-                    arr[0].physical_path = utils::dup_cstr((std::filesystem::path(rec_ptr->save_path) /
-                                                            rec_ptr->root_name / rec_ptr->original_root_name).string());
+                    arr[0].full_path = utils::dup_cstr((std::filesystem::path(rec_ptr->save_path) /
+                                                       rec_ptr->root_name / rec_ptr->original_root_name).string());
                     const std::string ext = utils::file_extension(rec_ptr->original_root_name);
                     arr[0].ext = ext.empty() ? nullptr : utils::dup_cstr(ext);
                     arr[0].size = rec_ptr->total_size;
@@ -1215,6 +1235,9 @@ namespace dw {
             fr.type = DW_SOURCE_LOCAL_FILE; // 本地扫描发现
             fr.save_path = save_path;
             fr.root_name = entry_name;
+            // 本地文件条目的复合主键：(client_id, LOCAL, root_name)。
+            // task_natural_key 必须赋值，否则所有条目共用同一 union_id 而相互覆盖。
+            fr.task_natural_key = entry_name;
             fr.full_path = (std::filesystem::path(save_path) / entry_name).string();
             fr.status = DW_TASK_STATUS_COMPLETED;
             fr.created_at = now_unix_ms();
@@ -1259,6 +1282,9 @@ namespace dw {
             dw_task_snapshot_t s{};
             s.protocol = DW_PROTOCOL_LOCAL;
             s.natural_key = utils::dup_cstr(f.root_name);
+            // 本地文件条目既无 url 也无 info_hash，与 list() 保持空串而非空指针。
+            s.url = utils::dup_cstr(std::string());
+            s.info_hash = utils::dup_cstr(std::string());
             s.name = utils::dup_cstr(f.root_name);
             s.save_path = utils::dup_cstr(f.save_path);
             s.status = static_cast<dw_task_status_t>(f.status);
@@ -1267,7 +1293,7 @@ namespace dw {
             s.total_done = f.total_done;
             s.created_at = f.created_at;
             s.modified_at = f.modified_at;
-            s.source = DW_SOURCE_TASK_FILE;
+            s.source = f.type; // 与入库值一致（DW_SOURCE_LOCAL_FILE）
             s.content_root = utils::dup_cstr(f.root_name);
             arr[i] = s;
         }
@@ -1317,23 +1343,21 @@ namespace dw {
 
         std::lock_guard<std::mutex> lock(mtx_);
 
-        // 加载该 save_path 下的文件记录，筛选 type IN (1,2)
+        // 加载该 save_path 下的文件记录，仅清理本地文件条目（type=DW_SOURCE_LOCAL_FILE）
         const auto files = store_.load_file_records_by_save_path(client_id_, save_path);
         std::error_code ec;
         for (const auto &f: files) {
-            if (f.type == DW_SOURCE_LOCAL_FILE) {
-                // 仅清理本地文件条目
-                // 删除物理文件/目录：save_path / root_name
-                std::filesystem::path full_path = std::filesystem::path(f.save_path) / f.root_name;
-                std::filesystem::remove_all(full_path, ec);
-            }
+            if (f.type != DW_SOURCE_LOCAL_FILE) continue;
+            // 删除物理文件/目录：save_path / root_name
+            const std::filesystem::path full_path = std::filesystem::path(f.save_path) / f.root_name;
+            std::filesystem::remove_all(full_path, ec);
         }
-        // 批量删除 file_records 中 type IN (1,2) 的条目
-        store_.clear_local_tasks(save_path);
-        // 同步 file_cache：移除该 save_path 下 type IN (1,2) 的缓存条目
+        // 批量删除 file_records 中的本地文件条目
+        store_.clear_local_tasks(client_id_, save_path);
+        // 同步 file_cache：移除该 save_path 下的本地文件条目缓存（与 DB 删除条件一致）
         if (file_cache_loaded_) {
             for (auto it = file_cache_.begin(); it != file_cache_.end();) {
-                if (it->second.save_path == save_path && (it->second.type == 1 || it->second.type == 2)) {
+                if (it->second.save_path == save_path && it->second.type == DW_SOURCE_LOCAL_FILE) {
                     it = file_cache_.erase(it);
                 } else {
                     ++it;
@@ -1348,20 +1372,30 @@ namespace dw {
 
         if (save_path.empty() || root_name.empty()) return -1;
 
+        // 类型门禁：仅允许删除本地文件条目。HTTP / BT 任务必须走 dw_delete_task，
+        // 否则会越过 engine 层删文件，留下引擎内仍在运行的孤儿任务。
+        ensure_file_cache_locked();
+        const FileRecord *target = nullptr;
+        for (const auto &[_, cr]: file_cache_) {
+            if (cr.save_path == save_path && cr.root_name == root_name) {
+                target = &cr;
+                break;
+            }
+        }
+        if (!target || target->type != DW_SOURCE_LOCAL_FILE) return -1;
+
         // 删除物理文件/目录：save_path / root_name
-        std::filesystem::path full_path = std::filesystem::path(save_path) / root_name;
+        const std::filesystem::path full_path = std::filesystem::path(save_path) / root_name;
         std::error_code ec;
         std::filesystem::remove_all(full_path, ec);
 
         // 删除 file_records 记录
         store_.delete_file_record_by_name(client_id_, save_path, root_name);
         // 同步 file_cache：按 save_path + root_name 定位并移除
-        if (file_cache_loaded_) {
-            for (auto it = file_cache_.begin(); it != file_cache_.end(); ++it) {
-                if (it->second.save_path == save_path && it->second.root_name == root_name) {
-                    file_cache_.erase(it);
-                    break;
-                }
+        for (auto it = file_cache_.begin(); it != file_cache_.end(); ++it) {
+            if (it->second.save_path == save_path && it->second.root_name == root_name) {
+                file_cache_.erase(it);
+                break;
             }
         }
         return ec ? -1 : 0;

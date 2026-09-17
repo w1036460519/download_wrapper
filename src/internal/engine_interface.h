@@ -82,6 +82,11 @@ public:
 
     // ---- 可选钩子（默认空实现，Torrent 覆写） ----
 
+    /// 配置热更新（dw_set_config 调用）：仅应用运行期可生效的字段（限速、做种分享率等）。
+    /// 字符串类字段（代理、UA、CA 证书）由工作线程直接引用，运行期替换会产生悬垂指针，
+    /// 故仅在 init 时生效，不在此处更新。默认空实现。
+    virtual void update_config(const dw_config_t* /*cfg*/) {}
+
     /// 节拍入口（A 线程调用）：BT 覆写（触发 post_torrent_updates 刷新 + 续传检查点），
     /// HTTP 引擎由 worker 自推进度，无需实现。
     virtual void post_updates() {}

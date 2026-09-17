@@ -1,0 +1,253 @@
+name: Build libwebrtc (裁剪版)
+
+# 从源码编译 webrtc-sdk/libwebrtc（DataChannel 裁剪版），
+# 产物上传为 GitHub Release 供 download_wrapper CI 消费。
+#
+# 触发：手动触发 或 标签 push（libwebrtc-v*）
+on:
+  workflow_dispatch:
+    inputs:
+      webrtc_branch:
+        description: 'webrtc-sdk/webrtc 分支'
+        required: true
+        default: 'm144_release'
+      platforms:
+        description: '构建平台（macos/linux/windows/all）'
+        required: true
+        default: 'macos'
+  push:
+    tags:
+      - 'libwebrtc-v*'
+
+env:
+  # webrtc-sdk/libwebrtc 版本标签
+  LIBWEBRTC_TAG: 'libwebrtc.m144.7559.09'
+  # depot_tools 固定版本（避免上游变动导致构建失败）
+  DEPOT_TOOLS_REF: 'main'
+
+jobs:
+  build:
+    name: libwebrtc-${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-latest
+            target_os: mac
+            gn_extra: 'target_cpu="x64" target_cpu="arm64"'
+          # 后续扩展：取消注释即可启用
+          # - name: linux-x64
+          #   os: ubuntu-22.04
+          #   target_os: linux
+          # - name: windows-x64
+          #   os: windows-2022
+          #   target_os: win
+
+    runs-on: ${{ matrix.os }}
+    # 按输入过滤平台
+    if: >
+      github.event_name == 'push' ||
+      inputs.platforms == 'all' ||
+      contains(inputs.platforms, matrix.name)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ── 磁盘空间检查 ──
+      - name: Check disk space
+        shell: bash
+        run: |
+          echo "== 构建前磁盘空间 =="
+          df -h / || true
+
+      # ── 安装 depot_tools ──
+      - name: Setup depot_tools
+        shell: bash
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/depot_tools:$PATH"
+          # 禁止 depot_tools 自动更新（CI 中会导致意外行为）
+          echo "CHROMIUM_BUILDTOOLS_PATH=" >> "$GITHUB_ENV"
+
+      # ── 创建 .gclient 配置 ──
+      # 安全：workflow_dispatch inputs 通过环境变量传递，不直接插入 shell 命令
+      - name: Configure gclient
+        env:
+          WEBRTC_BRANCH: ${{ inputs.webrtc_branch || 'm144_release' }}
+        shell: bash
+        run: |
+          # 验证分支名格式（仅允许字母数字、下划线、点、斜杠、短横线）
+          if [[ ! "$WEBRTC_BRANCH" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+            echo "错误: webrtc_branch 格式非法: $WEBRTC_BRANCH"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/webrtc_src"
+          cd "$RUNNER_TEMP/webrtc_src"
+          TARGET_OS="${{ matrix.target_os }}"
+          cat > .gclient <<EOF
+          solutions = [
+            {
+              "name"        : "src",
+              "url"         : "https://github.com/webrtc-sdk/webrtc.git@${WEBRTC_BRANCH}",
+              "deps_file"   : "DEPS",
+              "managed"     : False,
+              "custom_deps" : {},
+              "custom_vars" : {},
+            },
+          ]
+          target_os = ['${TARGET_OS}']
+          EOF
+          echo "WEBRTC_SRC=$RUNNER_TEMP/webrtc_src/src" >> "$GITHUB_ENV"
+
+      # ── 同步 WebRTC 源码（最耗时步骤，~20-30GB 下载）──
+      - name: gclient sync
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/webrtc_src"
+          gclient sync --no-history --shallow --jobs 8 -D
+          echo "== sync 后磁盘 =="
+          df -h / || true
+
+      # ── 克隆 webrtc-sdk/libwebrtc 到源码树 ──
+      - name: Integrate libwebrtc wrapper
+        shell: bash
+        run: |
+          cd "$WEBRTC_SRC"
+          git clone --depth 1 --branch "$LIBWEBRTC_TAG" \
+            https://github.com/webrtc-sdk/libwebrtc.git libwebrtc
+
+          # 应用音频补丁（如果存在）
+          if [ -f "libwebrtc/patches/custom_audio_source_m144.patch" ]; then
+            git apply libwebrtc/patches/custom_audio_source_m144.patch || true
+          fi
+
+          # 修改 BUILD.gn：将 libwebrtc 加入 default 构建组
+          # 这样 ninja 会同时编译 WebRTC 核心 + C++ 封装
+          if ! grep -q 'libwebrtc' BUILD.gn; then
+            sed -i.bak 's|deps = \[ ":webrtc" \]|deps = [ ":webrtc", "//libwebrtc" ]|' BUILD.gn
+          fi
+          echo "== BUILD.gn 修改后 =="
+          grep -A3 'group("default")' BUILD.gn || true
+
+      # ── GN 配置（DataChannel 裁剪）──
+      - name: GN gen (DataChannel-only)
+        shell: bash
+        run: |
+          cd "$WEBRTC_SRC"
+
+          # 裁剪参数：只保留 DataChannel 所需能力
+          # 禁用所有音视频编解码、测试、示例、工具
+          GN_ARGS="
+            is_debug=false
+            is_component_build=false
+            rtc_include_tests=false
+            rtc_build_examples=false
+            rtc_build_tools=false
+            rtc_enable_protobuf=false
+            rtc_use_h264=false
+            rtc_use_vp8=false
+            rtc_use_vp9=false
+            rtc_use_av1=false
+            rtc_include_ilbc=false
+            rtc_include_builtin_audio_codecs=false
+            rtc_include_builtin_video_codecs=false
+            rtc_enable_sctp=true
+            treat_warnings_as_errors=false
+            rtc_libvpx_build_vp8=false
+          "
+
+          case "${{ matrix.target_os }}" in
+            mac)
+              # macOS: 构建 universal binary (arm64 + x64)
+              gn gen out/Release-mac --args="${GN_ARGS} target_os=\"mac\" is_clang=true"
+              ;;
+            linux)
+              gn gen out/Release-linux --args="${GN_ARGS} target_os=\"linux\" is_clang=true use_custom_libcxx=false"
+              ;;
+            win)
+              gn gen out/Release-win --args="${GN_ARGS} target_os=\"win\" is_clang=true rtc_use_custom_crts=false"
+              ;;
+          esac
+
+          echo "== GN 配置完成 =="
+          gn args out/Release-* --list 2>/dev/null | head -5 || true
+
+      # ── Ninja 编译 ──
+      - name: Ninja build
+        shell: bash
+        run: |
+          cd "$WEBRTC_SRC"
+          OUT_DIR="out/Release-${{ matrix.target_os }}"
+
+          # 编译 default 目标（包含 :webrtc + //libwebrtc）
+          ninja -C "$OUT_DIR" default
+
+          echo "== 编译产物 =="
+          ls -lh "$OUT_DIR"/*.a "$OUT_DIR"/*.so "$OUT_DIR"/*.dll "$OUT_DIR"/*.dylib 2>/dev/null || true
+          echo "== 构建后磁盘 =="
+          df -h / || true
+
+      # ── 打包产物 ──
+      - name: Package
+        shell: bash
+        run: |
+          cd "$WEBRTC_SRC"
+          OUT_DIR="out/Release-${{ matrix.target_os }}"
+          PKG_DIR="$RUNNER_TEMP/libwebrtc-pkg"
+          mkdir -p "$PKG_DIR/include" "$PKG_DIR/lib"
+
+          # 1. 复制 webrtc-sdk C++ 封装公共头文件
+          cp -r libwebrtc/include/* "$PKG_DIR/include/"
+
+          # 2. 复制 Google WebRTC 内部头文件（封装实现依赖）
+          #    仅复制 api/ rtc_base/ pc/ media/ 等封装引用的目录
+          for dir in api rtc_base pc media call modules system_wrappers; do
+            if [ -d "$dir" ]; then
+              cp -r "$dir" "$PKG_DIR/include/"
+            fi
+          done
+          # 复制 third_party 中的必要头文件（abseil 等）
+          if [ -d "third_party/abseil-cpp" ]; then
+            mkdir -p "$PKG_DIR/include/third_party"
+            cp -r third_party/abseil-cpp/absl "$PKG_DIR/include/third_party/"
+          fi
+
+          # 3. 复制编译产物（静态库）
+          find "$OUT_DIR" -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" | while read f; do
+            cp "$f" "$PKG_DIR/lib/"
+          done
+
+          # 4. 复制封装实现源码（供 download_wrapper 编译）
+          mkdir -p "$PKG_DIR/src/base"
+          cp libwebrtc/src/*.cc libwebrtc/src/*.h "$PKG_DIR/src/" 2>/dev/null || true
+          cp libwebrtc/src/base/*.cc "$PKG_DIR/src/base/" 2>/dev/null || true
+
+          echo "== 打包完成 =="
+          du -sh "$PKG_DIR"
+          echo "include/ 文件数: $(find "$PKG_DIR/include" -type f | wc -l)"
+          echo "lib/ 文件数: $(find "$PKG_DIR/lib" -type f | wc -l)"
+          echo "src/ 文件数: $(find "$PKG_DIR/src" -type f | wc -l)"
+
+          # 压缩为 zip
+          cd "$RUNNER_TEMP"
+          zip -r "libwebrtc-${{ matrix.name }}-release.zip" libwebrtc-pkg/
+          ls -lh "libwebrtc-${{ matrix.name }}-release.zip"
+
+      # ── 上传产物 ──
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: libwebrtc-${{ matrix.name }}
+          path: ${{ runner.temp }}/libwebrtc-${{ matrix.name }}-release.zip
+          retention-days: 30
+
+      # ── 发布 Release（标签触发时）──
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/libwebrtc-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/libwebrtc-${{ matrix.name }}-release.zip
+          generate_release_notes: true

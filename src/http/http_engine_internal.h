@@ -340,6 +340,9 @@ namespace dw {
             /** 为单个分片构建 CURL easy handle */
             CURL *build_easy_for_part(dl_task_ctx *tCtx, dl_part_ctx *pCtx);
 
+            /** 统计当前处于下载中的 HTTP 任务数（全局限速在任务间均摊的分母），下限为 1 */
+            int active_downloading_tasks();
+
             /** 根据 CURLcode + HTTP status 分类失败原因 */
             dw_reason_t classify_failure(CURLcode rc, long http_code, int *retryable);
 

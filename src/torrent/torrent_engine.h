@@ -36,6 +36,12 @@ public:
     int32_t init(const dw_config_t* cfg, TaskManager* task_manager) override;
 
     /**
+     * 配置热更新：经 session apply_settings 下发上/下行限速，并刷新做种分享率上限。
+     * 监听端口与默认 trackers 仅 init 时生效。
+     */
+    void update_config(const dw_config_t* cfg) override;
+
+    /**
      * 销毁引擎，释放所有资源。
      */
     void destroy() override;

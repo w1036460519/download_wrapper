@@ -160,10 +160,14 @@ namespace dw {
         sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
     }
 
-    void TaskStore::clear_local_tasks(const std::string &save_path) const {
-        constexpr auto sql = "DELETE FROM file_records WHERE save_path=:save_path AND type=0;";
+    void TaskStore::clear_local_tasks(const std::string &client_id, const std::string &save_path) const {
+        // 仅清理本客户端、本目录下的本地文件条目（type=DW_SOURCE_LOCAL_FILE），
+        // 不得跨 client_id 删除，也不得连带 HTTP / BT 下载任务的记录。
+        constexpr auto sql =
+            "DELETE FROM file_records WHERE client_id=:client_id AND save_path=:save_path AND type=0;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
+        bind_text(st, ":client_id", client_id);
         bind_text(st, ":save_path", save_path);
         sqlite3_step(st);
         sqlite3_finalize(st);

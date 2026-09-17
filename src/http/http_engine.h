@@ -34,6 +34,12 @@ public:
     int32_t init(const dw_config_t* cfg, TaskManager* task_manager) override;
 
     /**
+     * 配置热更新：仅刷新数值型字段（限速 / 超时 / 重试 / 分片数）。
+     * 代理、UA、CA 证书等字符串字段被工作线程按裸指针引用，运行期替换将悬垂，故不更新。
+     */
+    void update_config(const dw_config_t* cfg) override;
+
+    /**
      * 销毁引擎，释放所有资源。
      */
     void destroy() override;

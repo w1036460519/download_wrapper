@@ -49,7 +49,7 @@ public:
     void init_schema() const;
 
     /// 清理指定 save_path 下的 file_records 中 type=0（本地文件条目）。
-    void clear_local_tasks(const std::string& save_path) const;
+    void clear_local_tasks(const std::string& client_id, const std::string& save_path) const;
     /// 删除任务及其 resume_data / file_progress_cache / file_records（统一按复合键）。
     void remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
     /// 重置任务进度：清除 resume_data / file_progress_cache，file_records 状态回 QUEUED、进度归零。

@@ -30,13 +30,9 @@ namespace dw {
             return (source && *source) ? utils::dup_cstr(source) : (def ? utils::dup_cstr(def) : nullptr);
         }
 
-        void apply_config(const dw_config_t *cfg) {
+        /// 运行期可热更新的数值型字段（不含字符串，原因见 update_config）。
+        void apply_runtime_config(const dw_config_t *cfg) {
             auto &g = he::g_cfg;
-            g.proxy = dup_string(g.proxy, cfg->proxy, nullptr);
-            g.proxy_username = dup_string(g.proxy_username, cfg->proxy_username, nullptr);
-            g.proxy_password = dup_string(g.proxy_password, cfg->proxy_password, nullptr);
-            g.user_agent = dup_string(g.user_agent, cfg->user_agent, "download_wrapper/2.0");
-            g.ca_bundle = dup_string(g.ca_bundle, cfg->ca_bundle, nullptr);
             g.connect_timeout_seconds = cfg->connect_timeout_seconds > 0 ? cfg->connect_timeout_seconds : 15;
             g.request_timeout_seconds = cfg->request_timeout_seconds;
             g.low_speed_limit_bps = cfg->low_speed_limit_bps >= 0 ? cfg->low_speed_limit_bps : 0;
@@ -46,9 +42,21 @@ namespace dw {
             g.max_retries = cfg->max_retries >= 0 ? cfg->max_retries : 3;
             g.default_parts = cfg->default_parts > 0 ? cfg->default_parts : 4;
             g.min_size_for_split = cfg->min_size_for_split > 0 ? cfg->min_size_for_split : 1 * 1024 * 1024;
+            // 全局下载限速（B/s）：0 = 不限速；新建 easy handle 时均摊到各分片。
+            g.download_rate_limit = cfg->download_rate_limit > 0 ? cfg->download_rate_limit : 0;
             g.log_level = cfg->log_level >= DW_LOG_DEBUG && cfg->log_level <= DW_LOG_ERROR
                               ? cfg->log_level
                               : DW_LOG_INFO;
+        }
+
+        void apply_config(const dw_config_t *cfg) {
+            auto &g = he::g_cfg;
+            g.proxy = dup_string(g.proxy, cfg->proxy, nullptr);
+            g.proxy_username = dup_string(g.proxy_username, cfg->proxy_username, nullptr);
+            g.proxy_password = dup_string(g.proxy_password, cfg->proxy_password, nullptr);
+            g.user_agent = dup_string(g.user_agent, cfg->user_agent, "download_wrapper/2.0");
+            g.ca_bundle = dup_string(g.ca_bundle, cfg->ca_bundle, nullptr);
+            apply_runtime_config(cfg);
         }
 
         bool ensure_running() {
@@ -87,6 +95,14 @@ namespace dw {
         initialized_ = true;
         log_i("", "HTTP 引擎初始化完成");
         return 0;
+    }
+
+    void HttpEngine::update_config(const dw_config_t *cfg) {
+        if (!initialized_ || !cfg) return;
+        apply_runtime_config(cfg);
+        log_i("", "[EVENT] HTTP 配置热更新: rate_limit=%lld B/s retries=%d parts=%d",
+              static_cast<long long>(he::g_cfg.download_rate_limit),
+              he::g_cfg.max_retries, he::g_cfg.default_parts);
     }
 
     void HttpEngine::destroy() {

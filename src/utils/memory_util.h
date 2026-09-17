@@ -16,11 +16,6 @@
 namespace dw::utils {
     /// 连续文件数组结果：alloc_file_list 分配的数组指针 + 节点数量。
     using file_array = std::pair<dw_file_info_t*, int32_t>;
-    /**
-    * 分配 dw_file_info_t 节点。与 free_file_info 配对使用。
-    * @return 节点指针（calloc 分配）；失败返回 nullptr。
-    */
-    dw_file_info_t *alloc_file_info();
 
     /**
     * 分配数组 dw_file_info_t。与 free_file_list 配对使用。
@@ -30,29 +25,11 @@ namespace dw::utils {
     dw_file_info_t *alloc_file_list(int32_t count);
 
     /**
-    * 释放 dw_file_info_t 节点。与 alloc_file_info 配对使用。
-    * @param file 待释放的节点指针；nullptr 时无操作。
-    */
-    void free_file_info(dw_file_info_t *file);
-
-    /**
-    * 释放数组 dw_file_info_t。与 alloc_file_list 配对使用。
+    * 释放数组 dw_file_info_t（含 name/full_path/ext 字符串字段）。与 alloc_file_list 配对使用。
     * @param files 数组指针（alloc_file_list 或等价 malloc 分配）；nullptr 或 count<=0 时无操作。
     * @param count 节点数。
     */
     void free_file_list(dw_file_info_t *files, int32_t count);
-
-    /**
-    * 分配 dw_submit_result_t。与 free_submit_result 配对使用。
-    * @return 节点指针（calloc 分配）；失败返回 nullptr。
-    */
-    dw_submit_result_t *alloc_submit_result();
-
-    /**
-    * 释放 dw_submit_result_t 节点。与 alloc_submit_result 配对使用。
-    * @param result 待释放的节点指针；nullptr 时无操作。
-    */
-    void free_submit_result(dw_submit_result_t *result);
 
     /**
     * 仅释放 dw_submit_result_t 内部字段（message/files/info_hash）并置空，不释放节点本体。

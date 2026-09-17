@@ -143,15 +143,6 @@ namespace dw {
         }
     }
 
-    inline const char *to_string_source(int32_t s) {
-        switch (s) {
-            case 0: return "LOCAL_TASK";
-            case 1: return "LOCAL_FILE";
-            case 2: return "REMOTE_FILE";
-            default: return "UNKNOWN";
-        }
-    }
-
     // ---- std::vector<int32_t> 序列化（调试日志用）----
 
     inline std::string to_string(const std::vector<int32_t> &v) {
@@ -166,12 +157,12 @@ namespace dw {
         boost::json::object obj;
         obj["index"] = f.index;
         obj["name"] = f.name ? f.name : "";
+        obj["full_path"] = f.full_path ? f.full_path : "";
         obj["size"] = f.size;
         obj["ext"] = f.ext ? f.ext : "";
         obj["status"] = f.status;
         obj["offset"] = f.offset;
         obj["downloaded_bytes"] = f.downloaded_bytes;
-        obj["physical_path"] = (f.physical_path ? f.physical_path : "");
         return boost::json::serialize(obj);
     }
 
@@ -233,7 +224,7 @@ namespace dw {
         obj["priority_file_indexes"] = p.priority_file_index_size;
         obj["url_seeds"] = p.url_seed_count;
         obj["priority"] = p.priority;
-        obj["source"] = to_string_source(p.source);
+        // source 已从参数结构体移除（由库内按 protocol 推导），此处不再输出。
         return boost::json::serialize(obj);
     }
 

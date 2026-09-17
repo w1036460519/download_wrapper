@@ -61,6 +61,9 @@ compile_commands.json
 # vcpkg
 vcpkg_installed/
 
+# 第三方预编译库（CI 自动下载，勿提交）
+third_party/
+
 # debug information files
 *.dwo
 

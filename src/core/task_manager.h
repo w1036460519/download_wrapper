@@ -144,6 +144,11 @@ namespace dw {
         /// 调度线程不再准入新任务；true 时唤醒调度按 QUEUED→准入路径自动重启。
         void set_network_allowed(bool allowed);
 
+        /// 运行期调整全局最大并发下载数（<=0 取默认 3）。
+        /// 调高后唤醒调度线程准入 QUEUED 任务；调低不中断已运行任务，
+        /// 多余名额随任务自然结束逐步收敛。
+        void set_max_concurrent(int32_t value);
+
         // ---- 任务文件实时查询（task_files 表已移除，磁盘为事实源） ----
 
         /// 解析任务内文件的物理路径与大小（dw_get_task_file_info 消费）。

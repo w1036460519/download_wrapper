@@ -242,10 +242,26 @@ DW_API int32_t dw_set_config(const dw_config_t *cfg) {
     }
 
     log_i("", "配置开始: %s", dw::to_string(*cfg).c_str());
+
+    // 先在锁内更新配置副本并取出下游目标，再锁外下发：
+    // 引擎 update_config / TaskManager 唤醒内部各自加锁，不可持 d->mutex 调用以规避锁序风险。
+    dw::IDownloadEngine *http = nullptr;
+    dw::IDownloadEngine *torrent = nullptr;
+    dw::TaskManager *tm = nullptr;
     {
         std::lock_guard<std::mutex> lock(d->mutex);
         dw::deep_copy_config(d->config, *cfg);
+        http = d->http_engine.get();
+        torrent = d->torrent_engine.get();
+        if (d->router) tm = d->router->task_manager();
     }
+
+    // 热更新运行期可生效的项：引擎限速 / 做种分享率、调度并发上限。
+    // 其余字段（代理、监听端口、work_dir、trackers）仅在 dw_init 时生效。
+    if (http) http->update_config(cfg);
+    if (torrent) torrent->update_config(cfg);
+    if (tm) tm->set_max_concurrent(cfg->max_concurrent_downloads);
+
     log_i("", "配置完成");
     return 0;
 }
@@ -324,7 +340,8 @@ DW_API int32_t dw_add_task(const dw_protocol_t protocol,
         return -1;
     }
 
-    const std::string task_key = dw_task_params_key(params, protocol) ? dw_task_params_key(params, protocol) : "";
+    const char *raw_key = dw_task_params_key(params, protocol);
+    const std::string task_key = raw_key ? raw_key : "";
     log_i(task_key.c_str(), "添加任务开始: protocol=%s client_id=%s force=%d",
           dw::to_string(protocol), client_id, force);
 
