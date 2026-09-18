@@ -269,13 +269,13 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
             _gn("out/Release-x64", {"target_cpu": "x64", "target_os": "ios",
                                     "is_clang": True, "target_environment": env, **ios_sign})
     else:
-        extra = {"target_cpu": cfg["target_cpu"], "target_os": target_os, "is_clang": True}
+        extra = {"target_cpu": cfg["target_cpu"], "target_os": cfg["target_os"], "is_clang": True}
         if "extra" in cfg:
             extra.update(cfg["extra"])
         if cfg.get("needs_ndk") and ndk_path:
             extra["android_ndk_root"] = ndk_path
         # iOS 设备构建同样禁用代码签名
-        if target_os == "ios":
+        if cfg["target_os"] == "ios":
             extra["ios_enable_code_signing"] = False
         _gn("out/Release", extra)
 
