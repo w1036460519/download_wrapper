@@ -38,13 +38,11 @@ PLATFORMS = {
     "linux-x64": {
         "target_os": "linux",
         "target_cpu": "x64",
-        "extra": {"use_custom_libcxx": False},
         "asset": "libwebrtc-linux-x64-release.zip",
     },
     "linux-arm64": {
         "target_os": "linux",
         "target_cpu": "arm64",
-        "extra": {"use_custom_libcxx": False},
         "asset": "libwebrtc-linux-arm64-release.zip",
     },
     "windows-x64": {
@@ -101,10 +99,9 @@ def gclient_cmd(*args):
     Windows: 通过 cmd.exe /c 调用 gclient.bat（触发 depot_tools bootstrap，捆绑 git 等工具）
     其他平台: 直接调用 gclient
     """
-    base_args = list(args)
     if platform.system() == "Windows":
-        return ["cmd.exe", "/c", "gclient.bat"] + base_args
-    return ["gclient"] + base_args
+        return ["cmd.exe", "/c", "gclient.bat"] + list(args)
+    return ["gclient"] + list(args)
 
 
 def _depot_cmd(name: str, *args):
@@ -112,19 +109,13 @@ def _depot_cmd(name: str, *args):
 
     Windows 上 depot_tools 通过 .bat wrapper 调用，需经 cmd.exe。
     """
-    base_args = list(args)
     if platform.system() == "Windows":
-        return ["cmd.exe", "/c", f"{name}.bat"] + base_args
-    return [name] + base_args
-
-
-def run_output(cmd, **kwargs):
-    """执行命令并返回 stdout。"""
-    return subprocess.check_output(cmd, text=True, **kwargs).strip()
+        return ["cmd.exe", "/c", f"{name}.bat"] + list(args)
+    return [name] + list(args)
 
 
 def gn_args_string(args: dict) -> str:
-    """将 dict 转为 GN --args 格式字符串（换行分隔）。"""
+    """将 dict 转为 GN --args 格式字符串（空格分隔）。"""
     parts = []
     for k, v in args.items():
         if isinstance(v, bool):
@@ -134,22 +125,6 @@ def gn_args_string(args: dict) -> str:
         else:
             parts.append(f"{k}={v}")
     return " ".join(parts)
-
-
-def append_github_env(key: str, value: str):
-    """向 GITHUB_ENV 追加变量（CI 环境）。"""
-    env_file = os.environ.get("GITHUB_ENV")
-    if env_file:
-        with open(env_file, "a") as f:
-            f.write(f"{key}={value}\n")
-
-
-def append_github_path(path: str):
-    """向 GITHUB_PATH 追加路径（CI 环境）。"""
-    path_file = os.environ.get("GITHUB_PATH")
-    if path_file:
-        with open(path_file, "a") as f:
-            f.write(f"{path}\n")
 
 
 # ── Step 1: depot_tools ──
@@ -164,7 +139,6 @@ def setup_depot_tools(temp_dir: Path) -> Path:
 
     depot_str = str(depot)
     os.environ["PATH"] = f"{depot_str}{os.pathsep}{os.environ['PATH']}"
-    append_github_path(depot_str)
 
     # Windows git 配置
     if platform.system() == "Windows":
@@ -175,9 +149,6 @@ def setup_depot_tools(temp_dir: Path) -> Path:
 
     # 触发 depot_tools 初始化（bootstrap 捆绑 git 等工具）
     run(gclient_cmd("--version"))
-
-    # 仅写入 CI 环境（后续步骤生效），不在当前进程设置，避免阻止 gclient sync 下载依赖
-    append_github_env("DEPOT_TOOLS_UPDATE", "0")
 
     return depot
 
@@ -273,22 +244,16 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
     """根据平台配置生成 GN 构建目录。"""
     cfg = PLATFORMS[platform_name]
     common = build_common_args()
-    target_os = cfg["target_os"]
 
     def _gn(out_dir: str, extra: dict):
         args = {**common, **extra}
         args_str = gn_args_string(args)
-        try:
-            run(_depot_cmd("gn", "gen", out_dir, f"--args={args_str}"), cwd=str(webrtc_src))
-        except subprocess.CalledProcessError:
-            # 重新执行并捕获 gn 的 stderr 以显示实际错误
-            result = subprocess.run(
-                _depot_cmd("gn", "gen", out_dir, f"--args={args_str}"),
-                cwd=str(webrtc_src), capture_output=True, text=True
-            )
+        cmd = _depot_cmd("gn", "gen", out_dir, f"--args={args_str}")
+        result = subprocess.run(cmd, cwd=str(webrtc_src), capture_output=True, text=True)
+        if result.returncode != 0:
             if result.stderr:
                 print(f"\n[GN stderr]\n{result.stderr}")
-            raise
+            raise subprocess.CalledProcessError(result.returncode, cmd)
 
     if cfg.get("universal"):
         # macOS / iOS simulator：双架构
@@ -322,15 +287,23 @@ def ninja_build(webrtc_src: Path, platform_name: str):
     cfg = PLATFORMS[platform_name]
 
     env = dict(os.environ)
-    if cfg["target_os"] == "android":
-        env["AUTONINJA_BUILD_ID"] = "ci-build"
 
     dirs = ["out/Release"]
     if cfg.get("universal"):
         dirs.append("out/Release-x64")
 
     for d in dirs:
-        run(_depot_cmd("ninja", "-C", d, "default"), cwd=str(webrtc_src), env=env)
+        result = subprocess.run(
+            _depot_cmd("ninja", "-C", d, "default"),
+            cwd=str(webrtc_src), env=env, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            output = (result.stdout or "") + (result.stderr or "")
+            lines = output.strip().splitlines()
+            print(f"\n[Ninja 最后 {min(50, len(lines))} 行输出]")
+            for line in lines[-50:]:
+                print(line)
+            raise subprocess.CalledProcessError(result.returncode, "ninja")
 
     # universal 合并
     if cfg.get("universal"):
@@ -435,7 +408,7 @@ def main():
     temp_dir = Path(args.temp_dir)
     cfg = PLATFORMS[args.platform]
 
-    print(f"== 构建配置 ==")
+    print("== 构建配置 ==")
     print(f"  平台:       {args.platform}")
     print(f"  目标 OS:    {cfg['target_os']}")
     print(f"  分支:       {args.webrtc_branch}")
@@ -449,10 +422,6 @@ def main():
     # 2. gclient sync
     print("\n== Step 2: gclient sync ==")
     webrtc_src = configure_gclient(temp_dir, args.webrtc_branch, cfg["target_os"])
-    append_github_env("WEBRTC_SRC", str(webrtc_src))
-
-    # sync 完成后禁止 depot_tools 自动更新
-    os.environ["DEPOT_TOOLS_UPDATE"] = "0"
 
     # 3. libwebrtc 集成
     print("\n== Step 3: libwebrtc 集成 ==")
