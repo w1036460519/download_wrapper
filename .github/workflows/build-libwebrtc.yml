@@ -38,7 +38,7 @@ jobs:
             gn_cpu: x64
             asset: libwebrtc-linux-x64-release.zip
           - name: linux-arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-24.04
             target_os: linux
             gn_cpu: arm64
             asset: libwebrtc-linux-arm64-release.zip
@@ -69,6 +69,7 @@ jobs:
             os: macos-latest
             target_os: ios
             gn_cpu: arm64
+            gn_extra: 'target_environment="device"'
             asset: libwebrtc-ios-arm64-release.zip
           - name: ios-simulator
             os: macos-latest
@@ -90,25 +91,27 @@ jobs:
           echo "== 构建前磁盘空间 =="
           df -h / || true
 
-      # ── Windows: git 配置 + 路径修正 ──
-      - name: Setup Windows environment
-        if: runner.os == 'Windows'
+      # ── 路径规范化 + Windows git 配置 ──
+      # RUNNER_TEMP 在 Windows 含反斜杠（如 D:\a\_temp），bash 无法解析。
+      # 创建 DW_TEMP 统一正斜杠，后续 bash 步骤全部使用 DW_TEMP。
+      - name: Normalize paths
         shell: bash
         run: |
-          git config --global core.autocrlf false
-          git config --global core.filemode false
-          git config --global core.fscache true
-          # RUNNER_TEMP 在 Windows 含反斜杠，转为正斜杠供 bash 使用
-          WIN_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
-          echo "RUNNER_TEMP=$WIN_TEMP" >> "$GITHUB_ENV"
+          DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
+          echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            git config --global core.autocrlf false
+            git config --global core.filemode false
+            git config --global core.fscache true
+          fi
 
       # ── 安装 depot_tools ──
       - name: Setup depot_tools
         shell: bash
         run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
-          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
-          export PATH="$RUNNER_TEMP/depot_tools:$PATH"
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DW_TEMP/depot_tools"
+          echo "$DW_TEMP/depot_tools" >> "$GITHUB_PATH"
+          export PATH="$DW_TEMP/depot_tools:$PATH"
           gclient --version
           echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
 
@@ -133,8 +136,8 @@ jobs:
             echo "错误: webrtc_branch 格式非法: $WEBRTC_BRANCH"
             exit 1
           fi
-          mkdir -p "$RUNNER_TEMP/webrtc_src"
-          cd "$RUNNER_TEMP/webrtc_src"
+          mkdir -p "$DW_TEMP/webrtc_src"
+          cd "$DW_TEMP/webrtc_src"
           cat > .gclient <<EOF
           solutions = [
             {
@@ -148,20 +151,22 @@ jobs:
           ]
           target_os = ['${{ matrix.target_os }}']
           EOF
-          echo "WEBRTC_SRC=$RUNNER_TEMP/webrtc_src/src" >> "$GITHUB_ENV"
+          echo "WEBRTC_SRC=$DW_TEMP/webrtc_src/src" >> "$GITHUB_ENV"
 
       # ── 缓存构建产物（ninja 增量编译） ──
       - name: Cache build output
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/webrtc_src/src/out/Release
+          path: |
+            ${{ runner.temp }}/webrtc_src/src/out/Release
+            ${{ runner.temp }}/webrtc_src/src/out/Release-x64
           key: libwebrtc-build-${{ matrix.name }}-${{ env.LIBWEBRTC_TAG }}
 
       # ── 同步 WebRTC 源码 ──
       - name: gclient sync
         shell: bash
         run: |
-          cd "$RUNNER_TEMP/webrtc_src"
+          cd "$DW_TEMP/webrtc_src"
           gclient sync --no-history --shallow --jobs 8 -D
           echo "== sync 后磁盘 =="
           df -h / || true
@@ -188,8 +193,8 @@ jobs:
         run: |
           cd "$WEBRTC_SRC"
 
-          # 构建 GN 参数：引号值用 GN 语法 "value"
-          GN_ARGS="
+          # 公共 GN 参数
+          COMMON_ARGS="
             is_debug=false
             is_component_build=false
             rtc_include_tests=false
@@ -206,39 +211,62 @@ jobs:
             rtc_enable_sctp=true
             treat_warnings_as_errors=false
             rtc_libvpx_build_vp8=false
-            target_cpu=\"${{ matrix.gn_cpu }}\"
           "
 
-          case "${{ matrix.target_os }}" in
-            mac)
-              GN_ARGS="$GN_ARGS target_os=\"mac\" is_clang=true"
-              ;;
-            linux)
-              GN_ARGS="$GN_ARGS target_os=\"linux\" is_clang=true use_custom_libcxx=false"
-              ;;
-            win)
-              GN_ARGS="$GN_ARGS target_os=\"win\" is_clang=true"
-              ;;
-            android)
-              GN_ARGS="$GN_ARGS target_os=\"android\" is_clang=true android_ndk_root=\"${ANDROID_NDK}\""
-              ;;
-            ios)
-              GN_ARGS="$GN_ARGS target_os=\"ios\" is_clang=true"
-              ;;
-          esac
+          # macOS / iOS simulator 需构建双架构（arm64 + x64）生成 universal 产物
+          if [[ "${{ matrix.name }}" == "macos" ]] || [[ "${{ matrix.name }}" == "ios-simulator" ]]; then
+            EXTRA="${{ matrix.gn_extra || '' }}"
 
-          # 追加平台额外参数（如 iOS simulator）
-          GN_ARGS="$GN_ARGS ${{ matrix.gn_extra || '' }}"
+            # arm64
+            gn gen out/Release --args="$COMMON_ARGS target_cpu=\"arm64\" target_os=\"${{ matrix.target_os }}\" is_clang=true $EXTRA"
 
-          gn gen out/Release --args="$GN_ARGS"
+            # x64
+            if [[ "${{ matrix.name }}" == "macos" ]]; then
+              gn gen out/Release-x64 --args="$COMMON_ARGS target_cpu=\"x64\" target_os=\"mac\" is_clang=true"
+            else
+              gn gen out/Release-x64 --args="$COMMON_ARGS target_cpu=\"x64\" target_os=\"ios\" is_clang=true target_environment=\"simulator\""
+            fi
+          else
+            case "${{ matrix.target_os }}" in
+              linux)
+                gn gen out/Release --args="$COMMON_ARGS target_cpu=\"${{ matrix.gn_cpu }}\" target_os=\"linux\" is_clang=true use_custom_libcxx=false"
+                ;;
+              win)
+                gn gen out/Release --args="$COMMON_ARGS target_cpu=\"${{ matrix.gn_cpu }}\" target_os=\"win\" is_clang=true"
+                ;;
+              android)
+                gn gen out/Release --args="$COMMON_ARGS target_cpu=\"${{ matrix.gn_cpu }}\" target_os=\"android\" is_clang=true android_ndk_root=\"${ANDROID_NDK}\""
+                ;;
+              *)
+                gn gen out/Release --args="$COMMON_ARGS target_cpu=\"${{ matrix.gn_cpu }}\" target_os=\"${{ matrix.target_os }}\" is_clang=true ${{ matrix.gn_extra || '' }}"
+                ;;
+            esac
+          fi
+
           echo "== GN 配置完成 =="
 
       # ── Ninja 编译 ──
       - name: Ninja build
+        env:
+          # Android build_server 静态分析需要此变量（autoninja 集成依赖）
+          AUTONINJA_BUILD_ID: ${{ matrix.target_os == 'android' && 'ci-build' || '' }}
         shell: bash
         run: |
           cd "$WEBRTC_SRC"
           ninja -C out/Release default
+
+          # macOS / iOS simulator：编译 x64 后用 lipo 合并为 universal
+          if [[ "${{ matrix.name }}" == "macos" ]] || [[ "${{ matrix.name }}" == "ios-simulator" ]]; then
+            ninja -C out/Release-x64 default
+            for f in out/Release/*.a out/Release/*.so out/Release/*.dylib; do
+              [ -f "$f" ] || continue
+              base=$(basename "$f")
+              if [ -f "out/Release-x64/$base" ]; then
+                lipo -create "$f" "out/Release-x64/$base" -output "out/Release/${base}.universal"
+                mv "out/Release/${base}.universal" "$f"
+              fi
+            done
+          fi
 
           echo "== 编译产物 =="
           ls -lh out/Release/*.a out/Release/*.so out/Release/*.dll out/Release/*.dylib 2>/dev/null || true
@@ -250,7 +278,7 @@ jobs:
         shell: bash
         run: |
           cd "$WEBRTC_SRC"
-          PKG_DIR="$RUNNER_TEMP/libwebrtc-pkg"
+          PKG_DIR="$DW_TEMP/libwebrtc-pkg"
           mkdir -p "$PKG_DIR/include" "$PKG_DIR/lib" "$PKG_DIR/src/base"
 
           cp -r libwebrtc/include/* "$PKG_DIR/include/"
@@ -275,7 +303,7 @@ jobs:
           echo "lib/:     $(find "$PKG_DIR/lib" -type f | wc -l) 文件"
           echo "src/:     $(find "$PKG_DIR/src" -type f | wc -l) 文件"
 
-          cd "$RUNNER_TEMP"
+          cd "$DW_TEMP"
           zip -r "${{ matrix.asset }}" libwebrtc-pkg/
           ls -lh "${{ matrix.asset }}"
 
