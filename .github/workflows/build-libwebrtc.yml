@@ -59,9 +59,8 @@ jobs:
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
           echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
-          export PATH="$RUNNER_TEMP/depot_tools:$PATH"
           # 禁止 depot_tools 自动更新（CI 中会导致意外行为）
-          echo "CHROMIUM_BUILDTOOLS_PATH=" >> "$GITHUB_ENV"
+          echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
 
       # ── 创建 .gclient 配置 ──
       # 安全：workflow_dispatch inputs 通过环境变量传递，不直接插入 shell 命令
