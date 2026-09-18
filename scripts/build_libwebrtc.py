@@ -251,8 +251,9 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
         cmd = _depot_cmd("gn", "gen", out_dir, f"--args={args_str}")
         result = subprocess.run(cmd, cwd=str(webrtc_src), capture_output=True, text=True)
         if result.returncode != 0:
-            if result.stderr:
-                print(f"\n[GN stderr]\n{result.stderr}")
+            output = (result.stdout or "") + (result.stderr or "")
+            if output.strip():
+                print(f"\n[GN 错误输出]\n{output.strip()}")
             raise subprocess.CalledProcessError(result.returncode, cmd)
 
     if cfg.get("universal"):

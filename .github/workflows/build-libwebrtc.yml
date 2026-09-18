@@ -28,15 +28,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos,           os: macos-latest,  target_os: mac,     asset: libwebrtc-macos-release.zip }
-          - { name: linux-x64,       os: ubuntu-24.04,  target_os: linux,   asset: libwebrtc-linux-x64-release.zip }
-          - { name: linux-arm64,     os: ubuntu-24.04,  target_os: linux,   asset: libwebrtc-linux-arm64-release.zip }
-          - { name: windows-x64,     os: windows-2022,  target_os: win,     asset: libwebrtc-windows-x64-release.zip }
-          - { name: windows-arm64,   os: windows-2022,  target_os: win,     asset: libwebrtc-windows-arm64-release.zip }
-          - { name: android-arm64,   os: ubuntu-24.04,  target_os: android, asset: libwebrtc-android-arm64-release.zip }
-          - { name: android-x64,     os: ubuntu-24.04,  target_os: android, asset: libwebrtc-android-x64-release.zip }
-          - { name: ios-arm64,       os: macos-latest,  target_os: ios,     asset: libwebrtc-ios-arm64-release.zip }
-          - { name: ios-simulator,   os: macos-latest,  target_os: ios,     asset: libwebrtc-ios-simulator-release.zip }
+          - { name: macos,           os: macos-latest,    target_os: mac,     asset: libwebrtc-macos-release.zip }
+          - { name: linux-x64,       os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-x64-release.zip }
+          - { name: linux-arm64,     os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-arm64-release.zip }
+          - { name: windows-x64,     os: windows-latest,  target_os: win,     asset: libwebrtc-windows-x64-release.zip }
+          - { name: windows-arm64,   os: windows-latest,  target_os: win,     asset: libwebrtc-windows-arm64-release.zip }
+          - { name: android-arm64,   os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-arm64-release.zip }
+          - { name: android-x64,     os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-x64-release.zip }
+          - { name: ios-arm64,       os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-arm64-release.zip }
+          - { name: ios-simulator,   os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-simulator-release.zip }
 
     runs-on: ${{ matrix.os }}
 
