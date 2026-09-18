@@ -19,6 +19,11 @@ import sys
 import zipfile
 from pathlib import Path
 
+# Windows 默认 cp1252 无法输出中文，强制 UTF-8
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # ── 常量 ──
 LIBWEBRTC_TAG = "libwebrtc.m144.7559.09"
 
