@@ -18,8 +18,6 @@ on:
 env:
   # webrtc-sdk/libwebrtc 版本标签
   LIBWEBRTC_TAG: 'libwebrtc.m144.7559.09'
-  # depot_tools 固定版本（避免上游变动导致构建失败）
-  DEPOT_TOOLS_REF: 'main'
 
 jobs:
   build:
@@ -28,17 +26,56 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── macOS ──
           - name: macos
             os: macos-latest
             target_os: mac
-            gn_extra: 'target_cpu="x64" target_cpu="arm64"'
-          # 后续扩展：取消注释即可启用
-          # - name: linux-x64
-          #   os: ubuntu-22.04
-          #   target_os: linux
-          # - name: windows-x64
-          #   os: windows-2022
-          #   target_os: win
+            gn_cpu: 'target_cpu="arm64"'
+            asset: libwebrtc-macos-release.zip
+          # ── Linux ──
+          - name: linux-x64
+            os: ubuntu-24.04
+            target_os: linux
+            gn_cpu: 'target_cpu="x64"'
+            asset: libwebrtc-linux-x64-release.zip
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target_os: linux
+            gn_cpu: 'target_cpu="arm64"'
+            asset: libwebrtc-linux-arm64-release.zip
+          # ── Windows ──
+          - name: windows-x64
+            os: windows-2022
+            target_os: win
+            gn_cpu: 'target_cpu="x64"'
+            asset: libwebrtc-windows-x64-release.zip
+          - name: windows-arm64
+            os: windows-2022
+            target_os: win
+            gn_cpu: 'target_cpu="arm64"'
+            asset: libwebrtc-windows-arm64-release.zip
+          # ── Android ──
+          - name: android-arm64
+            os: ubuntu-24.04
+            target_os: android
+            gn_cpu: 'target_cpu="arm64"'
+            asset: libwebrtc-android-arm64-release.zip
+          - name: android-x64
+            os: ubuntu-24.04
+            target_os: android
+            gn_cpu: 'target_cpu="x64"'
+            asset: libwebrtc-android-x64-release.zip
+          # ── iOS ──
+          - name: ios-arm64
+            os: macos-latest
+            target_os: ios
+            gn_cpu: 'target_cpu="arm64"'
+            asset: libwebrtc-ios-arm64-release.zip
+          - name: ios-simulator
+            os: macos-latest
+            target_os: ios
+            gn_cpu: 'target_cpu="arm64" target_environment="simulator"'
+            asset: libwebrtc-ios-simulator-release.zip
 
     runs-on: ${{ matrix.os }}
 
@@ -60,19 +97,26 @@ jobs:
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
           echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
           export PATH="$RUNNER_TEMP/depot_tools:$PATH"
-          # 首次运行触发 depot_tools 自动初始化（下载内部工具、Python 环境等）
           gclient --version
-          # 禁止后续步骤中 depot_tools 自动更新
           echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
 
+      # ── Android NDK（仅 Android 构建需要）──
+      - name: Setup Android NDK
+        if: matrix.target_os == 'android'
+        shell: bash
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+          echo "NDK 路径: $ANDROID_NDK_HOME"
+          ls "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" || true
+
       # ── 创建 .gclient 配置 ──
-      # 安全：workflow_dispatch inputs 通过环境变量传递，不直接插入 shell 命令
       - name: Configure gclient
         env:
           WEBRTC_BRANCH: ${{ inputs.webrtc_branch || 'm144_release' }}
         shell: bash
         run: |
-          # 验证分支名格式（仅允许字母数字、下划线、点、斜杠、短横线）
           if [[ ! "$WEBRTC_BRANCH" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
             echo "错误: webrtc_branch 格式非法: $WEBRTC_BRANCH"
             exit 1
@@ -95,7 +139,7 @@ jobs:
           EOF
           echo "WEBRTC_SRC=$RUNNER_TEMP/webrtc_src/src" >> "$GITHUB_ENV"
 
-      # ── 同步 WebRTC 源码（最耗时步骤，~20-30GB 下载）──
+      # ── 同步 WebRTC 源码 ──
       - name: gclient sync
         shell: bash
         run: |
@@ -112,18 +156,13 @@ jobs:
           git clone --depth 1 --branch "$LIBWEBRTC_TAG" \
             https://github.com/webrtc-sdk/libwebrtc.git libwebrtc
 
-          # 应用音频补丁（如果存在）
           if [ -f "libwebrtc/patches/custom_audio_source_m144.patch" ]; then
             git apply libwebrtc/patches/custom_audio_source_m144.patch || true
           fi
 
-          # 修改 BUILD.gn：将 libwebrtc 加入 default 构建组
-          # 这样 ninja 会同时编译 WebRTC 核心 + C++ 封装
           if ! grep -q 'libwebrtc' BUILD.gn; then
             sed -i.bak 's|deps = \[ ":webrtc" \]|deps = [ ":webrtc", "//libwebrtc" ]|' BUILD.gn
           fi
-          echo "== BUILD.gn 修改后 =="
-          grep -A3 'group("default")' BUILD.gn || true
 
       # ── GN 配置（DataChannel 裁剪）──
       - name: GN gen (DataChannel-only)
@@ -131,8 +170,6 @@ jobs:
         run: |
           cd "$WEBRTC_SRC"
 
-          # 裁剪参数：只保留 DataChannel 所需能力
-          # 禁用所有音视频编解码、测试、示例、工具
           GN_ARGS="
             is_debug=false
             is_component_build=false
@@ -150,36 +187,38 @@ jobs:
             rtc_enable_sctp=true
             treat_warnings_as_errors=false
             rtc_libvpx_build_vp8=false
+            ${{ matrix.gn_cpu }}
           "
 
           case "${{ matrix.target_os }}" in
             mac)
-              # macOS: 构建 universal binary (arm64 + x64)
-              gn gen out/Release-mac --args="${GN_ARGS} target_os=\"mac\" is_clang=true"
+              gn gen out/Release --args="${GN_ARGS} target_os=\"mac\" is_clang=true"
               ;;
             linux)
-              gn gen out/Release-linux --args="${GN_ARGS} target_os=\"linux\" is_clang=true use_custom_libcxx=false"
+              gn gen out/Release --args="${GN_ARGS} target_os=\"linux\" is_clang=true use_custom_libcxx=false"
               ;;
             win)
-              gn gen out/Release-win --args="${GN_ARGS} target_os=\"win\" is_clang=true rtc_use_custom_crts=false"
+              gn gen out/Release --args="${GN_ARGS} target_os=\"win\" is_clang=true"
+              ;;
+            android)
+              gn gen out/Release --args="${GN_ARGS} target_os=\"android\" is_clang=true android_ndk_root=\"$ANDROID_NDK\""
+              ;;
+            ios)
+              gn gen out/Release --args="${GN_ARGS} target_os=\"ios\" is_clang=true"
               ;;
           esac
 
           echo "== GN 配置完成 =="
-          gn args out/Release-* --list 2>/dev/null | head -5 || true
 
       # ── Ninja 编译 ──
       - name: Ninja build
         shell: bash
         run: |
           cd "$WEBRTC_SRC"
-          OUT_DIR="out/Release-${{ matrix.target_os }}"
-
-          # 编译 default 目标（包含 :webrtc + //libwebrtc）
-          ninja -C "$OUT_DIR" default
+          ninja -C out/Release default
 
           echo "== 编译产物 =="
-          ls -lh "$OUT_DIR"/*.a "$OUT_DIR"/*.so "$OUT_DIR"/*.dll "$OUT_DIR"/*.dylib 2>/dev/null || true
+          ls -lh out/Release/*.a out/Release/*.so out/Release/*.dll out/Release/*.dylib 2>/dev/null || true
           echo "== 构建后磁盘 =="
           df -h / || true
 
@@ -188,53 +227,45 @@ jobs:
         shell: bash
         run: |
           cd "$WEBRTC_SRC"
-          OUT_DIR="out/Release-${{ matrix.target_os }}"
           PKG_DIR="$RUNNER_TEMP/libwebrtc-pkg"
-          mkdir -p "$PKG_DIR/include" "$PKG_DIR/lib"
+          mkdir -p "$PKG_DIR/include" "$PKG_DIR/lib" "$PKG_DIR/src/base"
 
-          # 1. 复制 webrtc-sdk C++ 封装公共头文件
+          # 1. webrtc-sdk C++ 封装公共头文件
           cp -r libwebrtc/include/* "$PKG_DIR/include/"
 
-          # 2. 复制 Google WebRTC 内部头文件（封装实现依赖）
-          #    仅复制 api/ rtc_base/ pc/ media/ 等封装引用的目录
+          # 2. Google WebRTC 内部头文件（封装实现依赖）
           for dir in api rtc_base pc media call modules system_wrappers; do
-            if [ -d "$dir" ]; then
-              cp -r "$dir" "$PKG_DIR/include/"
-            fi
+            [ -d "$dir" ] && cp -r "$dir" "$PKG_DIR/include/"
           done
-          # 复制 third_party 中的必要头文件（abseil 等）
           if [ -d "third_party/abseil-cpp" ]; then
             mkdir -p "$PKG_DIR/include/third_party"
             cp -r third_party/abseil-cpp/absl "$PKG_DIR/include/third_party/"
           fi
 
-          # 3. 复制编译产物（静态库）
-          find "$OUT_DIR" -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" | while read f; do
+          # 3. 编译产物
+          find out/Release -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" | while read f; do
             cp "$f" "$PKG_DIR/lib/"
           done
 
-          # 4. 复制封装实现源码（供 download_wrapper 编译）
-          mkdir -p "$PKG_DIR/src/base"
+          # 4. 封装实现源码（供 download_wrapper 编译）
           cp libwebrtc/src/*.cc libwebrtc/src/*.h "$PKG_DIR/src/" 2>/dev/null || true
           cp libwebrtc/src/base/*.cc "$PKG_DIR/src/base/" 2>/dev/null || true
 
           echo "== 打包完成 =="
-          du -sh "$PKG_DIR"
-          echo "include/ 文件数: $(find "$PKG_DIR/include" -type f | wc -l)"
-          echo "lib/ 文件数: $(find "$PKG_DIR/lib" -type f | wc -l)"
-          echo "src/ 文件数: $(find "$PKG_DIR/src" -type f | wc -l)"
+          echo "include/: $(find "$PKG_DIR/include" -type f | wc -l) 文件"
+          echo "lib/:     $(find "$PKG_DIR/lib" -type f | wc -l) 文件"
+          echo "src/:     $(find "$PKG_DIR/src" -type f | wc -l) 文件"
 
-          # 压缩为 zip
           cd "$RUNNER_TEMP"
-          zip -r "libwebrtc-${{ matrix.name }}-release.zip" libwebrtc-pkg/
-          ls -lh "libwebrtc-${{ matrix.name }}-release.zip"
+          zip -r "${{ matrix.asset }}" libwebrtc-pkg/
+          ls -lh "${{ matrix.asset }}"
 
       # ── 上传产物 ──
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: libwebrtc-${{ matrix.name }}
-          path: ${{ runner.temp }}/libwebrtc-${{ matrix.name }}-release.zip
+          path: ${{ runner.temp }}/${{ matrix.asset }}
           retention-days: 30
 
       # ── 发布 Release（标签触发时）──
@@ -242,5 +273,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/libwebrtc-v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ runner.temp }}/libwebrtc-${{ matrix.name }}-release.zip
+          files: ${{ runner.temp }}/${{ matrix.asset }}
           generate_release_notes: true
