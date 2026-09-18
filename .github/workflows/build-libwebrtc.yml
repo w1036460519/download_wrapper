@@ -59,7 +59,10 @@ jobs:
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
           echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
-          # 禁止 depot_tools 自动更新（CI 中会导致意外行为）
+          export PATH="$RUNNER_TEMP/depot_tools:$PATH"
+          # 显式 bootstrap depot_tools（初始化内部工具、Python 环境等）
+          "$RUNNER_TEMP/depot_tools/ensure_bootstrap.sh"
+          # 禁止后续步骤中 depot_tools 自动更新
           echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
 
       # ── 创建 .gclient 配置 ──
