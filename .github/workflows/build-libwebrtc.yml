@@ -69,13 +69,11 @@ jobs:
             os: macos-latest
             target_os: ios
             gn_cpu: arm64
-            gn_extra: 'target_environment="device"'
             asset: libwebrtc-ios-arm64-release.zip
           - name: ios-simulator
             os: macos-latest
             target_os: ios
             gn_cpu: arm64
-            gn_extra: 'target_environment="simulator"'
             asset: libwebrtc-ios-simulator-release.zip
 
     runs-on: ${{ matrix.os }}
@@ -112,7 +110,13 @@ jobs:
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DW_TEMP/depot_tools"
           echo "$DW_TEMP/depot_tools" >> "$GITHUB_PATH"
           export PATH="$DW_TEMP/depot_tools:$PATH"
-          gclient --version
+          # Windows 上 Git Bash 不会自动解析 .bat 后缀，需显式指定
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "GCLIENT_CMD=gclient.bat" >> "$GITHUB_ENV"
+          else
+            echo "GCLIENT_CMD=gclient" >> "$GITHUB_ENV"
+          fi
+          $GCLIENT_CMD --version
           echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
 
       # ── Android NDK ──
@@ -167,7 +171,7 @@ jobs:
         shell: bash
         run: |
           cd "$DW_TEMP/webrtc_src"
-          gclient sync --no-history --shallow --jobs 8 -D
+          $GCLIENT_CMD sync --no-history --shallow --jobs 8 -D
           echo "== sync 后磁盘 =="
           df -h / || true
 
@@ -211,14 +215,17 @@ jobs:
             rtc_enable_sctp=true
             treat_warnings_as_errors=false
             rtc_libvpx_build_vp8=false
+            use_libcxx_modules=false
           "
 
           # macOS / iOS simulator 需构建双架构（arm64 + x64）生成 universal 产物
           if [[ "${{ matrix.name }}" == "macos" ]] || [[ "${{ matrix.name }}" == "ios-simulator" ]]; then
-            EXTRA="${{ matrix.gn_extra || '' }}"
-
             # arm64
-            gn gen out/Release --args="$COMMON_ARGS target_cpu=\"arm64\" target_os=\"${{ matrix.target_os }}\" is_clang=true $EXTRA"
+            if [[ "${{ matrix.name }}" == "macos" ]]; then
+              gn gen out/Release --args="$COMMON_ARGS target_cpu=\"arm64\" target_os=\"mac\" is_clang=true"
+            else
+              gn gen out/Release --args="$COMMON_ARGS target_cpu=\"arm64\" target_os=\"ios\" is_clang=true target_environment=\"simulator\""
+            fi
 
             # x64
             if [[ "${{ matrix.name }}" == "macos" ]]; then
@@ -237,8 +244,8 @@ jobs:
               android)
                 gn gen out/Release --args="$COMMON_ARGS target_cpu=\"${{ matrix.gn_cpu }}\" target_os=\"android\" is_clang=true android_ndk_root=\"${ANDROID_NDK}\""
                 ;;
-              *)
-                gn gen out/Release --args="$COMMON_ARGS target_cpu=\"${{ matrix.gn_cpu }}\" target_os=\"${{ matrix.target_os }}\" is_clang=true ${{ matrix.gn_extra || '' }}"
+              ios)
+                gn gen out/Release --args="$COMMON_ARGS target_cpu=\"${{ matrix.gn_cpu }}\" target_os=\"ios\" is_clang=true target_environment=\"device\""
                 ;;
             esac
           fi

@@ -575,13 +575,15 @@ namespace dw {
                 break;
             }
             case EngineEventType::DOWNLOAD_FAILED: {
-                rec->status = DW_TASK_STATUS_ERROR;
+                // 按 reason 区分：FAIL=可重试（调度器自动重试），其余=不可重试终态
+                const bool retryable = (event.reason == DW_REASON_FAIL);
+                rec->status = retryable ? DW_TASK_STATUS_FAIL : DW_TASK_STATUS_ERROR;
                 rec->reason = event.reason;
                 rec->message = event.message;
-                // 终态即时写（保留失败展示，用户手动重试）
+                // 终态即时写（保留失败展示，用户手动重试或调度器自动重试）
                 store_.update_file_record_status(rec->client_id, rec->task_protocol, rec->task_natural_key,
-                                                 DW_TASK_STATUS_ERROR, event.reason, event.message);
-                log_e(key.c_str(), "下载失败 msg=%s", event.message.c_str());
+                                                 rec->status, event.reason, event.message);
+                log_e(key.c_str(), "下载失败 retryable=%d msg=%s", retryable, event.message.c_str());
                 schedule_needed_ = true;
                 break;
             }
@@ -1051,10 +1053,10 @@ namespace dw {
             if (!ok) {
                 // 准入失败：迁 FAIL 释放名额（可重试，调度器自动重新准入）。
                 rec.status = DW_TASK_STATUS_FAIL;
-                rec.reason = DW_REASON_ERROR;
+                rec.reason = DW_REASON_FAIL;
                 rec.message = "调度恢复失败";
                 store_.update_file_record_status(rec.client_id, rec.task_protocol, rec.task_natural_key,
-                                                 DW_TASK_STATUS_FAIL, DW_REASON_ERROR, "调度恢复失败");
+                                                 DW_TASK_STATUS_FAIL, DW_REASON_FAIL, "调度恢复失败");
                 schedule_needed_ = true;
             } else {
                 // QUEUED 准入成功：直接进入下载（即时写权威列）。

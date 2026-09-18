@@ -104,7 +104,8 @@ typedef enum {
     DW_REASON_NETWORK = 2, /**< 网络问题。 */
     DW_REASON_INVALID_INPUT = 3, /**< 输入非法。 */
     DW_REASON_AUTH = 4, /**< 认证问题。 */
-    DW_REASON_ERROR = 5, /**< 通用错误。 */
+    DW_REASON_ERROR = 5, /**< 通用错误（不可重试）。 */
+    DW_REASON_FAIL = 6, /**< 可重试失败（调度器自动重试）。 */
 } dw_reason_t;
 
 /** 日志级别（从低到高）。 */

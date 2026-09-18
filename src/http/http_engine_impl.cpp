@@ -618,6 +618,8 @@ namespace dw {
                                     break;
                                 case DW_REASON_ERROR: rank = 3;
                                     break;
+                                case DW_REASON_FAIL: rank = 2;
+                                    break;
                                 case DW_REASON_NETWORK: rank = 1;
                                     break;
                                 default: rank = 0;
@@ -1033,6 +1035,8 @@ namespace dw {
                         case DW_REASON_AUTH: tCtx->message = "认证失败";
                             break;
                         case DW_REASON_ERROR: tCtx->message = "资源不存在或已失效";
+                            break;
+                        case DW_REASON_FAIL: tCtx->message = "下载失败，将自动重试";
                             break;
                         case DW_REASON_NETWORK: tCtx->message = "网络连接异常";
                             break;

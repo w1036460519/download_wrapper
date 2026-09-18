@@ -139,6 +139,7 @@ namespace dw {
             case DW_REASON_INVALID_INPUT: return "INVALID_INPUT";
             case DW_REASON_AUTH: return "AUTH";
             case DW_REASON_ERROR: return "ERROR";
+            case DW_REASON_FAIL: return "FAIL";
             default: return "UNKNOWN";
         }
     }

@@ -235,12 +235,8 @@ namespace dw {
             if (s.errc) {
                 log_e(key.c_str(), "任务发生错误. code: %d, msg: %s",
                       s.errc.value(), s.errc.message().c_str());
-                return EngineEvent{
-                    .type = EngineEventType::DOWNLOAD_FAILED,
-                    .engine_key = key,
-                    .protocol = DW_PROTOCOL_TORRENT,
-                    .client_id = g_task_manager->client_id()
-                };
+                post_fail(key, s.errc.message().c_str());
+                return {};
             }
             EngineEvent ev;
             ev.client_id = g_task_manager->client_id();
@@ -364,11 +360,7 @@ namespace dw {
 
             auto send_error = [&](const std::string &msg) {
                 log_e(key.c_str(), "%s", msg.c_str());
-                if (g_task_manager) {
-                    ev.type = EngineEventType::DOWNLOAD_FAILED;
-                    ev.message = msg;
-                    g_task_manager->on_engine_event(ev);
-                }
+                post_fail(key, msg);
             };
 
             const lt::torrent_status st = h.status();
@@ -492,7 +484,8 @@ namespace dw {
                     const std::string key = info_hash_hex(s.handle);
                     if (key.empty()) continue;
                     EngineEvent ev = make_status_update_event(s, key);
-                    if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
+                    if (!ev.engine_key.empty() && g_task_manager)
+                        g_task_manager->on_engine_event(std::move(ev));
                 }
             }
             // 添加任务
@@ -502,14 +495,7 @@ namespace dw {
                     // 添加任务失败
                     log_e(key.c_str(), "添加失败: %s", at->error.message().c_str());
                     if (key.empty()) return;
-                    if (g_task_manager) {
-                        g_task_manager->on_engine_event(EngineEvent{
-                            .type = EngineEventType::DOWNLOAD_FAILED,
-                            .engine_key = key,
-                            .protocol = DW_PROTOCOL_TORRENT,
-                            .client_id = g_task_manager->client_id()
-                        });
-                    }
+                    post_error(key, at->error.message().c_str());
                 } else if (at->handle.is_valid()) {
                     // 添加任务成功
                     log_i(key.c_str(), "添加成功");
@@ -547,14 +533,7 @@ namespace dw {
                 const std::string key = info_hash_hex(te->handle);
                 log_e(key.c_str(), "下载错误: %s", te->error.message().c_str());
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                post_fail(key, te->error.message().c_str());
             }
             // 文件错误
             else if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
@@ -562,57 +541,29 @@ namespace dw {
                 log_e(key.c_str(), "文件错误 file: %s, msg: %s, errno: %d",
                       fe->filename(), fe->error.message().c_str(), fe->error.value());
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                post_fail(key, fe->error.message().c_str());
             }
             // 种子冲突：两个磁力链接解析到同一 torrent，双方进入 error 状态
             else if (const auto *tc = lt::alert_cast<lt::torrent_conflict_alert>(a)) {
                 const std::string key = info_hash_hex(tc->handle);
                 log_e(key.c_str(), "种子冲突: 两个磁力链接解析到同一 torrent");
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                post_error(key, "种子冲突");
             }
             // 元数据解析失败：info-hash 校验不通过，libtorrent 自动重试，重试耗尽后 torrent 进入 error 状态
             else if (const auto *mf = lt::alert_cast<lt::metadata_failed_alert>(a)) {
                 const std::string key = info_hash_hex(mf->handle);
                 log_e(key.c_str(), "元数据解析失败: %s", mf->error.message().c_str());
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                post_fail(key, mf->error.message().c_str());
             }
             // 存储移动失败：move_storage() 调用失败，torrent 进入 error 状态
             else if (const auto *sm = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
                 const std::string key = info_hash_hex(sm->handle);
-                log_e(key.c_str(), "存储移动失败: %s, errno: %d",
-                      sm->error.message().c_str(), sm->error.value());
+                log_e(key.c_str(), "存储移动失败: %s, errno: %d, op=%d",
+                      sm->error.message().c_str(), sm->error.value(), static_cast<int>(sm->op));
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                post_error(key, sm->error.message().c_str());
             }
             // 断点续传数据就绪
             else if (const auto *rd = lt::alert_cast<lt::save_resume_data_alert>(a)) {
@@ -661,22 +612,6 @@ namespace dw {
                     ev.is_dir = true;
                     ev.ext = "";
                     g_task_manager->on_engine_event(std::move(ev));
-                }
-            }
-            // 存储迁移失败
-            else if (const auto *smf = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
-                const std::string key = info_hash_hex(smf->handle);
-                if (key.empty()) return;
-                log_e(key.c_str(), "存储迁移失败: %s (op=%d)",
-                      smf->error.message().c_str(), static_cast<int>(smf->op));
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id(),
-                        .message = smf->error.message().c_str()
-                    });
                 }
             }
             // 暂停
@@ -744,13 +679,7 @@ namespace dw {
                 if (key.empty()) return;
                 log_e(key.c_str(), "任务文件删除失败: %s",
                       tdf->error.message().c_str());
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_FAILED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT
-                    });
-                }
+                post_error(key, tdf->error.message().c_str());
             }
         }
 
@@ -1005,6 +934,7 @@ namespace dw {
         engine_event.engine_key = key;
         engine_event.protocol = DW_PROTOCOL_TORRENT;
         engine_event.client_id = g_task_manager->client_id();
+        engine_event.reason = DW_REASON_FAIL;
         engine_event.message = message;
         g_task_manager->on_engine_event(engine_event);
     }
