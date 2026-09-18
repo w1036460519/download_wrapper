@@ -16,7 +16,6 @@ on:
       - 'libwebrtc-v*'
 
 env:
-  # webrtc-sdk/libwebrtc 版本标签
   LIBWEBRTC_TAG: 'libwebrtc.m144.7559.09'
 
 jobs:
@@ -30,51 +29,52 @@ jobs:
           - name: macos
             os: macos-latest
             target_os: mac
-            gn_cpu: 'target_cpu="arm64"'
+            gn_cpu: arm64
             asset: libwebrtc-macos-release.zip
           # ── Linux ──
           - name: linux-x64
             os: ubuntu-24.04
             target_os: linux
-            gn_cpu: 'target_cpu="x64"'
+            gn_cpu: x64
             asset: libwebrtc-linux-x64-release.zip
           - name: linux-arm64
             os: ubuntu-24.04-arm
             target_os: linux
-            gn_cpu: 'target_cpu="arm64"'
+            gn_cpu: arm64
             asset: libwebrtc-linux-arm64-release.zip
           # ── Windows ──
           - name: windows-x64
             os: windows-2022
             target_os: win
-            gn_cpu: 'target_cpu="x64"'
+            gn_cpu: x64
             asset: libwebrtc-windows-x64-release.zip
           - name: windows-arm64
             os: windows-2022
             target_os: win
-            gn_cpu: 'target_cpu="arm64"'
+            gn_cpu: arm64
             asset: libwebrtc-windows-arm64-release.zip
           # ── Android ──
           - name: android-arm64
             os: ubuntu-24.04
             target_os: android
-            gn_cpu: 'target_cpu="arm64"'
+            gn_cpu: arm64
             asset: libwebrtc-android-arm64-release.zip
           - name: android-x64
             os: ubuntu-24.04
             target_os: android
-            gn_cpu: 'target_cpu="x64"'
+            gn_cpu: x64
             asset: libwebrtc-android-x64-release.zip
           # ── iOS ──
           - name: ios-arm64
             os: macos-latest
             target_os: ios
-            gn_cpu: 'target_cpu="arm64"'
+            gn_cpu: arm64
             asset: libwebrtc-ios-arm64-release.zip
           - name: ios-simulator
             os: macos-latest
             target_os: ios
-            gn_cpu: 'target_cpu="arm64" target_environment="simulator"'
+            gn_cpu: arm64
+            gn_extra: 'target_environment="simulator"'
             asset: libwebrtc-ios-simulator-release.zip
 
     runs-on: ${{ matrix.os }}
@@ -90,6 +90,18 @@ jobs:
           echo "== 构建前磁盘空间 =="
           df -h / || true
 
+      # ── Windows: git 配置 + 路径修正 ──
+      - name: Setup Windows environment
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.filemode false
+          git config --global core.fscache true
+          # RUNNER_TEMP 在 Windows 含反斜杠，转为正斜杠供 bash 使用
+          WIN_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
+          echo "RUNNER_TEMP=$WIN_TEMP" >> "$GITHUB_ENV"
+
       # ── 安装 depot_tools ──
       - name: Setup depot_tools
         shell: bash
@@ -100,16 +112,16 @@ jobs:
           gclient --version
           echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
 
-      # ── Android NDK（仅 Android 构建需要）──
+      # ── Android NDK ──
       - name: Setup Android NDK
         if: matrix.target_os == 'android'
         shell: bash
         run: |
           export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          # 转正斜杠
+          ANDROID_NDK_HOME=$(echo "$ANDROID_NDK_HOME" | tr '\\' '/')
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
-          echo "NDK 路径: $ANDROID_NDK_HOME"
-          ls "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" || true
 
       # ── 创建 .gclient 配置 ──
       - name: Configure gclient
@@ -123,7 +135,6 @@ jobs:
           fi
           mkdir -p "$RUNNER_TEMP/webrtc_src"
           cd "$RUNNER_TEMP/webrtc_src"
-          TARGET_OS="${{ matrix.target_os }}"
           cat > .gclient <<EOF
           solutions = [
             {
@@ -135,9 +146,16 @@ jobs:
               "custom_vars" : {},
             },
           ]
-          target_os = ['${TARGET_OS}']
+          target_os = ['${{ matrix.target_os }}']
           EOF
           echo "WEBRTC_SRC=$RUNNER_TEMP/webrtc_src/src" >> "$GITHUB_ENV"
+
+      # ── 缓存构建产物（ninja 增量编译） ──
+      - name: Cache build output
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/webrtc_src/src/out/Release
+          key: libwebrtc-build-${{ matrix.name }}-${{ env.LIBWEBRTC_TAG }}
 
       # ── 同步 WebRTC 源码 ──
       - name: gclient sync
@@ -148,7 +166,7 @@ jobs:
           echo "== sync 后磁盘 =="
           df -h / || true
 
-      # ── 克隆 webrtc-sdk/libwebrtc 到源码树 ──
+      # ── 克隆 libwebrtc 封装 ──
       - name: Integrate libwebrtc wrapper
         shell: bash
         run: |
@@ -170,6 +188,7 @@ jobs:
         run: |
           cd "$WEBRTC_SRC"
 
+          # 构建 GN 参数：引号值用 GN 语法 "value"
           GN_ARGS="
             is_debug=false
             is_component_build=false
@@ -187,27 +206,31 @@ jobs:
             rtc_enable_sctp=true
             treat_warnings_as_errors=false
             rtc_libvpx_build_vp8=false
-            ${{ matrix.gn_cpu }}
+            target_cpu=\"${{ matrix.gn_cpu }}\"
           "
 
           case "${{ matrix.target_os }}" in
             mac)
-              gn gen out/Release --args="${GN_ARGS} target_os=\"mac\" is_clang=true"
+              GN_ARGS="$GN_ARGS target_os=\"mac\" is_clang=true"
               ;;
             linux)
-              gn gen out/Release --args="${GN_ARGS} target_os=\"linux\" is_clang=true use_custom_libcxx=false"
+              GN_ARGS="$GN_ARGS target_os=\"linux\" is_clang=true use_custom_libcxx=false"
               ;;
             win)
-              gn gen out/Release --args="${GN_ARGS} target_os=\"win\" is_clang=true"
+              GN_ARGS="$GN_ARGS target_os=\"win\" is_clang=true"
               ;;
             android)
-              gn gen out/Release --args="${GN_ARGS} target_os=\"android\" is_clang=true android_ndk_root=\"$ANDROID_NDK\""
+              GN_ARGS="$GN_ARGS target_os=\"android\" is_clang=true android_ndk_root=\"${ANDROID_NDK}\""
               ;;
             ios)
-              gn gen out/Release --args="${GN_ARGS} target_os=\"ios\" is_clang=true"
+              GN_ARGS="$GN_ARGS target_os=\"ios\" is_clang=true"
               ;;
           esac
 
+          # 追加平台额外参数（如 iOS simulator）
+          GN_ARGS="$GN_ARGS ${{ matrix.gn_extra || '' }}"
+
+          gn gen out/Release --args="$GN_ARGS"
           echo "== GN 配置完成 =="
 
       # ── Ninja 编译 ──
@@ -230,10 +253,8 @@ jobs:
           PKG_DIR="$RUNNER_TEMP/libwebrtc-pkg"
           mkdir -p "$PKG_DIR/include" "$PKG_DIR/lib" "$PKG_DIR/src/base"
 
-          # 1. webrtc-sdk C++ 封装公共头文件
           cp -r libwebrtc/include/* "$PKG_DIR/include/"
 
-          # 2. Google WebRTC 内部头文件（封装实现依赖）
           for dir in api rtc_base pc media call modules system_wrappers; do
             [ -d "$dir" ] && cp -r "$dir" "$PKG_DIR/include/"
           done
@@ -242,12 +263,10 @@ jobs:
             cp -r third_party/abseil-cpp/absl "$PKG_DIR/include/third_party/"
           fi
 
-          # 3. 编译产物
           find out/Release -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" | while read f; do
             cp "$f" "$PKG_DIR/lib/"
           done
 
-          # 4. 封装实现源码（供 download_wrapper 编译）
           cp libwebrtc/src/*.cc libwebrtc/src/*.h "$PKG_DIR/src/" 2>/dev/null || true
           cp libwebrtc/src/base/*.cc "$PKG_DIR/src/base/" 2>/dev/null || true
 
@@ -260,7 +279,6 @@ jobs:
           zip -r "${{ matrix.asset }}" libwebrtc-pkg/
           ls -lh "${{ matrix.asset }}"
 
-      # ── 上传产物 ──
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
@@ -268,7 +286,6 @@ jobs:
           path: ${{ runner.temp }}/${{ matrix.asset }}
           retention-days: 30
 
-      # ── 发布 Release（标签触发时）──
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/libwebrtc-v')
         uses: softprops/action-gh-release@v2
