@@ -112,10 +112,11 @@ jobs:
           export PATH="$DW_TEMP/depot_tools:$PATH"
           # Windows 上 Git Bash 不会自动解析 .bat 后缀，需显式指定
           if [ "$RUNNER_OS" = "Windows" ]; then
-            echo "GCLIENT_CMD=gclient.bat" >> "$GITHUB_ENV"
+            GCLIENT_CMD="gclient.bat"
           else
-            echo "GCLIENT_CMD=gclient" >> "$GITHUB_ENV"
+            GCLIENT_CMD="gclient"
           fi
+          echo "GCLIENT_CMD=$GCLIENT_CMD" >> "$GITHUB_ENV"
           $GCLIENT_CMD --version
           echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
 
