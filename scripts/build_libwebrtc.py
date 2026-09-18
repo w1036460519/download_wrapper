@@ -113,10 +113,7 @@ def run_output(cmd, **kwargs):
 
 
 def gn_args_string(args: dict) -> str:
-    """将 dict 转为 GN --args 格式字符串。
-
-    例：{"is_debug": False, "target_cpu": "arm64"} → 'is_debug=false target_cpu="arm64"'
-    """
+    """将 dict 转为 GN --args 格式字符串（换行分隔）。"""
     parts = []
     for k, v in args.items():
         if isinstance(v, bool):
@@ -125,7 +122,7 @@ def gn_args_string(args: dict) -> str:
             parts.append(f'{k}="{v}"')
         else:
             parts.append(f"{k}={v}")
-    return " ".join(parts)
+    return "\n".join(parts)
 
 
 def append_github_env(key: str, value: str):
@@ -197,6 +194,10 @@ target_os = ['{target_os}']
 """)
     webrtc_src = src_dir / "src"
 
+    # Windows: 使用本地 Visual Studio，不下载 Google 私有工具链（CI 无 GCS 凭证）
+    if platform.system() == "Windows":
+        os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
+
     run(gclient_cmd("sync", "--no-history", "--shallow", "--jobs", "8", "-D"),
         cwd=str(src_dir))
 
@@ -266,7 +267,17 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
     def _gn(out_dir: str, extra: dict):
         args = {**common, **extra}
         args_str = gn_args_string(args)
-        run(["gn", "gen", out_dir, f"--args={args_str}"], cwd=str(webrtc_src))
+        try:
+            run(["gn", "gen", out_dir, f"--args={args_str}"], cwd=str(webrtc_src))
+        except subprocess.CalledProcessError:
+            # 重新执行并捕获 gn 的 stderr 以显示实际错误
+            result = subprocess.run(
+                ["gn", "gen", out_dir, f"--args={args_str}"],
+                cwd=str(webrtc_src), capture_output=True, text=True
+            )
+            if result.stderr:
+                print(f"\n[GN stderr]\n{result.stderr}")
+            raise
 
     if cfg.get("universal"):
         # macOS / iOS simulator：双架构
@@ -274,18 +285,22 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
             _gn("out/Release", {"target_cpu": "arm64", "target_os": "mac", "is_clang": True})
             _gn("out/Release-x64", {"target_cpu": "x64", "target_os": "mac", "is_clang": True})
         else:
-            # iOS simulator
+            # iOS simulator（CI 无代码签名证书）
             env = cfg.get("target_environment", "simulator")
+            ios_sign = {"ios_enable_code_signing": False}
             _gn("out/Release", {"target_cpu": "arm64", "target_os": "ios",
-                                "is_clang": True, "target_environment": env})
+                                "is_clang": True, "target_environment": env, **ios_sign})
             _gn("out/Release-x64", {"target_cpu": "x64", "target_os": "ios",
-                                    "is_clang": True, "target_environment": env})
+                                    "is_clang": True, "target_environment": env, **ios_sign})
     else:
         extra = {"target_cpu": cfg["target_cpu"], "target_os": target_os, "is_clang": True}
         if "extra" in cfg:
             extra.update(cfg["extra"])
         if cfg.get("needs_ndk") and ndk_path:
             extra["android_ndk_root"] = ndk_path
+        # iOS 设备构建同样禁用代码签名
+        if target_os == "ios":
+            extra["ios_enable_code_signing"] = False
         _gn("out/Release", extra)
 
 
