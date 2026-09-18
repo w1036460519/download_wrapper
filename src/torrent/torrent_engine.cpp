@@ -412,16 +412,14 @@ namespace dw {
                     std::filesystem::path fp(fs.file_path(i));
                     base_name = fp.filename().string();
                     is_dir = false;
-                    ext = fp.extension().string();
-                    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+                    ext = utils::file_extension(fp.string());
                     break;
                 }
             } else if (root_entries.size() == 1) {
                 base_name = root_entries.begin()->first;
                 is_dir = root_entries.begin()->second;
                 if (!is_dir) {
-                    ext = std::filesystem::path(base_name).extension().string();
-                    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+                    ext = utils::file_extension(base_name);
                 }
             } else if (root_entries.size() > 1) {
                 base_name = ev.name;
@@ -757,18 +755,15 @@ namespace dw {
         }
 
         // 采集 alert
-        void alert_loop(std::stop_token st) {
+        void alert_loop(const std::stop_token &st) {
             while (!st.stop_requested()) {
                 try {
-                    if (g_session) {
-                        g_session->wait_for_alert(std::chrono::milliseconds(g_interval_ms));
+                    if (g_session->wait_for_alert(std::chrono::milliseconds(1000))) {
                         std::vector<lt::alert *> alerts;
                         g_session->pop_alerts(&alerts);
                         for (const lt::alert *a: alerts) {
                             handle_alert(a);
                         }
-                    } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(g_interval_ms));
                     }
                 } catch (const std::exception &e) {
                     log_e("bt", "采集事件异常: %s", e.what());
