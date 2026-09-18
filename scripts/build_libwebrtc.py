@@ -107,6 +107,17 @@ def gclient_cmd(*args):
     return ["gclient"] + base_args
 
 
+def _depot_cmd(name: str, *args):
+    """构造 depot_tools 命令（gn / ninja 等）。
+
+    Windows 上 depot_tools 通过 .bat wrapper 调用，需经 cmd.exe。
+    """
+    base_args = list(args)
+    if platform.system() == "Windows":
+        return ["cmd.exe", "/c", f"{name}.bat"] + base_args
+    return [name] + base_args
+
+
 def run_output(cmd, **kwargs):
     """执行命令并返回 stdout。"""
     return subprocess.check_output(cmd, text=True, **kwargs).strip()
@@ -122,7 +133,7 @@ def gn_args_string(args: dict) -> str:
             parts.append(f'{k}="{v}"')
         else:
             parts.append(f"{k}={v}")
-    return "\n".join(parts)
+    return " ".join(parts)
 
 
 def append_github_env(key: str, value: str):
@@ -268,11 +279,11 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
         args = {**common, **extra}
         args_str = gn_args_string(args)
         try:
-            run(["gn", "gen", out_dir, f"--args={args_str}"], cwd=str(webrtc_src))
+            run(_depot_cmd("gn", "gen", out_dir, f"--args={args_str}"), cwd=str(webrtc_src))
         except subprocess.CalledProcessError:
             # 重新执行并捕获 gn 的 stderr 以显示实际错误
             result = subprocess.run(
-                ["gn", "gen", out_dir, f"--args={args_str}"],
+                _depot_cmd("gn", "gen", out_dir, f"--args={args_str}"),
                 cwd=str(webrtc_src), capture_output=True, text=True
             )
             if result.stderr:
@@ -319,7 +330,7 @@ def ninja_build(webrtc_src: Path, platform_name: str):
         dirs.append("out/Release-x64")
 
     for d in dirs:
-        run(["ninja", "-C", d, "default"], cwd=str(webrtc_src), env=env)
+        run(_depot_cmd("ninja", "-C", d, "default"), cwd=str(webrtc_src), env=env)
 
     # universal 合并
     if cfg.get("universal"):
