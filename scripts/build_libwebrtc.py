@@ -85,9 +85,14 @@ PLATFORMS = {
 
 
 def run(cmd, **kwargs):
-    """执行命令，失败时打印上下文后抛出。"""
-    print(f"\n$ {' '.join(str(c) for c in cmd)}")
-    subprocess.check_call(cmd, **kwargs)
+    """执行命令，失败时打印完整输出后抛出。"""
+    cmd_str = ' '.join(str(c) for c in cmd)
+    print(f"\n$ {cmd_str}")
+    try:
+        subprocess.check_call(cmd, **kwargs)
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERROR] 命令失败 (exit {e.returncode}): {cmd_str}")
+        raise
 
 
 def run_output(cmd, **kwargs):
@@ -151,8 +156,7 @@ def setup_depot_tools(temp_dir: Path) -> Path:
     # 触发 depot_tools 初始化（下载内部工具、Python 环境等）
     run(["python3", str(depot / "gclient.py"), "--version"])
 
-    # 禁止后续自动更新
-    os.environ["DEPOT_TOOLS_UPDATE"] = "0"
+    # 仅写入 CI 环境（后续步骤生效），不在当前进程设置，避免阻止 gclient sync 下载依赖
     append_github_env("DEPOT_TOOLS_UPDATE", "0")
 
     return depot
@@ -179,7 +183,6 @@ solutions = [
 ]
 target_os = ['{target_os}']
 """)
-
     webrtc_src = src_dir / "src"
     depot = temp_dir / "depot_tools"
     gclient_py = str(depot / "gclient.py")
@@ -412,6 +415,9 @@ def main():
     print("\n== Step 2: gclient sync ==")
     webrtc_src = configure_gclient(temp_dir, args.webrtc_branch, cfg["target_os"])
     append_github_env("WEBRTC_SRC", str(webrtc_src))
+
+    # sync 完成后禁止 depot_tools 自动更新
+    os.environ["DEPOT_TOOLS_UPDATE"] = "0"
 
     # 3. libwebrtc 集成
     print("\n== Step 3: libwebrtc 集成 ==")
