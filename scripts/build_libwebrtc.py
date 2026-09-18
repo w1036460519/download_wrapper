@@ -95,6 +95,18 @@ def run(cmd, **kwargs):
         raise
 
 
+def gclient_cmd(*args):
+    """构造 gclient 命令。
+
+    Windows: 通过 cmd.exe /c 调用 gclient.bat（触发 depot_tools bootstrap，捆绑 git 等工具）
+    其他平台: 直接调用 gclient
+    """
+    base_args = list(args)
+    if platform.system() == "Windows":
+        return ["cmd.exe", "/c", "gclient.bat"] + base_args
+    return ["gclient"] + base_args
+
+
 def run_output(cmd, **kwargs):
     """执行命令并返回 stdout。"""
     return subprocess.check_output(cmd, text=True, **kwargs).strip()
@@ -153,8 +165,8 @@ def setup_depot_tools(temp_dir: Path) -> Path:
                          ("core.fscache", "true")]:
             run(["git", "config", "--global", key, val])
 
-    # 触发 depot_tools 初始化（下载内部工具、Python 环境等）
-    run(["python3", str(depot / "gclient.py"), "--version"])
+    # 触发 depot_tools 初始化（bootstrap 捆绑 git 等工具）
+    run(gclient_cmd("--version"))
 
     # 仅写入 CI 环境（后续步骤生效），不在当前进程设置，避免阻止 gclient sync 下载依赖
     append_github_env("DEPOT_TOOLS_UPDATE", "0")
@@ -184,11 +196,8 @@ solutions = [
 target_os = ['{target_os}']
 """)
     webrtc_src = src_dir / "src"
-    depot = temp_dir / "depot_tools"
-    gclient_py = str(depot / "gclient.py")
 
-    run(["python3", gclient_py, "sync",
-         "--no-history", "--shallow", "--jobs", "8", "-D"],
+    run(gclient_cmd("sync", "--no-history", "--shallow", "--jobs", "8", "-D"),
         cwd=str(src_dir))
 
     return webrtc_src
