@@ -178,9 +178,10 @@ target_os = ['{target_os}']
 """)
     webrtc_src = src_dir / "src"
 
-    # Windows: 使用本地 Visual Studio，不下载 Google 私有工具链（CI 无 GCS 凭证）
+    # Windows: 使用 Google 预构建工具链（clang-cl + Windows SDK），无需本地 Visual Studio
+    # 工具链公开只读，匿名下载，无需 GCS 凭证
     if platform.system() == "Windows":
-        os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
+        os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "1"
 
     run(gclient_cmd("sync", "--no-history", "--shallow", "--jobs", "8", "-D"),
         cwd=str(src_dir))
