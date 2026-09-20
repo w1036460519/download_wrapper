@@ -48,11 +48,13 @@ PLATFORMS = {
     "windows-x64": {
         "target_os": "win",
         "target_cpu": "x64",
+        "extra": {"use_lld": False},
         "asset": "libwebrtc-windows-x64-release.zip",
     },
     "windows-arm64": {
         "target_os": "win",
         "target_cpu": "arm64",
+        "extra": {"use_lld": False},
         "asset": "libwebrtc-windows-arm64-release.zip",
     },
     "android-arm64": {
