@@ -415,7 +415,7 @@ namespace dw {
                     if (std::filesystem::exists(std::filesystem::path(ev.save_path) / base_name)) {
                         // 单文件-有重复  去除文件后缀，继续检查
                         log_i(key.c_str(), "文件冲突 %s", base_name.c_str());
-                        base_name = std::filesystem::path(base_name).stem();
+                        base_name = std::filesystem::path(base_name).stem().string();
                     } else {
                         // 单文件-无重复
                         log_i(key.c_str(), "文件无冲突 %s", base_name.c_str());
