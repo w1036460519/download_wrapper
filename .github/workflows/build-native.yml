@@ -6,15 +6,9 @@ on:
 
 env:
   # 固定 vcpkg 版本（发布 tag，可复现）；升级依赖时改这里即可
-  # 注意：msys2 上游镜像会定期清理旧包，过老的 tag 会导致 pkgconfig 等 msys 依赖下载失败，
-  # 需保持相对较新的 release tag
   VCPKG_REF: '2026.06.24'
-  # libwebrtc 自构建产物版本（build-libwebrtc.yml 发布的 release tag）；
-  # P2P 打洞库，通过 GitHub Release 预编译二进制提供，不走 vcpkg
+  # libwebrtc 自构建产物版本（build-libwebrtc.yml 发布的 release tag）
   LIBWEBRTC_RELEASE_TAG: 'libwebrtc-v1'
-  # 说明：vcpkg 的 x-gha 后端已于 2025 年 4 月随 GitHub Actions Cache API 变更被移除，
-  # 故不再配置 VCPKG_BINARY_SOURCES。vcpkg 默认启用 files provider，将二进制归档写入
-  # 各平台默认缓存目录，该目录由下方 actions/cache 步骤跨次构建持久化。
 
 jobs:
   build:
@@ -23,59 +17,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS：编译 arm64 + x86_64 后用 lipo 合并为单个 universal .dylib
-          # bincache 为 vcpkg 默认二进制缓存目录，供 actions/cache 持久化
           - name: macos-universal
             os: macos-latest
-            triplet: ''            # 见下方 macOS 专用步骤，单独处理双 triplet
-            output: download-macos-universal.dylib
             bincache: ~/.cache/vcpkg/archives
-          # Linux：x86_64 + arm64
           - name: linux-x64
             os: ubuntu-24.04
-            triplet: x64-linux
-            output: download-linux-x64.so
             bincache: ~/.cache/vcpkg/archives
           - name: linux-arm64
             os: ubuntu-24.04-arm
-            triplet: arm64-linux
-            output: download-linux-arm64.so
             bincache: ~/.cache/vcpkg/archives
-          # Windows：x64 + arm64（static-md：依赖静态链入 DLL，CRT 用系统动态运行时，产物自包含）
           - name: windows-x64
             os: windows-2022
-            triplet: x64-windows-static-md
-            output: download-windows-x64.dll
             bincache: ~\AppData\Local\vcpkg\archives
           - name: windows-arm64
             os: windows-2022
-            triplet: arm64-windows-static-md
-            output: download-windows-arm64.dll
             bincache: ~\AppData\Local\vcpkg\archives
-          # iOS：真机 arm64 静态库（.a）。iOS 不允许加载未签名独立动态库，
-          # 故编静态库并合并依赖为自包含胖库，随 Runner 链接
           - name: ios-arm64
             os: macos-latest
-            triplet: arm64-ios
-            output: download-ios-arm64.a
             bincache: ~/.cache/vcpkg/archives
-          # iOS：模拟器 universal（x86_64 + arm64 合并）
           - name: ios-simulator-universal
             os: macos-latest
-            triplet: ''            # 模拟器专用步骤，单独处理双 triplet
-            output: download-ios-simulator-universal.a
             bincache: ~/.cache/vcpkg/archives
-          # Android：arm64-v8a（真机）
           - name: android-arm64
             os: ubuntu-24.04
-            triplet: arm64-android
-            output: download-android-arm64.so
             bincache: ~/.cache/vcpkg/archives
-          # Android：x86_64（模拟器）
           - name: android-x64
             os: ubuntu-24.04
-            triplet: x64-android
-            output: download-android-x64.so
             bincache: ~/.cache/vcpkg/archives
 
     runs-on: ${{ matrix.os }}
@@ -84,10 +51,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # 缓存 vcpkg 的二进制归档目录（files provider 默认写入该目录）；
-      # 命中后 libtorrent/boost/openssl/curl 等重依赖无需重复编译。
-      # key 绑定平台 + vcpkg 版本 + vcpkg.json 哈希，依赖或版本变动时自动失效，
-      # restore-keys 提供退化匹配，保证部分依赖仍可复用。
+      # 缓存 vcpkg 二进制归档（命中后依赖无需重复编译）
       - name: Cache vcpkg binary archives
         uses: actions/cache@v5
         with:
@@ -97,20 +61,6 @@ jobs:
             vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-
             vcpkg-${{ matrix.name }}-
 
-      # 手动 clone 并 bootstrap vcpkg，固定到 VCPKG_REF 发布 tag
-      - name: Setup vcpkg
-        shell: bash
-        run: |
-          git clone https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
-          cd "$RUNNER_TEMP/vcpkg"
-          git checkout "$VCPKG_REF"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            ./bootstrap-vcpkg.bat -disableMetrics
-          else
-            ./bootstrap-vcpkg.sh -disableMetrics
-          fi
-          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
-
       # Linux 构建缺失的系统级依赖（libtorrent/boost 传递依赖需要）
       - name: Install Linux build deps
         if: runner.os == 'Linux'
@@ -118,286 +68,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y autoconf automake libtool pkg-config
 
-      # ── 下载 libwebrtc 预编译产物（P2P 模块依赖） ──
-      # 从自建 build-libwebrtc.yml 的 Release 下载（含 include/ + lib/ + src/），
-      # 解压到 third_party/libwebrtc/ 供 CMakeLists.txt 的 DW_LIBWEBRTC_DIR 消费。
-      # 若该平台尚无可用产物，优雅跳过 P2P 模块（下载主流程不受影响）。
-      - name: Download libwebrtc
+      # 构建（Python 脚本统一处理）
+      - name: Build
         shell: bash
         run: |
-          set -eu
-          REPO="${{ github.repository }}"
-          TAG="$LIBWEBRTC_RELEASE_TAG"
-          DEST="$PWD/third_party/libwebrtc"
-          mkdir -p "$DEST"
+          echo "== 构建前磁盘 =="
+          df -h / || true
 
-          # 矩阵名 → 产物 zip 名映射
-          case "${{ matrix.name }}" in
-            macos-*)              ASSET="libwebrtc-macos-release.zip" ;;
-            linux-x64)            ASSET="libwebrtc-linux-x64-release.zip" ;;
-            linux-arm64)          ASSET="libwebrtc-linux-arm64-release.zip" ;;
-            windows-x64)          ASSET="libwebrtc-windows-x64-release.zip" ;;
-            windows-arm64)        ASSET="libwebrtc-windows-arm64-release.zip" ;;
-            android-arm64)        ASSET="libwebrtc-android-arm64-release.zip" ;;
-            android-x64)          ASSET="libwebrtc-android-x64-release.zip" ;;
-            ios-arm64)            ASSET="libwebrtc-ios-arm64-release.zip" ;;
-            ios-simulator-*)      ASSET="libwebrtc-ios-simulator-release.zip" ;;
-            *)                    ASSET="" ;;
-          esac
+          python3 "${{ github.workspace }}/scripts/build_wrapper.py" \
+            --platform "${{ matrix.name }}" \
+            --vcpkg-ref "${{ env.VCPKG_REF }}" \
+            --workspace "${{ github.workspace }}" \
+            --temp-dir "${{ runner.temp }}"
 
-          if [ -z "$ASSET" ]; then
-            echo "跳过: 未知平台 ${{ matrix.name }}，P2P 模块未启用"
-            exit 0
-          fi
-
-          URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-          echo "下载 libwebrtc: $URL"
-          if curl -fSL --max-time 300 "$URL" -o libwebrtc.zip 2>/dev/null; then
-            # zip 内含 libwebrtc-pkg/ 顶层目录，提取后移动子内容
-            unzip -q libwebrtc.zip -d lw_tmp
-            if [ -d "lw_tmp/libwebrtc-pkg" ]; then
-              cp -r lw_tmp/libwebrtc-pkg/* "$DEST/"
-            else
-              cp -r lw_tmp/* "$DEST/"
-            fi
-            rm -rf lw_tmp libwebrtc.zip
-            echo "== libwebrtc 目录结构 =="
-            find "$DEST" -maxdepth 2 -type f | head -20
-            echo "include/ 文件数: $(find "$DEST/include" -type f 2>/dev/null | wc -l)"
-            echo "lib/ 文件数: $(find "$DEST/lib" -type f 2>/dev/null | wc -l)"
-            echo "src/ 文件数: $(find "$DEST/src" -type f 2>/dev/null | wc -l)"
-          else
-            echo "警告: libwebrtc 产物下载失败（${ASSET}），P2P 模块将跳过"
-            echo "       下载主流程不受影响"
-            rm -rf "$DEST"
-          fi
-
-      # ---------- macOS：universal 单文件 ----------
-      - name: Build (macOS universal)
-        if: matrix.name == 'macos-universal'
-        shell: bash
-        run: |
-          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          # 覆盖 triplet：将 vcpkg 依赖的 macOS 部署目标锁定到 14.0，
-          # 与主库、App 一致，避免最终 dylib 的 minos 被抬到构建机 SDK 版本。
-          export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
-
-          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
-
-          # arm64
-          cmake -B build-arm64 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-            -DVCPKG_TARGET_TRIPLET=arm64-osx \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
-          cmake --build build-arm64 --config Release
-
-          # x86_64
-          cmake -B build-x64 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-            -DVCPKG_TARGET_TRIPLET=x64-osx \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
-          cmake --build build-x64 --config Release
-
-          # 合并为 universal binary
-          mkdir -p dist
-          lipo -create \
-            build-arm64/download-macos-arm64.dylib \
-            build-x64/download-macos-x64.dylib \
-            -output dist/download-macos-universal.dylib
-
-          # strip 符号：Release 无调试信息但仍保留静态链入依赖的符号表。
-          # -x 只去除本地符号，保留动态库加载必需的导出符号，最稳妥。
-          echo "== strip 前 =="
-          ls -l dist
-          strip -x dist/download-macos-universal.dylib
-          echo "== strip 后 =="
-          ls -l dist
-
-          echo "== universal binary 架构验证 =="
-          lipo -info dist/download-macos-universal.dylib
-          file dist/download-macos-universal.dylib
-
-          echo "== 部署目标验证（各架构 minos 应为 14.0）=="
-          otool -l dist/download-macos-universal.dylib | grep -A3 LC_BUILD_VERSION || true
-
-      # ---------- Linux / Windows：单架构 ----------
-      - name: Build (${{ matrix.name }})
-        if: matrix.name == 'linux-x64' || matrix.name == 'linux-arm64' || matrix.name == 'windows-x64' || matrix.name == 'windows-arm64'
-        shell: bash
-        run: |
-          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          # Windows ARM64 需要显式指定架构（Visual Studio 生成器默认 x64）
-          ARCH_FLAG=""
-          if [[ "${{ matrix.name }}" == "windows-arm64" ]]; then
-            ARCH_FLAG="-A ARM64"
-          fi
-          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR" \
-            $ARCH_FLAG
-          cmake --build build --config Release
-
-          mkdir -p dist
-          # 兼容不同平台产物目录（多配置生成器会输出到 Release/ 子目录）
-          find build -name "${{ matrix.output }}" -exec cp {} dist/ \;
-
-          # strip 符号：仅 Linux 的 .so 需手动裁剪（仍带静态链入依赖的符号表）；
-          # Windows 符号已分离到 .pdb，.dll 本身无需 strip。
-          if [[ "${{ matrix.name }}" == linux-* ]]; then
-            echo "== strip 前 =="
-            ls -l dist
-            strip --strip-unneeded "dist/${{ matrix.output }}"
-            echo "== strip 后 =="
-          fi
-          ls -l dist
-
-      # ---------- iOS：真机 arm64 静态库，合并依赖为自包含胖静态库 ----------
-      - name: Build (iOS arm64 static)
-        if: matrix.name == 'ios-arm64'
-        shell: bash
-        run: |
-          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
-          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DDW_BUILD_SHARED=OFF \
-            -DVCPKG_TARGET_TRIPLET=arm64-ios \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
-          cmake --build build --config Release
-
-          mkdir -p dist
-          # STATIC 库只含 download_wrapper 自身符号；需将 vcpkg 依赖（curl/libtorrent/boost/openssl）
-          # 一并合并为自包含胖静态库，供 Runner 直接链接。
-          SELF_LIB=$(find build -name "download-ios-arm64.a" | head -1)
-          DEP_LIB_DIR=$(find . -type d -path "*vcpkg_installed/arm64-ios/lib" | head -1)
-          echo "self=$SELF_LIB deps=$DEP_LIB_DIR"
-          libtool -static -o dist/download-ios-arm64.a "$SELF_LIB" "$DEP_LIB_DIR"/*.a
-          echo "== 静态库架构验证 =="
-          lipo -info dist/download-ios-arm64.a
-
-      # ---------- iOS：模拟器 universal（x86_64 + arm64 合并）----------
-      - name: Build (iOS simulator universal)
-        if: matrix.name == 'ios-simulator-universal'
-        shell: bash
-        run: |
-          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          export VCPKG_OVERLAY_TRIPLETS="$PWD/vcpkg-triplets"
-
-          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
-
-          # arm64 模拟器（Apple Silicon Mac）
-          cmake -B build-sim-arm64 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_SYSROOT=iphonesimulator \
-            -DDW_BUILD_SHARED=OFF \
-            -DVCPKG_TARGET_TRIPLET=arm64-ios-simulator \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
-          cmake --build build-sim-arm64 --config Release
-
-          # x86_64 模拟器（Intel Mac）
-          cmake -B build-sim-x64 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_SYSROOT=iphonesimulator \
-            -DDW_BUILD_SHARED=OFF \
-            -DVCPKG_TARGET_TRIPLET=x64-ios-simulator \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
-          cmake --build build-sim-x64 --config Release
-
-          mkdir -p dist
-          # 合并各自依赖为自包含胖静态库
-          SELF_ARM64=$(find build-sim-arm64 -name "download-ios-simulator-arm64.a" | head -1)
-          SELF_X64=$(find build-sim-x64 -name "download-ios-simulator-x64.a" | head -1)
-          DEP_ARM64=$(find . -type d -path "*vcpkg_installed/arm64-ios-simulator/lib" | head -1)
-          DEP_X64=$(find . -type d -path "*vcpkg_installed/x64-ios-simulator/lib" | head -1)
-
-          # 先分别合并为单架构胖库
-          libtool -static -o "$RUNNER_TEMP/sim-arm64.a" "$SELF_ARM64" "$DEP_ARM64"/*.a
-          libtool -static -o "$RUNNER_TEMP/sim-x64.a" "$SELF_X64" "$DEP_X64"/*.a
-
-          # 再合并为 universal
-          lipo -create "$RUNNER_TEMP/sim-arm64.a" "$RUNNER_TEMP/sim-x64.a" \
-            -output dist/download-ios-simulator-universal.a
-          echo "== 模拟器 universal 架构验证 =="
-          lipo -info dist/download-ios-simulator-universal.a
-
-      # ---------- Android：arm64 / x64 动态库（.so，依赖静态链入自包含）----------
-      - name: Build (Android ${{ matrix.name }})
-        if: matrix.name == 'android-arm64' || matrix.name == 'android-x64'
-        shell: bash
-        run: |
-          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
-          echo "NDK=$ANDROID_NDK_HOME"
-          TOOLCHAIN="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          NDK_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
-          # 消费端项目必须显式 chainload NDK 工具链：triplet 只对构建依赖端口生效，
-          # 主项目仍需通过 VCPKG_CHAINLOAD_TOOLCHAIN_FILE + ANDROID_ABI 切到 NDK clang/lld，
-          # 否则会用宿主机 gcc/ld 链接 aarch64 静态库，报 "file in wrong format"
-          #
-          # API 级别对齐：curl(getifaddrs=API24)、boost.asio(aligned_alloc=API28) 等依赖
-          # 客观要求 Android 最低 API 28，主项目 ANDROID_PLATFORM 必须与之一致；
-          # 否则按 android-21 链接时 sysroot 缺这些符号，触发 undefined symbol 链接失败。
-          # 注意：App 侧 download_app 的 minSdkVersion 需同步 >= 28。
-
-          # 按 matrix 选择 ABI 和 triplet
-          if [ "${{ matrix.name }}" = "android-arm64" ]; then
-            ABI="arm64-v8a"
-            ANDROID_TRIPLET="arm64-android"
-          else
-            ABI="x86_64"
-            ANDROID_TRIPLET="x64-android"
-          fi
-
-          LIBWEBRTC_DIR="$PWD/third_party/libwebrtc"
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DVCPKG_TARGET_TRIPLET="$ANDROID_TRIPLET" \
-            -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-            -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
-            -DANDROID_ABI="$ABI" \
-            -DANDROID_PLATFORM=android-28 \
-            -DDW_LIBWEBRTC_DIR="$LIBWEBRTC_DIR"
-          cmake --build build --config Release
-
-          mkdir -p dist
-          find build -name "${{ matrix.output }}" -exec cp {} dist/ \;
-
-          # strip 符号：NDK 直接输出的 .so 保留了完整符号表与 C++ 异常展开信息，
-          # 加上静态链入的 libtorrent/boost/openssl/curl，未裁剪时体积可达数十 MB。
-          # 正常 Gradle/AGP 打包 APK 时会自动 strip，此处取裸产物需手动裁剪，
-          # 与其他平台产物体积对齐。
-          STRIP=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -name 'llvm-strip' | head -1)
-          echo "strip=$STRIP"
-          echo "== strip 前 =="
-          ls -l dist
-          "$STRIP" --strip-unneeded "dist/${{ matrix.output }}"
-          echo "== strip 后 =="
-          ls -l dist
+          echo "== 构建后磁盘 =="
+          df -h / || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: download_wrapper-${{ matrix.name }}
-          path: dist/${{ matrix.output }}
+          path: dist/*
           if-no-files-found: error
 
   # ========== 发布：推送 v* 标签时，汇总全平台产物并创建 GitHub Release ==========
@@ -405,18 +96,15 @@ jobs:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
-    # 仅当推送 v* 标签时发布；日常 main push / PR 不触发
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: write   # 使用内置 GITHUB_TOKEN 创建 Release，无需额外 token
+      contents: write
     steps:
-      # 下载所有平台的构建产物（每个 job 一个 artifact）
       - name: Download all artifacts
         uses: actions/download-artifact@v6
         with:
           path: artifacts
 
-      # 展平目录：CMake 已按 download-{platform}-{arch}.{ext} 命名，直接收集
       - name: Collect release assets
         run: |
           mkdir -p release
