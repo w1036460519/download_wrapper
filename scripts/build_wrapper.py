@@ -432,6 +432,8 @@ def main():
     parser.add_argument("--temp-dir",
                         default=os.environ.get("RUNNER_TEMP", "/tmp"),
                         help="临时目录")
+    parser.add_argument("--libwebrtc-dir",
+                        help="本地 libwebrtc 目录（跳过下载）")
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
@@ -451,7 +453,13 @@ def main():
 
     # 2. libwebrtc
     print("\n== Step 2: libwebrtc ==")
-    libwebrtc_dir = download_libwebrtc(workspace, args.platform)
+    if args.libwebrtc_dir:
+        # 使用本地 libwebrtc 目录（合并工作流场景）
+        libwebrtc_dir = Path(args.libwebrtc_dir).resolve()
+        print(f"使用本地 libwebrtc: {libwebrtc_dir}")
+    else:
+        # 从 GitHub Release 下载
+        libwebrtc_dir = download_libwebrtc(workspace, args.platform)
 
     # 3. 构建
     print("\n== Step 3: CMake 构建 ==")

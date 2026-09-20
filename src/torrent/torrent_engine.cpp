@@ -40,11 +40,9 @@
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/hex.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <map>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -129,7 +127,6 @@ namespace dw {
         // 处理 piece 完成事件（piece_finished_alert）
         // 基于 bitfield 位运算收集文件级区间
         void handle_piece_finished(const lt::torrent_handle &h, const lt::piece_index_t piece) {
-            if (!g_task_manager || !h.is_valid()) return;
             std::shared_ptr<const lt::torrent_info> ti;
             try {
                 ti = h.torrent_file();
@@ -139,6 +136,13 @@ namespace dw {
             if (!ti) return;
             const std::string key = info_hash_hex(h);
             if (key.empty()) return;
+            if (!h.is_valid() || !g_task_manager) {
+                TorrentEngine::post_fail(key, "无效任务");
+                log_e(key.c_str(), "任务管理器异常: handle=%d, task_manager=%p",
+                      h.is_valid(), static_cast<void *>(g_task_manager));
+                return;
+            }
+
             const lt::file_storage &fs = ti->layout();
             if (const lt::piece_index_t last = ti->last_piece();
                 piece < lt::piece_index_t{0} || piece > last)
@@ -243,7 +247,6 @@ namespace dw {
             ev.download_rate = static_cast<double>(s.download_payload_rate);
             ev.upload_rate = static_cast<double>(s.upload_payload_rate);
             ev.total_upload = s.all_time_upload;
-            ev.name = s.name;
             return ev;
         }
 
@@ -351,12 +354,6 @@ namespace dw {
                 return;
             }
 
-
-            auto send_error = [&](const std::string &msg) {
-                log_e(key.c_str(), "%s", msg.c_str());
-                TorrentEngine::post_fail(key, msg);
-            };
-
             const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
             if (!ti) {
                 TorrentEngine::post_fail(key, "解析失败");
@@ -388,6 +385,7 @@ namespace dw {
                 ev.original_root_name = base_name;
                 if (!ev.is_dir) {
                     // 单文件
+                    ev.ext = utils::file_extension(base_name);
                     if (std::filesystem::exists(std::filesystem::path(ev.save_path) / base_name)) {
                         // 单文件-有重复  去除文件后缀，继续检查
                         log_i(key.c_str(), "文件冲突 %s", base_name.c_str());
@@ -395,7 +393,6 @@ namespace dw {
                     } else {
                         // 单文件-无重复
                         log_i(key.c_str(), "文件无冲突 %s", base_name.c_str());
-                        ev.ext = utils::file_extension(base_name);
                     }
                 }
             } else if (root_entries.size() > 1) {
@@ -416,10 +413,10 @@ namespace dw {
                 ev.is_dir = true;
                 log_i(key.c_str(), "文件/目录冲突 %s", base_name.c_str());
                 try {
-                    h.move_storage(ev.root_name);
+                    h.move_storage((std::filesystem::path(ev.save_path) / ev.root_name).string());
                 } catch (const std::exception &e) {
                     log_e(key.c_str(), "move_storage 异常: %s", e.what());
-                    send_error("解析失败");
+                    TorrentEngine::post_fail(key, "解析失败");
                 }
             } else {
                 // 无冲突 发送解析完成事件
@@ -481,7 +478,7 @@ namespace dw {
                 const std::string key = info_hash_hex(te->handle);
                 log_e(key.c_str(), "下载错误: %s", te->error.message().c_str());
                 if (key.empty()) return;
-                TorrentEngine::post_fail(key, te->error.message());
+                TorrentEngine::post_fail(key, "下载失败");
             }
             // 文件错误
             else if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
@@ -489,21 +486,21 @@ namespace dw {
                 log_e(key.c_str(), "文件错误 file: %s, msg: %s, errno: %d",
                       fe->filename(), fe->error.message().c_str(), fe->error.value());
                 if (key.empty()) return;
-                TorrentEngine::post_fail(key, fe->error.message());
+                TorrentEngine::post_fail(key, "文件错误");
             }
             // 种子冲突：两个磁力链接解析到同一 torrent，双方进入 error 状态
             else if (const auto *tc = lt::alert_cast<lt::torrent_conflict_alert>(a)) {
                 const std::string key = info_hash_hex(tc->handle);
                 log_e(key.c_str(), "种子冲突: 两个磁力链接解析到同一 torrent");
                 if (key.empty()) return;
-                TorrentEngine::post_error(key, "种子冲突");
+                TorrentEngine::post_error(key, "无效任务");
             }
             // 元数据解析失败：info-hash 校验不通过，libtorrent 自动重试，重试耗尽后 torrent 进入 error 状态
             else if (const auto *mf = lt::alert_cast<lt::metadata_failed_alert>(a)) {
                 const std::string key = info_hash_hex(mf->handle);
                 log_e(key.c_str(), "元数据解析失败: %s", mf->error.message().c_str());
                 if (key.empty()) return;
-                TorrentEngine::post_fail(key, mf->error.message());
+                TorrentEngine::post_fail(key, "解析失败");
             }
             // 存储移动失败：move_storage() 调用失败，torrent 进入 error 状态
             else if (const auto *smf = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
@@ -511,7 +508,7 @@ namespace dw {
                 log_e(key.c_str(), "存储移动失败: %s, errno: %d, op=%d",
                       smf->error.message().c_str(), smf->error.value(), static_cast<int>(smf->op));
                 if (key.empty()) return;
-                TorrentEngine::post_error(key, smf->error.message());
+                TorrentEngine::post_error(key, "文件错误");
             }
             // 断点续传数据就绪
             else if (const auto *rd = lt::alert_cast<lt::save_resume_data_alert>(a)) {
@@ -557,6 +554,7 @@ namespace dw {
                 ev.root_name = root_name;
                 ev.save_path = new_path;
                 ev.is_dir = true;
+                ev.ext = utils::file_extension(original_root_name);
                 TorrentEngine::post_event(std::move(ev));
             }
             // 暂停
