@@ -34,14 +34,6 @@ env:
 jobs:
   build:
     name: libwebrtc-${{ matrix.name }}
-    if: >-
-      inputs.platforms == 'all' ||
-      (inputs.platforms == 'macos' && contains(matrix.name, 'macos')) ||
-      (inputs.platforms == 'linux' && contains(matrix.name, 'linux')) ||
-      (inputs.platforms == 'windows' && contains(matrix.name, 'windows')) ||
-      (inputs.platforms == 'android' && contains(matrix.name, 'android')) ||
-      (inputs.platforms == 'ios' && contains(matrix.name, 'ios'))
-
     strategy:
       fail-fast: false
       matrix:
@@ -62,14 +54,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Check platform filter
+        id: filter
+        shell: bash
+        run: |
+          PLATFORM="${{ matrix.name }}"
+          SELECTED="${{ inputs.platforms || 'all' }}"
+          if [ "$SELECTED" = "all" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "macos" ] && [[ "$PLATFORM" == macos* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "linux" ] && [[ "$PLATFORM" == linux* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "windows" ] && [[ "$PLATFORM" == windows* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "android" ] && [[ "$PLATFORM" == android* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "ios" ] && [[ "$PLATFORM" == ios* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Normalize paths
+        if: steps.filter.outputs.run == 'true'
         shell: bash
         run: |
           DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
           echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
 
       - name: Setup Android NDK
-        if: matrix.target_os == 'android'
+        if: steps.filter.outputs.run == 'true' && matrix.target_os == 'android'
         shell: bash
         run: |
           NDK=$(echo "${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" | tr '\\' '/')
@@ -77,6 +92,7 @@ jobs:
 
       # L1: depot_tools 缓存（工具链稳定，极少变化）
       - name: Cache depot_tools
+        if: steps.filter.outputs.run == 'true'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/depot_tools
@@ -84,6 +100,7 @@ jobs:
 
       # L2: WebRTC 源码 + 编译产物缓存（与 build-wrapper.yml 共享）
       - name: Cache libwebrtc
+        if: steps.filter.outputs.run == 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -94,6 +111,7 @@ jobs:
             libwebrtc-cache-${{ matrix.name }}-
 
       - name: Build
+        if: steps.filter.outputs.run == 'true'
         shell: bash
         env:
           WEBRTC_BRANCH: ${{ inputs.webrtc_branch || 'm144_release' }}
@@ -110,6 +128,7 @@ jobs:
           df -h / || true
 
       - name: Upload artifact
+        if: steps.filter.outputs.run == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: libwebrtc-${{ matrix.name }}

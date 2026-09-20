@@ -88,6 +88,15 @@ namespace dw {
         std::vector<uint8_t> load_resume(const std::string &client_id, dw_protocol_t proto,
                                          const std::string &natural_key);
 
+        /// 保存任务来源（save_path / magnet_link / torrent_file），用于 resume data 尚未生成时的兜底恢复。
+        void save_resume_source(const std::string &client_id, dw_protocol_t proto,
+                                const std::string &natural_key,
+                                const std::string &save_path,
+                                const std::string &magnet_link, const std::string &torrent_file);
+        /// 一次性加载全部恢复信息（data + magnet + torrent）。
+        TaskStore::ResumeInfo load_resume_info(const std::string &client_id, dw_protocol_t proto,
+                                               const std::string &natural_key);
+
         /// 读取任务保存目录（三要素定位）；任务不存在返回空串。
         std::string load_save_path(const std::string &client_id, dw_protocol_t proto,
                                    const std::string &natural_key);

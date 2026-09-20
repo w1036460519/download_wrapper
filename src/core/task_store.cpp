@@ -108,6 +108,9 @@ namespace dw {
                 protocol    INTEGER NOT NULL,
                 natural_key TEXT NOT NULL,
                 data BLOB,
+                save_path TEXT,
+                magnet_link TEXT,
+                torrent_file TEXT,
                 saved_at INTEGER,
                 PRIMARY KEY (client_id, protocol, natural_key)
             );
@@ -322,6 +325,68 @@ namespace dw {
             sqlite3_step(st);
             sqlite3_finalize(st);
         }
+    }
+
+    void TaskStore::save_resume_source(const std::string &client_id, dw_protocol_t protocol,
+                                       const std::string &natural_key,
+                                       const std::string &save_path,
+                                       const std::string &magnet_link,
+                                       const std::string &torrent_file) const {
+        // 仅写入来源字段（save_path / magnet_link / torrent_file），不影响 data 列；
+        // 使用 INSERT ... ON CONFLICT DO UPDATE 保留已有 data。
+        constexpr auto sql = R"(
+            INSERT INTO resume_data (client_id, protocol, natural_key, save_path, magnet_link, torrent_file, saved_at)
+            VALUES (:client_id, :protocol, :natural_key, :save_path, :magnet_link, :torrent_file, :saved_at)
+            ON CONFLICT(client_id, protocol, natural_key) DO UPDATE SET
+                save_path = excluded.save_path,
+                magnet_link = excluded.magnet_link,
+                torrent_file = excluded.torrent_file;
+        )";
+        sqlite3_stmt *st = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
+        bind_text(st, ":client_id", client_id);
+        bind_int(st, ":protocol", static_cast<int>(protocol));
+        bind_text(st, ":natural_key", natural_key);
+        bind_text(st, ":save_path", save_path);
+        bind_text(st, ":magnet_link", magnet_link);
+        bind_text(st, ":torrent_file", torrent_file);
+        bind_int64(st, ":saved_at", now_unix_ms());
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+
+    TaskStore::ResumeInfo TaskStore::load_resume_info(const std::string &client_id, const dw_protocol_t protocol,
+                                                      const std::string &natural_key) const {
+        ResumeInfo info;
+        constexpr auto sql =
+                "SELECT data, save_path, magnet_link, torrent_file FROM resume_data WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
+        sqlite3_stmt *st = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return info;
+        bind_text(st, ":client_id", client_id);
+        bind_int(st, ":protocol", static_cast<int>(protocol));
+        bind_text(st, ":natural_key", natural_key);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            // data (BLOB)
+            if (const void *blob = sqlite3_column_blob(st, 0);
+                blob && sqlite3_column_bytes(st, 0) > 0) {
+                const auto *p = static_cast<const uint8_t *>(blob);
+                info.data.assign(p, p + sqlite3_column_bytes(st, 0));
+            }
+            // save_path (TEXT)
+            if (const char *s = reinterpret_cast<const char *>(sqlite3_column_text(st, 1)); s) {
+                info.save_path = s;
+            }
+            // magnet_link (TEXT)
+            if (const char *m = reinterpret_cast<const char *>(sqlite3_column_text(st, 2)); m) {
+                info.magnet_link = m;
+            }
+            // torrent_file (TEXT)
+            if (const char *t = reinterpret_cast<const char *>(sqlite3_column_text(st, 3)); t) {
+                info.torrent_file = t;
+            }
+        }
+        sqlite3_finalize(st);
+        return info;
     }
 
     // ---- 文件目录表（file_records）----

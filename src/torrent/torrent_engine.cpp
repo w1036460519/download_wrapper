@@ -91,29 +91,72 @@ namespace dw {
         lt::torrent_handle find_handle(const std::string &info_hash,
                                        const std::string &client_id = {},
                                        const dw_protocol_t protocol = DW_PROTOCOL_TORRENT) {
-            if (!g_session || info_hash.empty()) return {};
+            if (info_hash.empty() || client_id.empty()) {
+                return {};
+            }
+            if (!g_session || !g_task_manager) {
+                log_e(info_hash.c_str(), "任务管理器异常: session=%p, task_manager=%p",
+                      static_cast<void *>(g_session.get()), static_cast<void *>(g_task_manager));
+                return {};
+            }
             lt::sha1_hash h;
             if (lt::aux::from_hex(info_hash, h.data())) {
-                if (auto th = g_session->find_torrent(h); th.is_valid()) return th;
+                if (auto th = g_session->find_torrent(h); th.is_valid()) {
+                    return th;
+                }
             }
             for (const auto handles = g_session->get_torrents();
                  const auto &th: handles) {
-                if (info_hash_hex(th) == info_hash) return th;
-            }
-            if (client_id.empty() || !g_task_manager) return {};
-            const auto resume = g_task_manager->load_resume(client_id, protocol, info_hash);
-            if (resume.empty()) return {};
-            try {
-                const lt::span<const char> buf(
-                    reinterpret_cast<const char *>(resume.data()),
-                    static_cast<std::ptrdiff_t>(resume.size()));
-                lt::add_torrent_params atp = lt::read_resume_data(buf);
-                for (const auto &t: g_default_trackers) {
-                    atp.trackers.emplace_back(t);
+                if (info_hash_hex(th) == info_hash) {
+                    return th;
                 }
-                atp.flags = lt::torrent_flags::update_subscribe
-                            | lt::torrent_flags::need_save_resume
-                            | lt::torrent_flags::default_dont_download;
+            }
+
+            const auto [data, save_path, magnet_link, torrent_file]
+                    = g_task_manager->load_resume_info(client_id, protocol, info_hash);
+            lt::add_torrent_params atp;
+            bool atp_ok = false;
+
+            if (!data.empty()) {
+                try {
+                    const lt::span<const char> buf(
+                        reinterpret_cast<const char *>(data.data()),
+                        static_cast<std::ptrdiff_t>(data.size()));
+                    atp = lt::read_resume_data(buf);
+                    atp_ok = true;
+                } catch (const std::exception &e) {
+                    log_e(info_hash.c_str(), "resume data 解析失败: %s", e.what());
+                }
+            }
+            if (!atp_ok && !magnet_link.empty()) {
+                lt::error_code ec;
+                lt::parse_magnet_uri(magnet_link, atp, ec);
+                if (!ec) {
+                    atp.save_path = save_path;
+                    atp_ok = true;
+                }
+            }
+            if (!atp_ok && !torrent_file.empty()) {
+                lt::error_code ec;
+                const auto loaded =
+                        lt::load_torrent_file(torrent_file, ec, lt::load_torrent_limits{});
+                if (!ec) {
+                    atp.save_path = save_path;
+                    atp.ti = loaded.ti;
+                    atp_ok = true;
+                }
+            }
+            if (!atp_ok) {
+                log_e(info_hash.c_str(), "无效恢复数据");
+                return {};
+            }
+            for (const auto &t: g_default_trackers) {
+                atp.trackers.emplace_back(t);
+            }
+            atp.flags = lt::torrent_flags::update_subscribe
+                        | lt::torrent_flags::need_save_resume
+                        | lt::torrent_flags::default_dont_download;
+            try {
                 if (auto handle = g_session->add_torrent(std::move(atp)); handle.is_valid()) {
                     log_i(info_hash.c_str(), "handle 构建成功");
                     return handle;
@@ -228,26 +271,6 @@ namespace dw {
                     TorrentEngine::post_event(std::move(ev));
                 }
             }
-        }
-
-        // 处理 state_update_alert 事件
-        EngineEvent make_status_update_event(const lt::torrent_status &s, const std::string &key) {
-            if (s.errc) {
-                log_e(key.c_str(), "任务发生错误. code: %d, msg: %s",
-                      s.errc.value(), s.errc.message().c_str());
-                TorrentEngine::post_fail(key, s.errc.message());
-                return {};
-            }
-            EngineEvent ev;
-            ev.type = EngineEventType::STATUS_UPDATE;
-            ev.engine_key = key;
-            ev.total_size = s.total_wanted;
-            ev.total_done = s.total_done;
-            ev.progress = static_cast<double>(s.progress);
-            ev.download_rate = static_cast<double>(s.download_payload_rate);
-            ev.upload_rate = static_cast<double>(s.upload_payload_rate);
-            ev.total_upload = s.all_time_upload;
-            return ev;
         }
 
         /**
@@ -433,9 +456,22 @@ namespace dw {
                 for (const lt::torrent_status &s: su->status) {
                     const std::string key = info_hash_hex(s.handle);
                     if (key.empty()) continue;
-                    EngineEvent ev = make_status_update_event(s, key);
-                    if (!ev.engine_key.empty())
+                    if (s.errc) {
+                        log_e(key.c_str(), "任务发生错误. code: %d, msg: %s",
+                              s.errc.value(), s.errc.message().c_str());
+                        TorrentEngine::post_fail(key, s.errc.message());
+                    } else {
+                        EngineEvent ev;
+                        ev.type = EngineEventType::STATUS_UPDATE;
+                        ev.engine_key = key;
+                        ev.total_size = s.total_wanted;
+                        ev.total_done = s.total_done;
+                        ev.progress = static_cast<double>(s.progress);
+                        ev.download_rate = static_cast<double>(s.download_payload_rate);
+                        ev.upload_rate = static_cast<double>(s.upload_payload_rate);
+                        ev.total_upload = s.all_time_upload;
                         TorrentEngine::post_event(std::move(ev));
+                    }
                 }
             }
             // 添加任务
@@ -525,36 +561,24 @@ namespace dw {
                     log_e(key.c_str(), "断点续传数据保存失败: %s", e.what());
                 }
             }
-            // 存储迁移完成：发送 PARSED 事件
+            // 存储迁移完成（说明发生了重名）：发送 PARSED 事件
             else if (const auto *sm = lt::alert_cast<lt::storage_moved_alert>(a)) {
                 const std::string key = info_hash_hex(sm->handle);
                 if (key.empty()) return;
 
-                const std::string new_path = sm->storage_path();
-                const std::string root_name = std::filesystem::path(new_path).filename().string();
+                const std::filesystem::path full_path(sm->storage_path());
+                const std::string root_name = full_path.filename().string();
+                const std::string save_path = full_path.parent_path().string();
 
-                // 从 torrent info 推导原始名称
-                std::string original_root_name;
-                if (const auto ti = sm->handle.torrent_file()) {
-                    const auto &fs = ti->layout();
-                    if (fs.num_files() > 0) {
-                        std::filesystem::path fp(fs.file_path(0));
-                        original_root_name = fp.begin() != fp.end() ? fp.begin()->string() : ti->name();
-                    } else {
-                        original_root_name = ti->name();
-                    }
-                }
-                log_i(key.c_str(), "存储迁移完成 -> '%s'，root_name='%s'，original_root_name='%s'",
-                      new_path.c_str(), root_name.c_str(), original_root_name.c_str());
+                log_i(key.c_str(), "存储迁移完成 -> '%s'，root_name='%s'，save_path='%s'",
+                      full_path.c_str(), root_name.c_str(), save_path.c_str());
 
                 EngineEvent ev;
                 ev.type = EngineEventType::PARSED;
                 ev.engine_key = key;
-                ev.original_root_name = original_root_name;
                 ev.root_name = root_name;
-                ev.save_path = new_path;
+                ev.save_path = save_path;
                 ev.is_dir = true;
-                ev.ext = utils::file_extension(original_root_name);
                 TorrentEngine::post_event(std::move(ev));
             }
             // 暂停

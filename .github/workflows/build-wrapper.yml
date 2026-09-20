@@ -34,15 +34,6 @@ env:
 jobs:
   build:
     name: wrapper-${{ matrix.name }}
-    if: >-
-      github.event_name == 'push' ||
-      inputs.platforms == 'all' ||
-      (inputs.platforms == 'macos' && contains(matrix.name, 'macos')) ||
-      (inputs.platforms == 'linux' && contains(matrix.name, 'linux')) ||
-      (inputs.platforms == 'windows' && contains(matrix.name, 'windows')) ||
-      (inputs.platforms == 'android' && contains(matrix.name, 'android')) ||
-      (inputs.platforms == 'ios' && contains(matrix.name, 'ios'))
-
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +81,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Check platform filter
+        id: filter
+        shell: bash
+        run: |
+          PLATFORM="${{ matrix.name }}"
+          SELECTED="${{ inputs.platforms || 'all' }}"
+          if [ "$SELECTED" = "all" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "macos" ] && [[ "$PLATFORM" == macos* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "linux" ] && [[ "$PLATFORM" == linux* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "windows" ] && [[ "$PLATFORM" == windows* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "android" ] && [[ "$PLATFORM" == android* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SELECTED" = "ios" ] && [[ "$PLATFORM" == ios* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Normalize paths
+        if: steps.filter.outputs.run == 'true'
         shell: bash
         run: |
           DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
@@ -98,6 +112,7 @@ jobs:
 
       # 从缓存读取 libwebrtc 构建产物（与 build-libwebrtc.yml 共享）
       - name: Cache libwebrtc (from build-libwebrtc workflow)
+        if: steps.filter.outputs.run == 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -109,6 +124,7 @@ jobs:
 
       # 缓存 vcpkg 二进制归档
       - name: Cache vcpkg binary archives
+        if: steps.filter.outputs.run == 'true'
         uses: actions/cache@v5
         with:
           path: ${{ matrix.bincache }}
@@ -119,6 +135,7 @@ jobs:
 
       # 缓存 CMake 构建产物（增量编译）
       - name: Cache CMake build
+        if: steps.filter.outputs.run == 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -131,13 +148,14 @@ jobs:
 
       # Linux 系统依赖
       - name: Install Linux build deps
-        if: runner.os == 'Linux'
+        if: steps.filter.outputs.run == 'true' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y autoconf automake libtool pkg-config
 
       # 构建
       - name: Build
+        if: steps.filter.outputs.run == 'true'
         shell: bash
         run: |
           echo "== 构建前磁盘 =="
@@ -154,6 +172,7 @@ jobs:
           df -h / || true
 
       - name: Upload artifact
+        if: steps.filter.outputs.run == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: download_wrapper-${{ matrix.name }}

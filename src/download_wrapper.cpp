@@ -392,6 +392,17 @@ DW_API int32_t dw_add_task(const dw_protocol_t protocol,
     }
 
     log_i(task_key.c_str(), "添加任务完成: rc=%d code=%d", rc, out_result->code);
+
+    // BT 任务保存来源（save_path / magnet_link / torrent_file），用于 resume data 尚未生成时的兜底恢复
+    if (rc == 0 && protocol == DW_PROTOCOL_TORRENT) {
+        const std::string save_path = params->save_path ? params->save_path : "";
+        const std::string magnet = params->magnet_link ? params->magnet_link : "";
+        const std::string torrent = params->torrent_file ? params->torrent_file : "";
+        if (!magnet.empty() || !torrent.empty()) {
+            tm->save_resume_source(client_id, protocol, task_key, save_path, magnet, torrent);
+        }
+    }
+
     return rc;
 }
 

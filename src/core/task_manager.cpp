@@ -247,7 +247,8 @@ namespace dw {
                     task_record.task_protocol = proto;
                     task_record.task_natural_key = key;
                     task_record.save_path = params->save_path ? params->save_path : "";
-                    // magnet_link / torrent_file 不入 FileRecord：引擎经 info_hash 兆底或 resume_data 重建。
+                    // magnet_link / torrent_file 不入 FileRecord：由 dw_add_task 写入 resume_data 表，
+                    // 用于 resume data 尚未生成时的兜底恢复。
                     // trackers 不持久化：直接由引擎处理，不存入 FileRecord。
                     if (params->file_indexes && params->file_index_size > 0) {
                         task_record.file_indexes.assign(params->file_indexes,
@@ -387,6 +388,20 @@ namespace dw {
                                                   const std::string &natural_key) {
         std::lock_guard<std::mutex> lock(mtx_);
         return store_.load_resume(client_id, proto, natural_key);
+    }
+
+    void TaskManager::save_resume_source(const std::string &client_id, const dw_protocol_t proto,
+                                         const std::string &natural_key,
+                                         const std::string &save_path,
+                                         const std::string &magnet_link, const std::string &torrent_file) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        store_.save_resume_source(client_id, proto, natural_key, save_path, magnet_link, torrent_file);
+    }
+
+    TaskStore::ResumeInfo TaskManager::load_resume_info(const std::string &client_id, const dw_protocol_t proto,
+                                                        const std::string &natural_key) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return store_.load_resume_info(client_id, proto, natural_key);
     }
 
     std::string TaskManager::load_save_path(const std::string &client_id, const dw_protocol_t proto,
@@ -582,7 +597,7 @@ namespace dw {
                 rec->message = event.message;
                 // 终态即时写（保留失败展示，用户手动重试或调度器自动重试）
                 store_.update_file_record_status(rec->client_id, rec->task_protocol, rec->task_natural_key,
-                                                 rec->status, event.reason, event.message);
+                                                 static_cast<dw_task_status_t>(rec->status), event.reason, event.message);
                 log_e(key.c_str(), "下载失败 retryable=%d msg=%s", retryable, event.message.c_str());
                 schedule_needed_ = true;
                 break;
