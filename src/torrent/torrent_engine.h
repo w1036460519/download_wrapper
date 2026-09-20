@@ -6,6 +6,7 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
+#include "internal/downloader_internal.h"
 #include "internal/engine_interface.h"
 #include "utils/memory_util.h"
 
@@ -148,6 +149,17 @@ public:
      */
     void sweep() override;
 
+    // ---- 事件投递工具方法（固定 protocol=BT、client_id 取自 TaskManager）----
+
+    /// 投递事件：自动填充 protocol=BT 与 client_id，内部判空 g_task_manager。
+    static void post_event(EngineEvent ev);
+
+    /// 发送可重试失败事件（对应 DW_TASK_STATUS_FAIL）。
+    static void post_fail(const std::string &key, const std::string &message);
+
+    /// 发送不可重试错误事件（对应 DW_TASK_STATUS_ERROR）。
+    static void post_error(const std::string &key, const std::string &message);
+
 private:
     bool initialized_ = false;
 
@@ -157,14 +169,6 @@ private:
     static void apply_file_priorities(const std::string &task_id,
                                       const std::string &client_id,
                                       const std::vector<int32_t> &priority_file_indexes);
-
-    // ---- 事件投递工具方法（固定 protocol=BT、client_id 取自 TaskManager）----
-
-    /// 发送可重试失败事件（对应 DW_TASK_STATUS_FAIL）。
-    static void post_fail(const std::string &key, const std::string &message);
-
-    /// 发送不可重试错误事件（对应 DW_TASK_STATUS_ERROR）。
-    static void post_error(const std::string &key, const std::string &message);
 };
 
 } // namespace dw

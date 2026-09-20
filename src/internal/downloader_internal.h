@@ -59,6 +59,8 @@ namespace dw {
         std::string name; // 种子/文件名（HTTP 探测定名或 BT 元数据）
         std::string save_path; // 引擎当前 save_path
         std::string original_name; // 重名/包装前的原始目录/文件名（未重名时与 content_root 相同）
+        std::string original_root_name;
+        std::string root_name;
         std::string content_root; // 磁盘根目录名（重名判定后的最终名称）
         bool is_dir = true; // 内容是否为目录（单文件无父路径 = false）
         std::string ext; // 文件后缀（仅单文件时有值，不含 '.'）

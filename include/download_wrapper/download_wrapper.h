@@ -768,24 +768,21 @@ DW_API int32_t dw_list_file_records(const char *client_id,
                                     int32_t *out_count);
 
 /**
- * 获取或注册文件记录。
+ * 查询文件记录的解析状态。
  *
- * 若 (protocol, natural_key) 对应的文件记录已存在则直接返回；
- * 否则以提供的参数新建一条记录（parsed=false）并返回。
+ * 优先从内存缓存查询，未命中则从数据库加载。
  * 用于引擎在重名检测前查询文件记录的解析状态。
  *
  * @param client_id    客户端标识。
  * @param protocol     协议类型。
  * @param natural_key  任务唯一标识（BT=info_hash, HTTP=url）。
- * @param save_path    保存路径（仅新建时使用）。
- * @param out_parsed   输出：该记录是否已解析（true=已解析，引擎可跳过重名检测）。
+ * @param out_parsed   输出：该记录是否已解析（true=已解析，引擎可跳过重名检测；不存在返回 false）。
  * @return             0=成功，-1=失败。
  */
-DW_API int32_t dw_get_or_register_file_record(const char *client_id,
-                                               dw_protocol_t protocol,
-                                               const char *natural_key,
-                                               const char *save_path,
-                                               bool *out_parsed);
+DW_API int32_t dw_is_file_record_parsed(const char *client_id,
+                                        dw_protocol_t protocol,
+                                        const char *natural_key,
+                                        bool *out_parsed);
 
 /**
  * 设置任务队列优先级（越大越优先）。

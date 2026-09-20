@@ -71,6 +71,9 @@ public:
     /// 用于占位插入的幂等检查，避免重复新建。
     bool has_file_record(const std::string &client_id, dw_protocol_t task_protocol,
                          const std::string &task_natural_key) const;
+    /// 按任务关联三要素加载单条文件记录；不存在返回 false。
+    bool find_file_record(const std::string &client_id, dw_protocol_t task_protocol,
+                          const std::string &task_natural_key, FileRecord &out) const;
     /// 按任务关联三要素刷新 modified_at 为当前时间，用于排序置顶。
     void touch_file_record(const std::string &client_id, dw_protocol_t task_protocol,
                            const std::string &task_natural_key) const;

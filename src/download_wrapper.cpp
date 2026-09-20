@@ -1093,17 +1093,15 @@ DW_API void dw_file_record_list_free(dw_file_record_t *records, int32_t count) {
     std::free(records);
 }
 
-DW_API int32_t dw_get_or_register_file_record(const char *client_id,
-                                               dw_protocol_t protocol,
-                                               const char *natural_key,
-                                               const char *save_path,
-                                               bool *out_parsed) {
+DW_API int32_t dw_is_file_record_parsed(const char *client_id,
+                                        dw_protocol_t protocol,
+                                        const char *natural_key,
+                                        bool *out_parsed) {
     if (!client_id || !natural_key || !out_parsed) return -1;
     if (!dw::g_downloader) return -1;
     auto *tm = dw::g_downloader->router ? dw::g_downloader->router->task_manager() : nullptr;
     if (!tm) return -1;
-    const std::string sp = save_path ? save_path : "";
-    *out_parsed = tm->get_or_register_file_record(client_id, protocol, natural_key, sp);
+    *out_parsed = tm->is_file_record_parsed(client_id, protocol, natural_key);
     return 0;
 }
 

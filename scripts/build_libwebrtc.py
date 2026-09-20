@@ -424,6 +424,12 @@ def main():
     print("\n== Step 2: gclient sync ==")
     webrtc_src = configure_gclient(temp_dir, args.webrtc_branch, cfg["target_os"])
 
+    # 2.5 交叉编译 sysroot（x86_64 runner 编译 arm64 目标时需额外 sysroot）
+    if cfg["target_os"] == "linux" and cfg.get("target_cpu") == "arm64":
+        print("\n== Step 2.5: 安装 arm64 sysroot ==")
+        run(["python3", "build/linux/sysroot_scripts/install-sysroot.py", "--arch=arm64"],
+            cwd=str(webrtc_src))
+
     # 3. libwebrtc 集成
     print("\n== Step 3: libwebrtc 集成 ==")
     integrate_libwebrtc(webrtc_src)

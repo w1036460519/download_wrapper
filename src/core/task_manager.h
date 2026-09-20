@@ -134,11 +134,16 @@ namespace dw {
         void sync_file_record_cache(const std::string &client_id, dw_protocol_t proto,
                                     const std::string &natural_key, const FileRecord *fr = nullptr);
 
-        /// 获取或注册文件记录：已存在则返回其 parsed 状态；否则新建一条（parsed=false）。
+        /// 查找文件记录：优先内存缓存，未命中则从 DB 加载到缓存。
+        /// @return 缓存中的 FileRecord 指针，不存在返回 nullptr（假定已持 mtx_）。
+        FileRecord *find_file_record(const std::string &client_id, dw_protocol_t proto,
+                                     const std::string &natural_key);
+
+        /// 获取文件记录的解析状态：已存在则返回其 parsed 状态；不存在返回 false。
         /// 用于引擎在重名检测前查询文件记录的解析状态。
-        /// @return true=已解析（引擎可跳过重名检测），false=未解析或新建。
-        bool get_or_register_file_record(const std::string &client_id, dw_protocol_t proto,
-                                          const std::string &natural_key, const std::string &save_path);
+        /// @return true=已解析（引擎可跳过重名检测），false=未解析或不存在。
+        bool is_file_record_parsed(const std::string &client_id, dw_protocol_t proto,
+                                   const std::string &natural_key);
 
         /// 设置流量闸门：allowed=false 时逐任务暂停所有活跃下载（BT/HTTP）并回落 QUEUED，
         /// 调度线程不再准入新任务；true 时唤醒调度按 QUEUED→准入路径自动重启。

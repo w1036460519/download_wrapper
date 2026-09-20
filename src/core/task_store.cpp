@@ -370,6 +370,25 @@ namespace dw {
         return exists;
     }
 
+    bool TaskStore::find_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
+                                     const std::string &task_natural_key, FileRecord &out) const {
+        constexpr auto sql =
+                "SELECT * FROM file_records WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key LIMIT 1;";
+        sqlite3_stmt *st = nullptr;
+        bool found = false;
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
+            bind_text(st, ":client_id", client_id);
+            bind_int(st, ":protocol", static_cast<int>(task_protocol));
+            bind_text(st, ":natural_key", task_natural_key);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                fill_file_record(st, out);
+                found = true;
+            }
+            sqlite3_finalize(st);
+        }
+        return found;
+    }
+
     void TaskStore::touch_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
                                      const std::string &task_natural_key) const {
         constexpr auto sql =

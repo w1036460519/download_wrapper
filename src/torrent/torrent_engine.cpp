@@ -74,8 +74,6 @@ namespace dw {
         std::vector<std::string> g_default_trackers;
         // 事件投递目标
         class TaskManager *g_task_manager = nullptr;
-        // 重名处理：存储待迁移任务的原始名称（key → base_name），move_storage 完成后消费
-        std::unordered_map<std::string, std::string> g_pending_original_names;
 
         // 从 info_hash_t 提取 hex（优先 v2，回退 v1）
         std::string info_hash_hex(const lt::info_hash_t &ih) {
@@ -185,8 +183,6 @@ namespace dw {
                 EngineEvent ev;
                 ev.type = EngineEventType::FILE_PROGRESS;
                 ev.engine_key = key;
-                ev.protocol = DW_PROTOCOL_TORRENT;
-                ev.client_id = g_task_manager->client_id();
                 ev.file_index = i;
                 ev.file_size = f_size;
                 ev.file_path = fs.file_path(idx);
@@ -225,7 +221,7 @@ namespace dw {
 
                 // 发送事件（区间集合已完整，调用方直接序列化保存）
                 if (!ev.intervals.empty()) {
-                    g_task_manager->on_engine_event(std::move(ev));
+                    TorrentEngine::post_event(std::move(ev));
                 }
             }
         }
@@ -235,14 +231,12 @@ namespace dw {
             if (s.errc) {
                 log_e(key.c_str(), "任务发生错误. code: %d, msg: %s",
                       s.errc.value(), s.errc.message().c_str());
-                post_fail(key, s.errc.message().c_str());
+                TorrentEngine::post_fail(key, s.errc.message());
                 return {};
             }
             EngineEvent ev;
-            ev.client_id = g_task_manager->client_id();
             ev.type = EngineEventType::STATUS_UPDATE;
             ev.engine_key = key;
-            ev.protocol = DW_PROTOCOL_TORRENT;
             ev.total_size = s.total_wanted;
             ev.total_done = s.total_done;
             ev.progress = static_cast<double>(s.progress);
@@ -335,38 +329,38 @@ namespace dw {
         // 使用 orig_files() 获取原始文件结构检测磁盘重名；
         // 重名时调用 move_storage 整体迁移，完成后由 storage_moved_alert 发送 PARSED 事件。
         void handle_parsed(const lt::torrent_handle &h) {
-            if (!h.is_valid()) return;
             const std::string key = info_hash_hex(h);
             if (key.empty()) return;
-
+            if (!h.is_valid() || !g_task_manager) {
+                TorrentEngine::post_fail(key, "无效任务");
+                log_e(key.c_str(), "任务管理器异常: handle=%d, task_manager=%p",
+                      h.is_valid(), static_cast<void *>(g_task_manager));
+                return;
+            }
             EngineEvent ev;
             ev.type = EngineEventType::PARSED;
-            ev.protocol = DW_PROTOCOL_TORRENT;
-            ev.client_id = g_task_manager->client_id();
             ev.engine_key = key;
 
-            // 重名判定已完成：从 file_record.parsed 判断
-            if (g_task_manager) {
-                const lt::torrent_status st = h.status();
-                ev.save_path = st.save_path;
-                bool parsed = g_task_manager->get_or_register_file_record(
-                    g_task_manager->client_id(), DW_PROTOCOL_TORRENT, key, ev.save_path);
-                if (parsed) {
-                    log_i(key.c_str(), "已解析，跳过重名检测");
-                    g_task_manager->on_engine_event(std::move(ev));
-                    return;
-                }
+            // 任务已经解析完成
+            const lt::torrent_status st = h.status();
+            std::string client_id = g_task_manager->client_id();
+            if (auto file_record = g_task_manager->find_file_record(client_id, DW_PROTOCOL_TORRENT, key);
+                file_record && file_record->parsed) {
+                log_i(key.c_str(), "任务已解析");
+                TorrentEngine::post_event(std::move(ev));
+                return;
             }
+
 
             auto send_error = [&](const std::string &msg) {
                 log_e(key.c_str(), "%s", msg.c_str());
-                post_fail(key, msg);
+                TorrentEngine::post_fail(key, msg);
             };
 
-            const lt::torrent_status st = h.status();
             const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
             if (!ti) {
-                send_error("解析失败");
+                TorrentEngine::post_fail(key, "解析失败");
+                log_e(key.c_str(), "获取任务文件失败");
                 return;
             }
 
@@ -387,90 +381,49 @@ namespace dw {
                 log_i(key.c_str(), "原始文件 -> %s", fp.string().c_str());
             }
 
-            // 统计非 pad 文件数
-            int non_pad_count = 0;
-            for (lt::file_index_t i(0); i < fs.end_file(); ++i) {
-                if (!fs.pad_file_at(i)) ++non_pad_count;
-            }
-
-            // 确定 base_name / is_dir / ext
             std::string base_name;
-            bool is_dir = true;
-            std::string ext;
-            // 单文件 torrent：根条目可能是前置目录，提取实际文件名
-            if (non_pad_count == 1) {
-                for (lt::file_index_t i(0); i < fs.end_file(); ++i) {
-                    if (fs.pad_file_at(i)) continue;
-                    std::filesystem::path fp(fs.file_path(i));
-                    base_name = fp.filename().string();
-                    is_dir = false;
-                    ext = utils::file_extension(fp.string());
-                    break;
-                }
-            } else if (root_entries.size() == 1) {
+            if (root_entries.size() == 1) {
                 base_name = root_entries.begin()->first;
-                is_dir = root_entries.begin()->second;
-                if (!is_dir) {
-                    ext = utils::file_extension(base_name);
+                ev.is_dir = root_entries.begin()->second;
+                ev.original_root_name = base_name;
+                if (!ev.is_dir) {
+                    // 单文件
+                    if (std::filesystem::exists(std::filesystem::path(ev.save_path) / base_name)) {
+                        // 单文件-有重复  去除文件后缀，继续检查
+                        log_i(key.c_str(), "文件冲突 %s", base_name.c_str());
+                        base_name = std::filesystem::path(base_name).stem();
+                    } else {
+                        // 单文件-无重复
+                        log_i(key.c_str(), "文件无冲突 %s", base_name.c_str());
+                        ev.ext = utils::file_extension(base_name);
+                    }
                 }
             } else if (root_entries.size() > 1) {
+                // 多目录/文件
+                log_i(key.c_str(), "多目录/文件");
                 base_name = ev.name;
                 if (base_name.empty()) {
                     base_name = std::filesystem::path(root_entries.begin()->first).stem().string();
                 }
-                is_dir = true;
-            }
-            ev.is_dir = is_dir;
-            ev.ext = ext;
-            log_i(key.c_str(), "根文件 -> %s(%s)", base_name.c_str(), is_dir ? "目录" : "文件");
-            if (base_name.empty()) {
-                send_error("无法确定文件名");
+            } else if (root_entries.empty()) {
+                TorrentEngine::post_error(key, "解析失败");
+                log_e(key.c_str(), "任务中没有文件");
                 return;
             }
-
-            // 检测磁盘重名
-            const bool needs_rename = std::filesystem::exists(
-                std::filesystem::path(ev.save_path) / base_name);
-
-            // 无重名：创建占位，直接发送 PARSED（含 content_root / is_dir / ext）
-            if (!needs_rename) {
-                ev.original_name = base_name; // 无重名时 original_name = content_root
-                ev.content_root = base_name;
-                std::filesystem::create_directories(ev.save_path);
-                if (is_dir) {
-                    std::filesystem::create_directories(
-                        std::filesystem::path(ev.save_path) / base_name);
-                } else {
-                    std::ofstream ofs(
-                        std::filesystem::path(ev.save_path) / base_name, std::ios::app);
+            if (std::filesystem::exists(std::filesystem::path(ev.save_path) / base_name)) {
+                // 1.单文件冲突 2.单目录冲突 3.多目录/文件
+                ev.root_name = utils::acquire_wrapper_name(ev.save_path, base_name, nullptr);
+                ev.is_dir = true;
+                log_i(key.c_str(), "文件/目录冲突 %s", base_name.c_str());
+                try {
+                    h.move_storage(ev.root_name);
+                } catch (const std::exception &e) {
+                    log_e(key.c_str(), "move_storage 异常: %s", e.what());
+                    send_error("解析失败");
                 }
-                log_i(key.c_str(), "解析完成");
-                if (g_task_manager) g_task_manager->on_engine_event(std::move(ev));
-                return;
-            }
-
-            // 磁盘重名：计算唯一目标名，调用 move_storage 整体迁移
-            std::string target_name;
-            if (!is_dir) {
-                const std::string stem = std::filesystem::path(base_name).stem().string();
-                const std::string new_stem = utils::acquire_wrapper_name(
-                    ev.save_path, stem, nullptr);
-                target_name = ext.empty() ? new_stem : new_stem + "." + ext;
             } else {
-                target_name = utils::acquire_wrapper_name(
-                    ev.save_path, base_name, nullptr);
-            }
-            const std::string new_save_path =
-                    (std::filesystem::path(ev.save_path) / target_name).string();
-            log_i(key.c_str(), "重名 '%s' -> '%s'，调用 move_storage",
-                  base_name.c_str(), target_name.c_str());
-            // 存储原始名称，供 storage_moved_alert 处理时消费
-            g_pending_original_names[key] = base_name;
-            try {
-                h.move_storage(new_save_path);
-            } catch (const std::exception &e) {
-                log_e(key.c_str(), "move_storage 异常: %s", e.what());
-                send_error("move_storage 调用失败");
+                // 无冲突 发送解析完成事件
+                TorrentEngine::post_event(std::move(ev));
             }
         }
 
@@ -484,8 +437,8 @@ namespace dw {
                     const std::string key = info_hash_hex(s.handle);
                     if (key.empty()) continue;
                     EngineEvent ev = make_status_update_event(s, key);
-                    if (!ev.engine_key.empty() && g_task_manager)
-                        g_task_manager->on_engine_event(std::move(ev));
+                    if (!ev.engine_key.empty())
+                        TorrentEngine::post_event(std::move(ev));
                 }
             }
             // 添加任务
@@ -494,8 +447,7 @@ namespace dw {
                 if (at->error) {
                     // 添加任务失败
                     log_e(key.c_str(), "添加失败: %s", at->error.message().c_str());
-                    if (key.empty()) return;
-                    post_error(key, at->error.message().c_str());
+                    TorrentEngine::post_error(key, at->error.message());
                 } else if (at->handle.is_valid()) {
                     // 添加任务成功
                     log_i(key.c_str(), "添加成功");
@@ -519,21 +471,17 @@ namespace dw {
                 const std::string key = info_hash_hex(tf->handle);
                 log_i(key.c_str(), "下载完成");
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DOWNLOAD_COMPLETED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                EngineEvent ev;
+                ev.type = EngineEventType::DOWNLOAD_COMPLETED;
+                ev.engine_key = key;
+                TorrentEngine::post_event(std::move(ev));
             }
             // 任务错误
             else if (const auto *te = lt::alert_cast<lt::torrent_error_alert>(a)) {
                 const std::string key = info_hash_hex(te->handle);
                 log_e(key.c_str(), "下载错误: %s", te->error.message().c_str());
                 if (key.empty()) return;
-                post_fail(key, te->error.message().c_str());
+                TorrentEngine::post_fail(key, te->error.message());
             }
             // 文件错误
             else if (const auto *fe = lt::alert_cast<lt::file_error_alert>(a)) {
@@ -541,29 +489,29 @@ namespace dw {
                 log_e(key.c_str(), "文件错误 file: %s, msg: %s, errno: %d",
                       fe->filename(), fe->error.message().c_str(), fe->error.value());
                 if (key.empty()) return;
-                post_fail(key, fe->error.message().c_str());
+                TorrentEngine::post_fail(key, fe->error.message());
             }
             // 种子冲突：两个磁力链接解析到同一 torrent，双方进入 error 状态
             else if (const auto *tc = lt::alert_cast<lt::torrent_conflict_alert>(a)) {
                 const std::string key = info_hash_hex(tc->handle);
                 log_e(key.c_str(), "种子冲突: 两个磁力链接解析到同一 torrent");
                 if (key.empty()) return;
-                post_error(key, "种子冲突");
+                TorrentEngine::post_error(key, "种子冲突");
             }
             // 元数据解析失败：info-hash 校验不通过，libtorrent 自动重试，重试耗尽后 torrent 进入 error 状态
             else if (const auto *mf = lt::alert_cast<lt::metadata_failed_alert>(a)) {
                 const std::string key = info_hash_hex(mf->handle);
                 log_e(key.c_str(), "元数据解析失败: %s", mf->error.message().c_str());
                 if (key.empty()) return;
-                post_fail(key, mf->error.message().c_str());
+                TorrentEngine::post_fail(key, mf->error.message());
             }
             // 存储移动失败：move_storage() 调用失败，torrent 进入 error 状态
-            else if (const auto *sm = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
-                const std::string key = info_hash_hex(sm->handle);
+            else if (const auto *smf = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
+                const std::string key = info_hash_hex(smf->handle);
                 log_e(key.c_str(), "存储移动失败: %s, errno: %d, op=%d",
-                      sm->error.message().c_str(), sm->error.value(), static_cast<int>(sm->op));
+                      smf->error.message().c_str(), smf->error.value(), static_cast<int>(smf->op));
                 if (key.empty()) return;
-                post_error(key, sm->error.message().c_str());
+                TorrentEngine::post_error(key, smf->error.message());
             }
             // 断点续传数据就绪
             else if (const auto *rd = lt::alert_cast<lt::save_resume_data_alert>(a)) {
@@ -580,106 +528,78 @@ namespace dw {
                     log_e(key.c_str(), "断点续传数据保存失败: %s", e.what());
                 }
             }
-            // 存储迁移完成：从新 save_path 提取 content_root，发送 PARSED 事件
+            // 存储迁移完成：发送 PARSED 事件
             else if (const auto *sm = lt::alert_cast<lt::storage_moved_alert>(a)) {
                 const std::string key = info_hash_hex(sm->handle);
                 if (key.empty()) return;
 
                 const std::string new_path = sm->storage_path();
-                const std::string content_root =
-                        std::filesystem::path(new_path).filename().string();
-                // 从 pending map 取出原始名称（重名前的名字）
-                std::string original_name;
-                auto it = g_pending_original_names.find(key);
-                if (it != g_pending_original_names.end()) {
-                    original_name = it->second;
-                    g_pending_original_names.erase(it);
-                } else {
-                    original_name = content_root; // 兜底：无重名时相同
-                }
-                log_i(key.c_str(), "存储迁移完成 -> '%s'，content_root='%s'，original_name='%s'",
-                      new_path.c_str(), content_root.c_str(), original_name.c_str());
+                const std::string root_name = std::filesystem::path(new_path).filename().string();
 
-                if (g_task_manager) {
-                    EngineEvent ev;
-                    ev.type = EngineEventType::PARSED;
-                    ev.protocol = DW_PROTOCOL_TORRENT;
-                    ev.client_id = g_task_manager->client_id();
-                    ev.engine_key = key;
-                    ev.original_name = original_name;
-                    ev.content_root = content_root;
-                    ev.save_path = new_path;
-                    ev.is_dir = true;
-                    ev.ext = "";
-                    g_task_manager->on_engine_event(std::move(ev));
+                // 从 torrent info 推导原始名称
+                std::string original_root_name;
+                if (const auto ti = sm->handle.torrent_file()) {
+                    const auto &fs = ti->layout();
+                    if (fs.num_files() > 0) {
+                        std::filesystem::path fp(fs.file_path(0));
+                        original_root_name = fp.begin() != fp.end() ? fp.begin()->string() : ti->name();
+                    } else {
+                        original_root_name = ti->name();
+                    }
                 }
+                log_i(key.c_str(), "存储迁移完成 -> '%s'，root_name='%s'，original_root_name='%s'",
+                      new_path.c_str(), root_name.c_str(), original_root_name.c_str());
+
+                EngineEvent ev;
+                ev.type = EngineEventType::PARSED;
+                ev.engine_key = key;
+                ev.original_root_name = original_root_name;
+                ev.root_name = root_name;
+                ev.save_path = new_path;
+                ev.is_dir = true;
+                TorrentEngine::post_event(std::move(ev));
             }
             // 暂停
             else if (lt::alert_cast<lt::torrent_paused_alert>(a)) {
                 const std::string key = info_hash_hex(lt::alert_cast<lt::torrent_paused_alert>(a)->handle);
                 log_i(key.c_str(), "暂停");
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::PAUSED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                EngineEvent ev;
+                ev.type = EngineEventType::PAUSED;
+                ev.engine_key = key;
+                TorrentEngine::post_event(std::move(ev));
             }
             // 恢复
             else if (lt::alert_cast<lt::torrent_resumed_alert>(a)) {
                 const std::string key = info_hash_hex(lt::alert_cast<lt::torrent_resumed_alert>(a)->handle);
                 log_i(key.c_str(), "恢复");
                 if (key.empty()) return;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::RESUMED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id()
-                    });
-                }
+                EngineEvent ev;
+                ev.type = EngineEventType::RESUMED;
+                ev.engine_key = key;
+                TorrentEngine::post_event(std::move(ev));
             }
             // 任务已从 session 移除（不删文件场景：remove_torrent 不带 delete_files）
             else if (const auto *tr = lt::alert_cast<lt::torrent_removed_alert>(a)) {
                 const std::string key = info_hash_hex(tr->info_hashes);
                 if (key.empty()) return;
-                log_i(key.c_str(), "任务已从 session 移除");
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DELETED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id(),
-                        .delete_files = 0 // 不删文件，仅回收内存与 DB
-                    });
-                }
+                log_i(key.c_str(), "任务删除完成");
+                EngineEvent ev;
+                ev.type = EngineEventType::DELETED;
+                ev.engine_key = key;
+                ev.delete_files = 0;
+                TorrentEngine::post_event(std::move(ev));
             }
             // 任务文件删除完成（删文件场景：remove_torrent 带 delete_files）
-            // libtorrent 已删除下载文件，wrapper 负责清理包层目录（content_root）
             else if (const auto *td = lt::alert_cast<lt::torrent_deleted_alert>(a)) {
                 const std::string key = info_hash_hex(td->info_hashes);
                 if (key.empty()) return;
                 log_i(key.c_str(), "任务文件删除完成");
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(EngineEvent{
-                        .type = EngineEventType::DELETED,
-                        .engine_key = key,
-                        .protocol = DW_PROTOCOL_TORRENT,
-                        .client_id = g_task_manager->client_id(),
-                        .delete_files = 1 // 引擎已删文件，wrapper 清理包层目录
-                    });
-                }
-            }
-            // 任务文件删除失败
-            else if (const auto *tdf = lt::alert_cast<lt::torrent_delete_failed_alert>(a)) {
-                const std::string key = info_hash_hex(tdf->info_hashes);
-                if (key.empty()) return;
-                log_e(key.c_str(), "任务文件删除失败: %s",
-                      tdf->error.message().c_str());
-                post_error(key, tdf->error.message().c_str());
+                EngineEvent ev;
+                ev.type = EngineEventType::DELETED;
+                ev.engine_key = key;
+                ev.delete_files = 1;
+                TorrentEngine::post_event(std::move(ev));
             }
         }
 
@@ -927,28 +847,29 @@ namespace dw {
         log_i(task_id.c_str(), "设置文件优先级完成");
     }
 
-    void TorrentEngine::post_fail(const std::string &key, const std::string &message) {
+    void TorrentEngine::post_event(EngineEvent ev) {
         if (!g_task_manager) return;
-        EngineEvent engine_event;
-        engine_event.type = EngineEventType::DOWNLOAD_FAILED;
-        engine_event.engine_key = key;
-        engine_event.protocol = DW_PROTOCOL_TORRENT;
-        engine_event.client_id = g_task_manager->client_id();
-        engine_event.reason = DW_REASON_FAIL;
-        engine_event.message = message;
-        g_task_manager->on_engine_event(engine_event);
+        ev.protocol = DW_PROTOCOL_TORRENT;
+        ev.client_id = g_task_manager->client_id();
+        g_task_manager->on_engine_event(std::move(ev));
+    }
+
+    void TorrentEngine::post_fail(const std::string &key, const std::string &message) {
+        EngineEvent ev;
+        ev.type = EngineEventType::DOWNLOAD_FAILED;
+        ev.engine_key = key;
+        ev.reason = DW_REASON_FAIL;
+        ev.message = message;
+        post_event(std::move(ev));
     }
 
     void TorrentEngine::post_error(const std::string &key, const std::string &message) {
-        if (!g_task_manager) return;
-        EngineEvent engine_event;
-        engine_event.type = EngineEventType::DOWNLOAD_FAILED;
-        engine_event.engine_key = key;
-        engine_event.protocol = DW_PROTOCOL_TORRENT;
-        engine_event.client_id = g_task_manager->client_id();
-        engine_event.reason = DW_REASON_ERROR;
-        engine_event.message = message;
-        g_task_manager->on_engine_event(engine_event);
+        EngineEvent ev;
+        ev.type = EngineEventType::DOWNLOAD_FAILED;
+        ev.engine_key = key;
+        ev.reason = DW_REASON_ERROR;
+        ev.message = message;
+        post_event(std::move(ev));
     }
 
     int32_t TorrentEngine::add_task(const dw_task_params_t *params,

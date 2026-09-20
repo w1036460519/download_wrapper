@@ -452,7 +452,7 @@ namespace dw {
             }
         }
         if (!rec_ptr) return false;
-    
+
         if (proto == DW_PROTOCOL_HTTP) {
             // wrapper 模型：物理路径 = save_path / root_name（wrapper 目录） / original_root_name（原始文件名）。
             if (rec_ptr->root_name.empty() || rec_ptr->original_root_name.empty()) return false; // 定名未落定
@@ -622,7 +622,8 @@ namespace dw {
                 reset_live_telemetry(*rec);
                 // 暂停态即时写（迁移点）
                 store_.update_file_record_status(rec->client_id, rec->task_protocol, rec->task_natural_key,
-                                                 DW_TASK_STATUS_PAUSED, static_cast<dw_reason_t>(rec->reason), rec->message);
+                                                 DW_TASK_STATUS_PAUSED, static_cast<dw_reason_t>(rec->reason),
+                                                 rec->message);
                 log_i(key.c_str(), "暂停生效");
                 break;
             }
@@ -815,33 +816,25 @@ namespace dw {
         }
     }
 
-    bool TaskManager::get_or_register_file_record(const std::string &client_id, dw_protocol_t proto,
-                                                  const std::string &natural_key, const std::string &save_path) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        ensure_file_cache_locked();
+    FileRecord *TaskManager::find_file_record(const std::string &client_id, dw_protocol_t proto,
+                                              const std::string &natural_key) {
         const std::string ck = union_id_of(client_id, proto, natural_key);
         const auto it = file_cache_.find(ck);
         if (it != file_cache_.end()) {
-            return it->second.parsed;
+            return &it->second;
         }
-        // 缓存未命中（占位缺失的兜底：旧库/异常场景）：新建占位记录（parsed=false，状态回解析中）
-        FileRecord fr;
-        fr.client_id = client_id;
-        // 任务类型按协议细化：HTTP=1，BT=2（本地文件条目=0，由 scan_local_tasks 写入）。
-        fr.type = (proto == DW_PROTOCOL_HTTP) ? DW_SOURCE_TASK_FILE : DW_SOURCE_REMOTE_FILE;
-        fr.save_path = save_path;
-        fr.original_root_name = natural_key;
-        fr.root_name = natural_key;
-        fr.file_type = true;
-        fr.task_protocol = proto;
-        fr.task_natural_key = natural_key;
-        fr.status = DW_TASK_STATUS_RESOLVING;
-        fr.parsed = false;
-        fr.created_at = now_unix_ms();
-        fr.modified_at = fr.created_at;
-        store_.insert_file_record(fr);
-        file_cache_[ck] = fr;
-        return false;
+        if (FileRecord fr; store_.find_file_record(client_id, proto, natural_key, fr)) {
+            file_cache_[ck] = std::move(fr);
+            return &file_cache_[ck];
+        }
+        return nullptr;
+    }
+
+    bool TaskManager::is_file_record_parsed(const std::string &client_id, dw_protocol_t proto,
+                                            const std::string &natural_key) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        FileRecord *fr = find_file_record(client_id, proto, natural_key);
+        return fr && fr->parsed;
     }
 
     /* ================================================================== */
@@ -1175,7 +1168,7 @@ namespace dw {
                     arr[0].index = 0;
                     arr[0].name = utils::dup_cstr(rec_ptr->original_root_name);
                     arr[0].full_path = utils::dup_cstr((std::filesystem::path(rec_ptr->save_path) /
-                                                       rec_ptr->root_name / rec_ptr->original_root_name).string());
+                                                        rec_ptr->root_name / rec_ptr->original_root_name).string());
                     const std::string ext = utils::file_extension(rec_ptr->original_root_name);
                     arr[0].ext = ext.empty() ? nullptr : utils::dup_cstr(ext);
                     arr[0].size = rec_ptr->total_size;
@@ -1460,14 +1453,14 @@ namespace dw {
         }
         file_cache_loaded_ = true;
     }
-    
+
     void TaskManager::register_task(FileRecord task_record) {
         // tasks_ 以 union_id 为 key，无冗余索引。
         tasks_[task_record.union_id()] = std::move(task_record);
     }
-    
+
     FileRecord *TaskManager::load_task_record_locked(const std::string &client_id, const dw_protocol_t proto,
-                                                      const std::string &natural_key) {
+                                                     const std::string &natural_key) {
         const std::string uid = union_id_of(client_id, proto, natural_key);
         // 内存命中：直接返回指针。
         if (const auto it = tasks_.find(uid); it != tasks_.end()) {
