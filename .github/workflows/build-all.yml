@@ -1,0 +1,261 @@
+name: Build All
+
+# 合并工作流：先构建 libwebrtc，再构建 download_wrapper
+# 同 workflow 内共享 artifacts，无需 Release 或跨 workflow 下载
+#
+# 触发：手动触发 或 标签 push（v* 或 libwebrtc-v*）
+# 路径过滤：仅相关文件变更时触发
+on:
+  workflow_dispatch:
+    inputs:
+      webrtc_branch:
+        description: 'webrtc-sdk/webrtc 分支'
+        required: true
+        default: 'm144_release'
+  push:
+    tags:
+      - 'v*'
+      - 'libwebrtc-v*'
+    paths:
+      - 'scripts/**'
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - '.github/workflows/build-all.yml'
+
+env:
+  LIBWEBRTC_TAG: 'libwebrtc.m144.7559.09'
+  VCPKG_REF: '2026.06.24'
+
+jobs:
+  # ══════════════════════════════════════════════════════════════
+  # 阶段 1：构建 libwebrtc（9 个平台）
+  # ═══════════════════════════════════════════════════════════════
+  build-libwebrtc:
+    name: libwebrtc-${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos,           os: macos-latest,    target_os: mac,     asset: libwebrtc-macos-release.zip }
+          - { name: linux-x64,       os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-x64-release.zip }
+          - { name: linux-arm64,     os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-arm64-release.zip }
+          - { name: windows-x64,     os: windows-2022,    target_os: win,     asset: libwebrtc-windows-x64-release.zip }
+          - { name: windows-arm64,   os: windows-2022,    target_os: win,     asset: libwebrtc-windows-arm64-release.zip }
+          - { name: android-arm64,   os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-arm64-release.zip }
+          - { name: android-x64,     os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-x64-release.zip }
+          - { name: ios-arm64,       os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-arm64-release.zip }
+          - { name: ios-simulator,   os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-simulator-release.zip }
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize paths
+        shell: bash
+        run: |
+          DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
+          echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
+
+      - name: Setup Android NDK
+        if: matrix.target_os == 'android'
+        shell: bash
+        run: |
+          NDK=$(echo "${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" | tr '\\' '/')
+          echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
+
+      # L1: depot_tools 缓存（工具链稳定，极少变化）
+      - name: Cache depot_tools
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/depot_tools
+          key: depot-tools-${{ runner.os }}
+
+      # L2: WebRTC 源码缓存（分支变更时失效）
+      - name: Cache WebRTC source
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/webrtc_src
+          key: webrtc-src-${{ matrix.name }}-${{ inputs.webrtc_branch || 'm144_release' }}
+
+      # L3: Ninja 编译产物缓存（源码 hash 变更时失效）
+      - name: Cache build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ runner.temp }}/webrtc_src/src/out/Release
+            ${{ runner.temp }}/webrtc_src/src/out/Release-x64
+          key: webrtc-build-${{ matrix.name }}-${{ inputs.webrtc_branch || 'm144_release' }}-${{ hashFiles('scripts/build_libwebrtc.py') }}
+          restore-keys: |
+            webrtc-build-${{ matrix.name }}-${{ inputs.webrtc_branch || 'm144_release' }}-
+
+      - name: Build
+        shell: bash
+        env:
+          WEBRTC_BRANCH: ${{ inputs.webrtc_branch || 'm144_release' }}
+        run: |
+          echo "== 构建前磁盘 =="
+          df -h / || true
+
+          python3 "${{ github.workspace }}/scripts/build_libwebrtc.py" \
+            --platform "${{ matrix.name }}" \
+            --webrtc-branch "$WEBRTC_BRANCH" \
+            --temp-dir "$DW_TEMP"
+
+          echo "== 构建后磁盘 =="
+          df -h / || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: libwebrtc-${{ matrix.name }}
+          path: ${{ runner.temp }}/${{ matrix.asset }}
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════
+  # 阶段 2：构建 download_wrapper（9 个平台，依赖阶段 1）
+  # ═══════════════════════════════════════════════════════════════
+  build-wrapper:
+    name: wrapper-${{ matrix.name }}
+    needs: build-libwebrtc
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-latest
+            libwebrtc_name: macos
+            bincache: ~/.cache/vcpkg/archives
+          - name: linux-x64
+            os: ubuntu-latest
+            libwebrtc_name: linux-x64
+            bincache: ~/.cache/vcpkg/archives
+          - name: linux-arm64
+            os: ubuntu-latest
+            libwebrtc_name: linux-arm64
+            bincache: ~/.cache/vcpkg/archives
+          - name: windows-x64
+            os: windows-2022
+            libwebrtc_name: windows-x64
+            bincache: ~\AppData\Local\vcpkg\archives
+          - name: windows-arm64
+            os: windows-2022
+            libwebrtc_name: windows-arm64
+            bincache: ~\AppData\Local\vcpkg\archives
+          - name: ios-arm64
+            os: macos-latest
+            libwebrtc_name: ios-arm64
+            bincache: ~/.cache/vcpkg/archives
+          - name: ios-simulator-universal
+            os: macos-latest
+            libwebrtc_name: ios-simulator
+            bincache: ~/.cache/vcpkg/archives
+          - name: android-arm64
+            os: ubuntu-latest
+            libwebrtc_name: android-arm64
+            bincache: ~/.cache/vcpkg/archives
+          - name: android-x64
+            os: ubuntu-latest
+            libwebrtc_name: android-x64
+            bincache: ~/.cache/vcpkg/archives
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # 下载对应的 libwebrtc 产物（同 workflow 内）
+      - name: Download libwebrtc
+        uses: actions/download-artifact@v6
+        with:
+          name: libwebrtc-${{ matrix.libwebrtc_name }}
+          path: ${{ runner.temp }}/libwebrtc
+
+      # 缓存 vcpkg 二进制归档
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v5
+        with:
+          path: ${{ matrix.bincache }}
+          key: vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-
+            vcpkg-${{ matrix.name }}-
+
+      # 缓存 CMake 构建产物（增量编译）
+      - name: Cache CMake build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ github.workspace }}/build
+            ${{ github.workspace }}/build-arm64
+            ${{ github.workspace }}/build-x64
+          key: cmake-build-${{ matrix.name }}-${{ hashFiles('src/**', 'include/**', 'CMakeLists.txt') }}
+          restore-keys: |
+            cmake-build-${{ matrix.name }}-
+
+      # Linux 系统依赖
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config
+
+      # 构建
+      - name: Build
+        shell: bash
+        run: |
+          echo "== 构建前磁盘 =="
+          df -h / || true
+
+          python3 "${{ github.workspace }}/scripts/build_wrapper.py" \
+            --platform "${{ matrix.name }}" \
+            --vcpkg-ref "${{ env.VCPKG_REF }}" \
+            --workspace "${{ github.workspace }}" \
+            --temp-dir "${{ runner.temp }}" \
+            --libwebrtc-dir "${{ runner.temp }}/libwebrtc"
+
+          echo "== 构建后磁盘 =="
+          df -h / || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: download_wrapper-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ══════════════════════════════════════════════════════════════
+  # 阶段 3：发布 Release（推送 v* 标签时）
+  # ═══════════════════════════════════════════════════════════════
+  release:
+    name: Publish Release
+    needs: build-wrapper
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            cp "$dir"* release/ 2>/dev/null || true
+          done
+          echo "== 待发布资产 =="
+          ls -l release
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
