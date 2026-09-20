@@ -100,7 +100,8 @@ namespace dw {
                 log_e(info_hash.c_str(), "任务管理器异常: session=%p, task_manager=%p",
                       static_cast<void *>(g_session.get()), static_cast<void *>(g_task_manager));
                 return {};
-            
+            }
+
             lt::sha1_hash h;
             if (lt::aux::from_hex(info_hash, h.data())) {
                 if (auto th = g_session->find_torrent(h); th.is_valid()) {
