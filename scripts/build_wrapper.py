@@ -106,14 +106,19 @@ LIBWEBRTC_ASSETS = {
 
 
 def run(cmd, **kwargs):
-    """执行命令，失败时抛出带上下文的异常。"""
+    """执行命令，实时打印输出，失败时抛出异常。"""
     cmd_str = ' '.join(str(c) for c in cmd)
     print(f"\n$ {cmd_str}")
-    try:
-        subprocess.check_call(cmd, **kwargs)
-    except subprocess.CalledProcessError as e:
-        print(f"\n[ERROR] 命令失败 (exit {e.returncode}): {cmd_str}")
-        raise
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, **kwargs
+    )
+    for line in process.stdout:
+        print(line, end='')
+    process.wait()
+    if process.returncode != 0:
+        print(f"\n[ERROR] 命令失败 (exit {process.returncode}): {cmd_str}")
+        raise subprocess.CalledProcessError(process.returncode, cmd)
 
 
 def run_capture(cmd, **kwargs):
