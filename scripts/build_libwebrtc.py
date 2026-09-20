@@ -188,11 +188,9 @@ target_os = ['{target_os}']
 """)
     webrtc_src = src_dir / "src"
 
-    # Windows: 使用公开桶下载工具链（绕过私有桶 401 错误）
+    # Windows: 使用本地 Visual Studio（Google 工具链桶需凭证，外部项目不可用）
     if platform.system() == "Windows":
-        os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "1"
-        os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN_BASE_URL"] = \
-            "https://commondatastorage.googleapis.com/chrome-wintoolchain/"
+        os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
 
     run(gclient_cmd("sync", "--no-history", "--shallow", "--jobs", "8", "-D"),
         cwd=str(src_dir))
