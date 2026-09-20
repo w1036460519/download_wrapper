@@ -59,14 +59,14 @@ PLATFORMS = {
         "target_os": "android",
         "target_cpu": "arm64",
         "needs_ndk": True,
-        "extra": {"android_static_analysis": "none"},
+        "extra": {"android_static_analysis": "off"},
         "asset": "libwebrtc-android-arm64-release.zip",
     },
     "android-x64": {
         "target_os": "android",
         "target_cpu": "x64",
         "needs_ndk": True,
-        "extra": {"android_static_analysis": "none"},
+        "extra": {"android_static_analysis": "off"},
         "asset": "libwebrtc-android-x64-release.zip",
     },
     "ios-arm64": {
@@ -188,10 +188,11 @@ target_os = ['{target_os}']
 """)
     webrtc_src = src_dir / "src"
 
-    # Windows: 使用 Google 预构建工具链（clang-cl + Windows SDK），无需本地 Visual Studio
-    # 工具链公开只读，匿名下载，无需 GCS 凭证
+    # Windows: 使用公开桶下载工具链（绕过私有桶 401 错误）
     if platform.system() == "Windows":
         os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "1"
+        os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN_BASE_URL"] = \
+            "https://commondatastorage.googleapis.com/chrome-wintoolchain/"
 
     run(gclient_cmd("sync", "--no-history", "--shallow", "--jobs", "8", "-D"),
         cwd=str(src_dir))

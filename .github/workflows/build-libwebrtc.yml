@@ -61,13 +61,12 @@ jobs:
           NDK=$(echo "${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" | tr '\\' '/')
           echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
 
-      # ── 缓存 Windows 工具链（Google 预构建 clang-cl + Windows SDK） ──
+      # ── 缓存 Windows 工具链（公开桶下载，避免重复下载） ──
       - name: Cache Windows toolchain
         if: runner.os == 'Windows'
         uses: actions/cache@v4
         with:
           path: |
-            ~\AppData\Local\Chromium
             ~\AppData\Local\depot_tools\win_toolchain
           key: win-toolchain-${{ runner.os }}
 
