@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       # 缓存 vcpkg 二进制归档（命中后依赖无需重复编译）
       - name: Cache vcpkg binary archives
