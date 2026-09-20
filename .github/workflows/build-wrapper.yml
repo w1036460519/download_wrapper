@@ -1,0 +1,161 @@
+name: Build Wrapper
+
+# 独立构建 download_wrapper（9 个平台）
+# 从缓存读取 libwebrtc 构建产物（key: libwebrtc-cache-{platform}）
+#
+# 触发：代码变更 或 手动触发
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: '选择平台'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
+          - windows
+          - android
+          - ios
+  push:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - 'scripts/build_wrapper.py'
+      - '.github/workflows/build-wrapper.yml'
+
+env:
+  VCPKG_REF: '2026.06.24'
+
+jobs:
+  build:
+    name: wrapper-${{ matrix.name }}
+    if: >-
+      github.event_name == 'push' ||
+      inputs.platforms == 'all' ||
+      (inputs.platforms == 'macos' && contains(matrix.name, 'macos')) ||
+      (inputs.platforms == 'linux' && contains(matrix.name, 'linux')) ||
+      (inputs.platforms == 'windows' && contains(matrix.name, 'windows')) ||
+      (inputs.platforms == 'android' && contains(matrix.name, 'android')) ||
+      (inputs.platforms == 'ios' && contains(matrix.name, 'ios'))
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-latest
+            libwebrtc_name: macos
+            bincache: ~/.cache/vcpkg/archives
+          - name: linux-x64
+            os: ubuntu-latest
+            libwebrtc_name: linux-x64
+            bincache: ~/.cache/vcpkg/archives
+          - name: linux-arm64
+            os: ubuntu-latest
+            libwebrtc_name: linux-arm64
+            bincache: ~/.cache/vcpkg/archives
+          - name: windows-x64
+            os: windows-2022
+            libwebrtc_name: windows-x64
+            bincache: ~\AppData\Local\vcpkg\archives
+          - name: windows-arm64
+            os: windows-2022
+            libwebrtc_name: windows-arm64
+            bincache: ~\AppData\Local\vcpkg\archives
+          - name: ios-arm64
+            os: macos-latest
+            libwebrtc_name: ios-arm64
+            bincache: ~/.cache/vcpkg/archives
+          - name: ios-simulator-universal
+            os: macos-latest
+            libwebrtc_name: ios-simulator
+            bincache: ~/.cache/vcpkg/archives
+          - name: android-arm64
+            os: ubuntu-latest
+            libwebrtc_name: android-arm64
+            bincache: ~/.cache/vcpkg/archives
+          - name: android-x64
+            os: ubuntu-latest
+            libwebrtc_name: android-x64
+            bincache: ~/.cache/vcpkg/archives
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize paths
+        shell: bash
+        run: |
+          DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
+          echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
+
+      # 从缓存读取 libwebrtc 构建产物（与 build-libwebrtc.yml 共享）
+      - name: Cache libwebrtc (from build-libwebrtc workflow)
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ runner.temp }}/webrtc_src
+            ${{ runner.temp }}/webrtc_build
+          key: libwebrtc-cache-${{ matrix.libwebrtc_name }}-fixed
+          restore-keys: |
+            libwebrtc-cache-${{ matrix.libwebrtc_name }}-
+
+      # 缓存 vcpkg 二进制归档
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v5
+        with:
+          path: ${{ matrix.bincache }}
+          key: vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-
+            vcpkg-${{ matrix.name }}-
+
+      # 缓存 CMake 构建产物（增量编译）
+      - name: Cache CMake build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ github.workspace }}/build
+            ${{ github.workspace }}/build-arm64
+            ${{ github.workspace }}/build-x64
+          key: cmake-build-${{ matrix.name }}-${{ hashFiles('src/**', 'include/**', 'CMakeLists.txt') }}
+          restore-keys: |
+            cmake-build-${{ matrix.name }}-
+
+      # Linux 系统依赖
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config
+
+      # 构建
+      - name: Build
+        shell: bash
+        run: |
+          echo "== 构建前磁盘 =="
+          df -h / || true
+
+          python3 "${{ github.workspace }}/scripts/build_wrapper.py" \
+            --platform "${{ matrix.name }}" \
+            --vcpkg-ref "${{ env.VCPKG_REF }}" \
+            --workspace "${{ github.workspace }}" \
+            --temp-dir "${{ runner.temp }}" \
+            --libwebrtc-dir "${{ runner.temp }}/webrtc_build"
+
+          echo "== 构建后磁盘 =="
+          df -h / || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: download_wrapper-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error

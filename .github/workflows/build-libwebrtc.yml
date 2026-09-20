@@ -1,0 +1,117 @@
+name: Build libwebrtc
+
+# 独立构建 libwebrtc（9 个平台）
+# 缓存 key: libwebrtc-cache-{platform}（与 build-wrapper.yml 共享）
+#
+# 触发：仅手动触发
+on:
+  workflow_dispatch:
+    inputs:
+      webrtc_branch:
+        description: 'webrtc-sdk/webrtc 分支'
+        required: true
+        default: 'm144_release'
+      platforms:
+        description: '选择平台'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
+          - windows
+          - android
+          - ios
+      force_rebuild:
+        description: '强制重新下载源码（跳过缓存）'
+        type: boolean
+        default: false
+
+env:
+  LIBWEBRTC_TAG: 'libwebrtc.m144.7559.09'
+
+jobs:
+  build:
+    name: libwebrtc-${{ matrix.name }}
+    if: >-
+      inputs.platforms == 'all' ||
+      (inputs.platforms == 'macos' && contains(matrix.name, 'macos')) ||
+      (inputs.platforms == 'linux' && contains(matrix.name, 'linux')) ||
+      (inputs.platforms == 'windows' && contains(matrix.name, 'windows')) ||
+      (inputs.platforms == 'android' && contains(matrix.name, 'android')) ||
+      (inputs.platforms == 'ios' && contains(matrix.name, 'ios'))
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos,           os: macos-latest,    target_os: mac,     asset: libwebrtc-macos-release.zip }
+          - { name: linux-x64,       os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-x64-release.zip }
+          - { name: linux-arm64,     os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-arm64-release.zip }
+          - { name: windows-x64,     os: windows-2022,    target_os: win,     asset: libwebrtc-windows-x64-release.zip }
+          - { name: windows-arm64,   os: windows-2022,    target_os: win,     asset: libwebrtc-windows-arm64-release.zip }
+          - { name: android-arm64,   os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-arm64-release.zip }
+          - { name: android-x64,     os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-x64-release.zip }
+          - { name: ios-arm64,       os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-arm64-release.zip }
+          - { name: ios-simulator,   os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-simulator-release.zip }
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize paths
+        shell: bash
+        run: |
+          DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
+          echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
+
+      - name: Setup Android NDK
+        if: matrix.target_os == 'android'
+        shell: bash
+        run: |
+          NDK=$(echo "${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" | tr '\\' '/')
+          echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
+
+      # L1: depot_tools 缓存（工具链稳定，极少变化）
+      - name: Cache depot_tools
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/depot_tools
+          key: depot-tools-${{ runner.os }}
+
+      # L2: WebRTC 源码 + 编译产物缓存（与 build-wrapper.yml 共享）
+      - name: Cache libwebrtc
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ runner.temp }}/webrtc_src
+            ${{ runner.temp }}/webrtc_build
+          key: libwebrtc-cache-${{ matrix.name }}-${{ inputs.force_rebuild && github.run_id || 'fixed' }}
+          restore-keys: |
+            libwebrtc-cache-${{ matrix.name }}-
+
+      - name: Build
+        shell: bash
+        env:
+          WEBRTC_BRANCH: ${{ inputs.webrtc_branch || 'm144_release' }}
+        run: |
+          echo "== 构建前磁盘 =="
+          df -h / || true
+
+          python3 "${{ github.workspace }}/scripts/build_libwebrtc.py" \
+            --platform "${{ matrix.name }}" \
+            --webrtc-branch "$WEBRTC_BRANCH" \
+            --temp-dir "$DW_TEMP"
+
+          echo "== 构建后磁盘 =="
+          df -h / || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: libwebrtc-${{ matrix.name }}
+          path: ${{ runner.temp }}/${{ matrix.asset }}
+          retention-days: 30
