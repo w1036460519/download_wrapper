@@ -59,12 +59,14 @@ PLATFORMS = {
         "target_os": "android",
         "target_cpu": "arm64",
         "needs_ndk": True,
+        "extra": {"android_static_analysis": "none"},
         "asset": "libwebrtc-android-arm64-release.zip",
     },
     "android-x64": {
         "target_os": "android",
         "target_cpu": "x64",
         "needs_ndk": True,
+        "extra": {"android_static_analysis": "none"},
         "asset": "libwebrtc-android-x64-release.zip",
     },
     "ios-arm64": {
