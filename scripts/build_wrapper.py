@@ -300,10 +300,14 @@ def find_vcpkg_installed(workspace: Path, triplet: str) -> Path | None:
 
 # ── Step 4: 后处理 ──
 
-def strip_binary(filepath: Path, platform_os: str):
+def strip_binary(filepath: Path, platform_os: str, triplet: str = ""):
     """strip 符号裁剪。"""
     if platform_os == "linux":
-        run(["strip", "--strip-unneeded", str(filepath)])
+        if triplet == "arm64-linux":
+            # 交叉编译场景：x64 runner 上的系统 strip 无法识别 arm64 ELF
+            run(["aarch64-linux-gnu-strip", "--strip-unneeded", str(filepath)])
+        else:
+            run(["strip", "--strip-unneeded", str(filepath)])
     elif platform_os == "macos":
         run(["strip", "-x", str(filepath)])
     elif platform_os == "android":
@@ -374,7 +378,7 @@ def build_single_arch(workspace: Path, cfg: dict, vcpkg_dir: Path,
 
     # strip（Windows DLL 无需 strip）
     if cfg["os"] in ("linux", "android"):
-        strip_binary(dist / cfg["output"], cfg["os"])
+        strip_binary(dist / cfg["output"], cfg["os"], cfg.get("triplet", ""))
 
     return dist / cfg["output"]
 
