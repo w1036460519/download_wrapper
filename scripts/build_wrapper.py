@@ -224,6 +224,12 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
     if triplet:
         cmd.append(f"-DVCPKG_TARGET_TRIPLET={triplet}")
 
+    # linux-arm64 交叉编译：注入 chainload 工具链（指定 aarch64 交叉编译器）
+    if triplet == "arm64-linux":
+        cross_tc = workspace / "cmake" / "aarch64-linux-toolchain.cmake"
+        if cross_tc.exists():
+            cmd.append(f"-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE={cross_tc}")
+
     # overlay triplets（macOS/iOS 需要自定义部署目标）
     if cfg.get("overlay_triplets"):
         overlay = workspace / "vcpkg-triplets"
@@ -378,16 +384,16 @@ def build_macos_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
 
     # arm64
     cmake_configure(workspace / "build-arm64", workspace,
-                    {**cfg, "triplet": "arm64-osx", "deploy_target": deploy,
-                     "extra_cmake_args": [f"-DCMAKE_OSX_ARCHITECTURES=arm64"]},
-                    vcpkg_dir, libwebrtc_dir)
+                    {**cfg, "triplet": "arm64-osx", "deploy_target": deploy},
+                    vcpkg_dir, libwebrtc_dir,
+                    extra_args=["-DCMAKE_OSX_ARCHITECTURES=arm64"])
     cmake_build(workspace / "build-arm64")
 
     # x64
     cmake_configure(workspace / "build-x64", workspace,
-                    {**cfg, "triplet": "x64-osx", "deploy_target": deploy,
-                     "extra_cmake_args": [f"-DCMAKE_OSX_ARCHITECTURES=x86_64"]},
-                    vcpkg_dir, libwebrtc_dir)
+                    {**cfg, "triplet": "x64-osx", "deploy_target": deploy},
+                    vcpkg_dir, libwebrtc_dir,
+                    extra_args=["-DCMAKE_OSX_ARCHITECTURES=x86_64"])
     cmake_build(workspace / "build-x64")
 
     # 合并
@@ -410,16 +416,16 @@ def build_ios_simulator_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
     """iOS simulator universal: arm64 + x64 各编译后合并。"""
     # arm64 模拟器
     cmake_configure(workspace / "build-sim-arm64", workspace,
-                    {**cfg, "triplet": "arm64-ios-simulator", "simulator": True,
-                     "extra_cmake_args": ["-DCMAKE_OSX_ARCHITECTURES=arm64"]},
-                    vcpkg_dir, libwebrtc_dir)
+                    {**cfg, "triplet": "arm64-ios-simulator", "simulator": True},
+                    vcpkg_dir, libwebrtc_dir,
+                    extra_args=["-DCMAKE_OSX_ARCHITECTURES=arm64"])
     cmake_build(workspace / "build-sim-arm64")
 
     # x64 模拟器
     cmake_configure(workspace / "build-sim-x64", workspace,
-                    {**cfg, "triplet": "x64-ios-simulator", "simulator": True,
-                     "extra_cmake_args": ["-DCMAKE_OSX_ARCHITECTURES=x86_64"]},
-                    vcpkg_dir, libwebrtc_dir)
+                    {**cfg, "triplet": "x64-ios-simulator", "simulator": True},
+                    vcpkg_dir, libwebrtc_dir,
+                    extra_args=["-DCMAKE_OSX_ARCHITECTURES=x86_64"])
     cmake_build(workspace / "build-sim-x64")
 
     # 合并为 universal

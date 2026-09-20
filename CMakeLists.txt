@@ -114,6 +114,8 @@ else()
 endif()
 if(DW_ARCH STREQUAL "x86_64")
     set(DW_ARCH "x64")
+elseif(DW_ARCH STREQUAL "aarch64")
+    set(DW_ARCH "arm64")
 endif()
 
 set_target_properties(download_wrapper PROPERTIES
