@@ -8,6 +8,6 @@ set(VCPKG_OSX_SYSROOT iphonesimulator)
 set(VCPKG_OSX_ARCHITECTURES arm64)
 set(VCPKG_OSX_DEPLOYMENT_TARGET "17.0")
 
-# C++20 支持（std::jthread / std::stop_token 需要）
+# C++20 支持
 set(VCPKG_C_FLAGS "-std=c99")
 set(VCPKG_CXX_FLAGS "-std=c++20")

@@ -1249,7 +1249,7 @@ namespace dw {
             }
 
             void start_task(dl_task_ctx *tCtx) {
-                tCtx->task_thread = std::jthread(task_thread_func, tCtx);
+                tCtx->task_thread = std::thread(task_thread_func, tCtx);
             }
 
             /* =====================================================================

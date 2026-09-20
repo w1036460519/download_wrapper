@@ -59,10 +59,12 @@ namespace dw {
     namespace {
         // 单例 session
         std::unique_ptr<lt::session> g_session;
-        // alert 轮询线程（jthread：停止请求 + 自动 join）
-        std::jthread g_alert_thread;
+        // alert 轮询线程
+        std::thread g_alert_thread;
         // 恢复数据定时请求线程（每 5 秒）
-        std::jthread g_resume_thread;
+        std::thread g_resume_thread;
+        // 线程运行标志：destroy() 置 false 后唤醒循环
+        std::atomic<bool> g_running{false};
         // 进度回调间隔（ms）
         int g_interval_ms = 1000;
         // BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文。
@@ -98,7 +100,7 @@ namespace dw {
                 log_e(info_hash.c_str(), "任务管理器异常: session=%p, task_manager=%p",
                       static_cast<void *>(g_session.get()), static_cast<void *>(g_task_manager));
                 return {};
-            }
+            
             lt::sha1_hash h;
             if (lt::aux::from_hex(info_hash, h.data())) {
                 if (auto th = g_session->find_torrent(h); th.is_valid()) {
@@ -626,8 +628,8 @@ namespace dw {
         }
 
         // 采集 alert
-        void alert_loop(const std::stop_token &st) {
-            while (!st.stop_requested()) {
+        void alert_loop() {
+            while (g_running.load()) {
                 try {
                     if (g_session->wait_for_alert(std::chrono::milliseconds(1000))) {
                         std::vector<lt::alert *> alerts;
@@ -645,8 +647,8 @@ namespace dw {
         }
 
         // 每 5 秒对发起元数据请求 save_resume_data，
-        void resume_loop(const std::stop_token &st) {
-            while (!st.stop_requested()) {
+        void resume_loop() {
+            while (g_running.load()) {
                 if (g_session) {
                     try {
                         int total = 0, downloading = 0, finished = 0, seeding = 0, paused = 0;
@@ -783,8 +785,9 @@ namespace dw {
         }
 
         g_task_manager = task_manager;
-        g_alert_thread = std::jthread(alert_loop);
-        g_resume_thread = std::jthread(resume_loop);
+        g_running.store(true);
+        g_alert_thread = std::thread(alert_loop);
+        g_resume_thread = std::thread(resume_loop);
 
         initialized_ = true;
         log_i("bt", "初始化引擎完成 interval: %dms", g_interval_ms);
@@ -818,12 +821,11 @@ namespace dw {
             return;
         }
         // 先停止工作线程，再销毁 session。
+        g_running.store(false);
         if (g_resume_thread.joinable()) {
-            g_resume_thread.request_stop();
             g_resume_thread.join();
         }
         if (g_alert_thread.joinable()) {
-            g_alert_thread.request_stop();
             g_alert_thread.join();
         }
         g_session.reset();

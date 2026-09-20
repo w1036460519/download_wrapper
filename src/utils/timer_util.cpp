@@ -17,7 +17,8 @@ namespace dw::utils {
         struct timer_io_ctx {
             boost::asio::io_context ioc;
             boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
-            std::jthread worker;
+            std::thread worker;
+            std::atomic<bool> running{true};
 
             timer_io_ctx()
                 : work(boost::asio::make_work_guard(ioc))
@@ -25,7 +26,8 @@ namespace dw::utils {
 
             ~timer_io_ctx() {
                 work.reset();
-                worker.request_stop();
+                ioc.stop();
+                running.store(false);
                 if (worker.joinable()) worker.join();
             }
         };

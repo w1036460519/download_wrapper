@@ -219,11 +219,11 @@ namespace dw {
         void collect_progress_locked(std::vector<FileRecord> &fwd_records);
 
         // A 线程（轻量）：周期遍历内存 + 转发回调，不落库 / 不快照 / 不移除 / 不 sweep。
-        // stop_token 由 jthread 自动传入，stop() 请求停止后唤醒等待点并退出循环。
-        void scheduler_loop(std::stop_token st);
+        // stop() 置 running_=false 后由 notify_all 唤醒等待点并退出循环。
+        void scheduler_loop();
 
         // B 线程（重载）：较长节拍或被 schedule 唤醒，持锁完成持久化 / 区间快照 / 终态注销 / 准入，随后锁外 sweep。
-        void maintenance_loop(std::stop_token st);
+        void maintenance_loop();
 
         // B 线程消费单个引擎事件（PARSED/DOWNLOAD_FAILED/DOWNLOAD_COMPLETED/STATUS_UPDATE/
         // RESUME_DATA/PAUSED/RESUMED/DELETED）。
@@ -297,8 +297,8 @@ namespace dw {
         bool file_cache_loaded_ = false;
 
         TaskStore store_; // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
-        std::jthread worker_; // A 线程：轻量采集 + 回调（析构兜底自动请求停止并 join）
-        std::jthread maintenance_; // B 线程：持久化 + 区间快照 + 终态注销 + 准入 + sweep
+        std::thread worker_; // A 线程：轻量采集 + 回调（stop() 显式 join）
+        std::thread maintenance_; // B 线程：持久化 + 区间快照 + 终态注销 + 准入 + sweep
         std::atomic<bool> running_{false}; // 生命周期标志：start 准入 / stop 幂等守卫 / run_schedule 准入闸门
         bool schedule_needed_ = false; // 调度线程需被唤醒
         bool net_allowed_ = true; // 流量闸门：false=关闭（不准入新任务）；默认开启，不持久化，由调用方重启后重新下发

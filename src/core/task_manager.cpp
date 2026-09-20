@@ -125,8 +125,8 @@ namespace dw {
 
         running_.store(true);
         schedule_needed_ = true;
-        worker_ = std::jthread([this](std::stop_token st) { scheduler_loop(std::move(st)); });
-        maintenance_ = std::jthread([this](std::stop_token st) { maintenance_loop(std::move(st)); });
+        worker_ = std::thread([this] { scheduler_loop(); });
+        maintenance_ = std::thread([this] { maintenance_loop(); });
 
         log_i("", "下载器启动 clientId=%s tasks=%zu concurrent=%d",
               client_id_.c_str(), tasks_.size(), max_concurrent_);
@@ -137,9 +137,7 @@ namespace dw {
         if (!running_.exchange(false)) {
             return;
         }
-        // request_stop 驱动循环条件退出；notify_all 立即唤醒两循环的 cv 等待点。
-        worker_.request_stop();
-        maintenance_.request_stop();
+        // running_=false 驱动循环条件退出；notify_all 立即唤醒两循环的 cv 等待点。
         cv_.notify_all();
         if (worker_.joinable()) {
             worker_.join();
@@ -856,9 +854,9 @@ namespace dw {
     /*                          调度线程                                  */
     /* ================================================================== */
 
-    void TaskManager::scheduler_loop(std::stop_token st) {
+    void TaskManager::scheduler_loop() {
         // 采集后同步到内存和调用回调
-        while (!st.stop_requested()) {
+        while (running_.load()) {
             std::vector<FileRecord> fwd_records;
             bool wake_schedule = false;
 
@@ -867,7 +865,7 @@ namespace dw {
                 // 超时至下一拍；stop() 置 running_=false 后由 notify_all 立即唤醒。
                 cv_.wait_for(lock, std::chrono::milliseconds(flush_interval_ms_),
                              [this] { return !running_.load(); });
-                if (st.stop_requested()) break;
+                if (!running_.load()) break;
 
                 // 采集数据
                 collect_progress_locked(fwd_records);
@@ -916,14 +914,14 @@ namespace dw {
         }
     }
 
-    void TaskManager::maintenance_loop(std::stop_token st) {
-        while (!st.stop_requested()) {
+    void TaskManager::maintenance_loop() {
+        while (running_.load()) {
             {
                 std::unique_lock<std::mutex> lock(mtx_);
                 // 停止请求 / 调度请求任一满足即唤醒；停止与否出锁后统一判。
                 cv_.wait_for(lock, std::chrono::milliseconds(maintenance_interval_ms_),
                              [this] { return !running_.load() || schedule_needed_; });
-                if (st.stop_requested()) break;
+                if (!running_.load()) break;
 
                 maintenance_persist_locked();
 

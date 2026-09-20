@@ -48,7 +48,7 @@ endif()
 
 if(APPLE)
     if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-        # std::jthread/stop_token 需 iOS 17+；std::format chrono 需 macOS 14+
+        # std::format chrono 需 macOS 14+；iOS 17+ 对齐
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
             set(CMAKE_OSX_DEPLOYMENT_TARGET "17.0" CACHE STRING "")
         else()
