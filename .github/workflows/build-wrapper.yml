@@ -29,7 +29,7 @@ on:
       - '.github/workflows/build-wrapper.yml'
 
 env:
-  VCPKG_REF: '2026.06.24'
+  VCPKG_REF: 'latest'
 
 jobs:
   build:

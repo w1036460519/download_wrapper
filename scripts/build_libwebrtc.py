@@ -95,7 +95,8 @@ def run(cmd, **kwargs):
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        encoding='utf-8',
+        errors='replace',
         bufsize=1,
         **kwargs
     )
@@ -263,7 +264,8 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
         args = {**common, **extra}
         args_str = gn_args_string(args)
         cmd = _depot_cmd("gn", "gen", out_dir, f"--args={args_str}")
-        result = subprocess.run(cmd, cwd=str(webrtc_src), capture_output=True, text=True)
+        result = subprocess.run(cmd, cwd=str(webrtc_src), capture_output=True,
+                                 encoding='utf-8', errors='replace')
         if result.returncode != 0:
             output = (result.stdout or "") + (result.stderr or "")
             if output.strip():
@@ -310,7 +312,8 @@ def ninja_build(webrtc_src: Path, platform_name: str):
     for d in dirs:
         result = subprocess.run(
             _depot_cmd("ninja", "-C", d, "default"),
-            cwd=str(webrtc_src), env=env, capture_output=True, text=True
+            cwd=str(webrtc_src), env=env, capture_output=True,
+            encoding='utf-8', errors='replace'
         )
         if result.returncode != 0:
             output = (result.stdout or "") + (result.stderr or "")

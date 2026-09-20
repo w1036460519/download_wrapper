@@ -7,7 +7,7 @@
 
 用法：
   python3 scripts/build_wrapper.py --platform macos-universal
-  python3 scripts/build_wrapper.py --platform linux-x64 --vcpkg-ref 2026.06.24
+  python3 scripts/build_wrapper.py --platform linux-x64 --vcpkg-ref latest
 """
 
 import argparse
@@ -111,7 +111,7 @@ def run(cmd, **kwargs):
     print(f"\n$ {cmd_str}")
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, **kwargs
+        encoding='utf-8', errors='replace', bufsize=1, **kwargs
     )
     for line in process.stdout:
         print(line, end='')
@@ -123,20 +123,22 @@ def run(cmd, **kwargs):
 
 def run_capture(cmd, **kwargs):
     """执行命令并捕获输出。"""
-    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    result = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='replace', **kwargs)
     return result
 
 
 # ── Step 1: vcpkg ──
 
 def setup_vcpkg(workspace: Path, vcpkg_ref: str, temp_dir: Path) -> Path:
-    """克隆 vcpkg 并 bootstrap，返回 vcpkg 根目录。"""
+    """克隆 vcpkg 并 bootstrap，返回 vcpkg 根目录。
+    vcpkg_ref 为空或 'latest' 时跟踪 master 最新。"""
     vcpkg_dir = temp_dir / "vcpkg"
     if vcpkg_dir.exists():
         shutil.rmtree(vcpkg_dir)
 
     run(["git", "clone", "https://github.com/microsoft/vcpkg.git", str(vcpkg_dir)])
-    run(["git", "checkout", vcpkg_ref], cwd=str(vcpkg_dir))
+    if vcpkg_ref and vcpkg_ref != "latest":
+        run(["git", "checkout", vcpkg_ref], cwd=str(vcpkg_dir))
 
     # bootstrap
     if platform.system() == "Windows":
@@ -436,7 +438,7 @@ def main():
     parser = argparse.ArgumentParser(description="编译 download_wrapper 全平台产物")
     parser.add_argument("--platform", required=True, choices=PLATFORMS.keys(),
                         help="目标平台")
-    parser.add_argument("--vcpkg-ref", default=os.environ.get("VCPKG_REF", "2026.06.24"),
+    parser.add_argument("--vcpkg-ref", default=os.environ.get("VCPKG_REF", "latest"),
                         help="vcpkg 版本 tag")
     parser.add_argument("--workspace", default=os.getcwd(),
                         help="项目根目录")
