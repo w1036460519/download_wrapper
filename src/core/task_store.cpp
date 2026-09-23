@@ -289,30 +289,6 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    std::vector<uint8_t> TaskStore::load_resume(const std::string &client_id, const dw_protocol_t protocol,
-                                                const std::string &natural_key) const {
-        std::vector<uint8_t> out;
-        constexpr auto sql =
-                "SELECT data FROM resume_data WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
-            return out;
-        }
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            const void *blob = sqlite3_column_blob(st, 0);
-            const int n = sqlite3_column_bytes(st, 0);
-            if (blob && n > 0) {
-                const auto *p = static_cast<const uint8_t *>(blob);
-                out.assign(p, p + n);
-            }
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
     void TaskStore::clear_resume(const std::string &client_id, const dw_protocol_t protocol,
                                  const std::string &natural_key) const {
         constexpr auto sql =
@@ -359,7 +335,7 @@ namespace dw {
                                                       const std::string &natural_key) const {
         ResumeInfo info;
         constexpr auto sql =
-                "SELECT data, save_path, magnet_link, torrent_file FROM resume_data WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
+                "SELECT data, magnet_link, torrent_file FROM resume_data WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return info;
         bind_text(st, ":client_id", client_id);
@@ -372,16 +348,12 @@ namespace dw {
                 const auto *p = static_cast<const uint8_t *>(blob);
                 info.data.assign(p, p + sqlite3_column_bytes(st, 0));
             }
-            // save_path (TEXT)
-            if (const char *s = reinterpret_cast<const char *>(sqlite3_column_text(st, 1)); s) {
-                info.save_path = s;
-            }
             // magnet_link (TEXT)
-            if (const char *m = reinterpret_cast<const char *>(sqlite3_column_text(st, 2)); m) {
+            if (const char *m = reinterpret_cast<const char *>(sqlite3_column_text(st, 1)); m) {
                 info.magnet_link = m;
             }
             // torrent_file (TEXT)
-            if (const char *t = reinterpret_cast<const char *>(sqlite3_column_text(st, 3)); t) {
+            if (const char *t = reinterpret_cast<const char *>(sqlite3_column_text(st, 2)); t) {
                 info.torrent_file = t;
             }
         }
@@ -520,6 +492,70 @@ namespace dw {
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
         bind_text(st, ":client_id", client_id);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            FileRecord r;
+            fill_file_record(st, r);
+            out.push_back(std::move(r));
+        }
+        sqlite3_finalize(st);
+        return out;
+    }
+
+    std::vector<FileRecord> TaskStore::load_file_records(const std::string &client_id,
+                                                         const std::vector<dw_task_status_t> &statuses) const {
+        std::vector<FileRecord> out;
+        if (statuses.empty()) return out;
+        // 动态构建 IN 子句：status IN (?, ?, ...)
+        std::string placeholders;
+        for (size_t i = 0; i < statuses.size(); ++i) {
+            if (i > 0) placeholders += ", ";
+            placeholders += "?";
+        }
+        const std::string sql =
+            "SELECT * FROM file_records WHERE client_id=? AND status IN (" + placeholders + ") ORDER BY modified_at DESC;";
+        sqlite3_stmt *st = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return out;
+        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        for (size_t i = 0; i < statuses.size(); ++i) {
+            sqlite3_bind_int(st, static_cast<int>(i + 2), static_cast<int>(statuses[i]));
+        }
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            FileRecord r;
+            fill_file_record(st, r);
+            out.push_back(std::move(r));
+        }
+        sqlite3_finalize(st);
+        return out;
+    }
+
+    std::vector<FileRecord> TaskStore::load_file_records(const std::string &client_id,
+                                                         const std::vector<dw_protocol_t> &protocols,
+                                                         const std::vector<dw_task_status_t> &statuses) const {
+        std::vector<FileRecord> out;
+        if (protocols.empty() || statuses.empty()) return out;
+        // 动态构建 IN 子句：protocol IN (?, ...) AND status IN (?, ...)
+        std::string proto_placeholders, status_placeholders;
+        for (size_t i = 0; i < protocols.size(); ++i) {
+            if (i > 0) proto_placeholders += ", ";
+            proto_placeholders += "?";
+        }
+        for (size_t i = 0; i < statuses.size(); ++i) {
+            if (i > 0) status_placeholders += ", ";
+            status_placeholders += "?";
+        }
+        const std::string sql =
+            "SELECT * FROM file_records WHERE client_id=? AND protocol IN (" + proto_placeholders +
+            ") AND status IN (" + status_placeholders + ") ORDER BY modified_at DESC;";
+        sqlite3_stmt *st = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return out;
+        int idx = 1;
+        sqlite3_bind_text(st, idx++, client_id.c_str(), -1, SQLITE_TRANSIENT);
+        for (size_t i = 0; i < protocols.size(); ++i) {
+            sqlite3_bind_int(st, idx++, static_cast<int>(protocols[i]));
+        }
+        for (size_t i = 0; i < statuses.size(); ++i) {
+            sqlite3_bind_int(st, idx++, static_cast<int>(statuses[i]));
+        }
         while (sqlite3_step(st) == SQLITE_ROW) {
             FileRecord r;
             fill_file_record(st, r);

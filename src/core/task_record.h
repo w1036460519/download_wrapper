@@ -82,6 +82,7 @@ struct FileRecord {
     bool    synth_notified = false; // 引擎无 ctx 的合成态已向上层合成过一帧回调
     std::vector<int32_t> file_indexes;          // 文件索引列表
     std::vector<int32_t> priority_file_indexes; // 优先下载文件索引
+    bool force = false;                         // 强制准入标记（调度器让行后自动清除）
 
     // 运行态遥测（不持久化）：引擎线程经 on_progress 推入，A 线程节拍读取并转发
     double download_rate = 0.0;     // 下载速率（B/s）

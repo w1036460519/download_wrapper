@@ -65,10 +65,6 @@ namespace dw {
         void save_resume(const std::string &client_id, dw_protocol_t protocol,
                          const std::string &natural_key, const uint8_t *data, size_t size) const;
 
-        /// 读取断点续传数据；不存在返回空 vector。
-        std::vector<uint8_t> load_resume(const std::string &client_id, dw_protocol_t protocol,
-                                         const std::string &natural_key) const;
-
         /// 仅清除某任务的断点续传数据。
         void clear_resume(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
 
@@ -78,10 +74,9 @@ namespace dw {
                                 const std::string &save_path,
                                 const std::string &magnet_link, const std::string &torrent_file) const;
 
-        /// 恢复信息结构体：包含 resume data 二进制、save_path、magnet_link、torrent_file
+        /// 恢复信息结构体：包含 resume data 二进制、magnet_link、torrent_file
         struct ResumeInfo {
             std::vector<uint8_t> data; ///< libtorrent resume 二进制数据
-            std::string save_path; ///< 保存路径（兜底恢复时使用）
             std::string magnet_link; ///< 磁力链接
             std::string torrent_file; ///< 种子文件路径
         };
@@ -110,6 +105,17 @@ namespace dw {
 
         /// 载入指定客户端的全部文件记录（按 modified_at DESC）。
         std::vector<FileRecord> load_file_records(const std::string &client_id) const;
+
+        /// 载入指定客户端指定状态集合的文件记录（按 modified_at DESC）。
+        /// 用于启动时按需加载活跃态任务，避免全量加载浪费。
+        std::vector<FileRecord> load_file_records(const std::string &client_id,
+                                                  const std::vector<dw_task_status_t> &statuses) const;
+
+        /// 载入指定客户端、指定协议集合、指定状态集合的文件记录（按 modified_at DESC）。
+        /// 用于按协议维度精确过滤，避免加载不相关协议的任务。
+        std::vector<FileRecord> load_file_records(const std::string &client_id,
+                                                  const std::vector<dw_protocol_t> &protocols,
+                                                  const std::vector<dw_task_status_t> &statuses) const;
 
         /// 载入指定客户端某 save_path 下的文件记录（按 modified_at DESC）。
         std::vector<FileRecord> load_file_records_by_save_path(const std::string &client_id,

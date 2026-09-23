@@ -34,13 +34,13 @@ public:
      * 初始化引擎。
      * @return 0=成功，-1=失败。
      */
-    int32_t init(const dw_config_t* cfg, TaskManager* task_manager) override;
+    int32_t init(const Config *cfg, TaskManager *task_manager) override;
 
     /**
      * 配置热更新：经 session apply_settings 下发上/下行限速，并刷新做种分享率上限。
      * 监听端口与默认 trackers 仅 init 时生效。
      */
-    void update_config(const dw_config_t* cfg) override;
+    void update_config(const Config *cfg) override;
 
     /**
      * 销毁引擎，释放所有资源。
@@ -50,8 +50,7 @@ public:
     /**
      * 添加单个 BT 下载任务（不含 resume_data，仅创建 handle）。
      */
-    int32_t add_task(const dw_task_params_t* params,
-                     dw_submit_result_t*     out_result) override;
+    dw_submit_result_t add_task(const TaskParams *params) override;
 
     /**
      * 恢复单个 BT 下载任务（调度器准入时调用）。
@@ -64,21 +63,18 @@ public:
     /**
      * 暂停单个 BT 下载任务。
      */
-    int32_t pause_task(const std::string &info_hash,
-                       const std::string &client_id,
-                       dw_submit_result_t* out_result) override;
+    dw_submit_result_t pause_task(const std::string &info_hash,
+                                  const std::string &client_id) override;
 
     /**
      * 删除单个 BT 下载任务（事件驱动模型）：
      *   - handle 有效 → remove_torrent(delete_files)，后续由 torrent_removed_alert /
      *     torrent_deleted_alert 触发 DELETED 事件；
      *   - handle 无效 → 按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
-     * @return 0=引擎已接管；-1=错误。
      */
-    int32_t delete_task(const std::string &info_hash,
-                        const std::string &client_id,
-                        int32_t             delete_files,
-                        dw_submit_result_t* out_result) override;
+    dw_submit_result_t delete_task(const std::string &info_hash,
+                                   const std::string &client_id,
+                                   int32_t delete_files) override;
 
     /**
      * 查询任务运行时资源是否已释放：session 完成移除（find_handle 失效）即视为
@@ -90,13 +86,13 @@ public:
      * 解析磁力链接获取 info_hash。
      * 纯解析、不依赖引擎实例状态，故为 static。
      */
-    static char* magnet_to_info_hash(const std::string &magnet_link);
+    static dw_submit_result_t parse_magnet(const std::string &magnet_link);
 
     /**
-     * 解析 .torrent 文件获取 info_hash。
+     * 解析 .torrent 文件获取 info_hash 和文件列表。
      * 纯解析、不依赖引擎实例状态，故为 static。
      */
-    static char* torrent_file_to_info_hash(const std::string &torrent_file_path);
+    static dw_submit_result_t parse_torrent_file(const std::string &torrent_file_path);
 
     /**
      * info_hash 转磁力链接。
@@ -138,10 +134,10 @@ public:
                        std::string& out_path, int64_t& out_size) override;
 
     /**
-     * 文件列表实时查询：选中文件的扁平清单（pad 文件过滤，优先级口径与
-     * PARSED 上报一致）。连续数组由 alloc_file_list 分配，调用方负责释放。
+     * 文件列表实时查询：全量文件清单（pad 已过滤），含选中状态。
      */
-    utils::file_array get_file_list(const std::string &task_id) override;
+    dw_submit_result_t get_file_list(const std::string &client_id,
+                                      const std::string &natural_key) override;
 
     /**
      * 周期性维护策略：回收已达做种分享率阈值的任务（remove_torrent 释放上下文）。

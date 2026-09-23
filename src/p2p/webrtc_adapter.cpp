@@ -176,7 +176,7 @@ std::string WebrtcAdapter::generate_offer() {
             sdp_promise_.set_value({sdp.std_string(), type.std_string()});
         },
         [](const char *err) {
-            dw::log_e("p2p", "CreateOffer 失败: %s", err);
+            dw::log_e("p2p", "CreateOffer 失败: {}", err);
         },
         constraints);
 
@@ -266,7 +266,7 @@ std::string WebrtcAdapter::accept_offer(const std::string &offer_code) {
             sdp_promise_.set_value({sdp.std_string(), type.std_string()});
         },
         [](const char *err) {
-            dw::log_e("p2p", "CreateAnswer 失败: %s", err);
+            dw::log_e("p2p", "CreateAnswer 失败: {}", err);
         },
         constraints);
 
@@ -349,7 +349,7 @@ int32_t WebrtcAdapter::send(const void *data, size_t len) {
         bytes_sent_.fetch_add(static_cast<int64_t>(len));
         return DW_P2P_OK;
     } catch (const std::exception &e) {
-        dw::log_e("p2p", "发送失败: %s", e.what());
+        dw::log_e("p2p", "发送失败: {}", e.what());
         return DW_P2P_ERR_TRANSPORT;
     }
 }

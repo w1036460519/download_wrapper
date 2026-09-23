@@ -15,6 +15,7 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
+#include "internal/downloader_internal.h"
 #include "utils/memory_util.h"
 
 #include <cstdint>
@@ -33,14 +34,13 @@ public:
     virtual ~IDownloadEngine() = default;
 
     /// 初始化引擎。task_manager 用于事件投递。@return 0=成功，-1=失败。
-    virtual int32_t init(const dw_config_t* cfg, TaskManager* task_manager) = 0;
+    virtual int32_t init(const Config *cfg, TaskManager *task_manager) = 0;
 
     /// 销毁引擎，释放所有资源。
     virtual void destroy() = 0;
 
     /// 添加单个下载任务。
-    virtual int32_t add_task(const dw_task_params_t* params,
-                             dw_submit_result_t*     out_result) = 0;
+    virtual dw_submit_result_t add_task(const TaskParams *params) = 0;
 
     /// 恢复单个下载任务（调度器准入时调用；内部接口，字符串直接传 std::string）。
     /// 双行为：handle/ctx 存在则直接恢复；不存在则引擎内部经三要素自取 resume_data 重建。
@@ -52,20 +52,17 @@ public:
 
     /// 暂停单个下载任务（id 为引擎键：HTTP=url，BT=info_hash）。
     /// client_id 用于 BT 侧 handle 不在 session 时经恢复数据重建句柄；HTTP 不使用。
-    virtual int32_t pause_task(const std::string &id,
-                               const std::string &client_id,
-                               dw_submit_result_t* out_result) = 0;
+    virtual dw_submit_result_t pause_task(const std::string &id,
+                                          const std::string &client_id) = 0;
 
     /// 删除单个下载任务（事件驱动模型）：
     ///   - handle 有效 → remove_torrent(delete_files)，后续由 torrent_removed_alert /
     ///     torrent_deleted_alert 触发 DELETED 事件；
     ///   - handle 无效 → 按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
     /// wrapper 收到 DELETED 事件后回收资源、清理数据。
-    /// @return 0=引擎已接管；-1=错误。
-    virtual int32_t delete_task(const std::string &id,
-                                const std::string &client_id,
-                                int32_t             delete_files,
-                                dw_submit_result_t* out_result) = 0;
+    virtual dw_submit_result_t delete_task(const std::string &id,
+                                           const std::string &client_id,
+                                           int32_t delete_files) = 0;
 
     /// 查询任务运行时资源是否已全部释放（线程已 join、文件/存储句柄已关闭）。
     /// 引擎未持有该任务（从未添加 / 已回收）同样视为已释放。
@@ -83,9 +80,7 @@ public:
     // ---- 可选钩子（默认空实现，Torrent 覆写） ----
 
     /// 配置热更新（dw_set_config 调用）：仅应用运行期可生效的字段（限速、做种分享率等）。
-    /// 字符串类字段（代理、UA、CA 证书）由工作线程直接引用，运行期替换会产生悬垂指针，
-    /// 故仅在 init 时生效，不在此处更新。默认空实现。
-    virtual void update_config(const dw_config_t* /*cfg*/) {}
+    virtual void update_config(const Config * /*cfg*/) {}
 
     /// 节拍入口（A 线程调用）：BT 覆写（触发 post_torrent_updates 刷新 + 续传检查点），
     /// HTTP 引擎由 worker 自推进度，无需实现。
@@ -103,9 +98,11 @@ public:
     virtual bool get_file_path(const std::string &/*id*/, int32_t /*file_index*/,
                                std::string& /*out_path*/, int64_t& /*out_size*/) { return false; }
 
-    /// 文件列表实时查询（BT 覆写）：返回选中文件的连续数组（pad 文件已过滤）。
-    /// 数组由 alloc_file_list 分配，调用方负责释放；handle 离线返回 {nullptr, 0}。
-    virtual utils::file_array get_file_list(const std::string &/*id*/) { return {nullptr, 0}; }
+    /// 文件列表实时查询（BT 覆写）：返回全量文件清单（pad 已过滤），含选中状态。
+    virtual dw_submit_result_t get_file_list(const std::string &/*client_id*/,
+                                              const std::string &/*natural_key*/) {
+        return dw_submit_result_t::failure(DW_REASON_ERROR, "不支持");
+    }
 };
 
 } // namespace dw

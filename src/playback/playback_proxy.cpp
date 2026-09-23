@@ -21,6 +21,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <boost/json.hpp>
 #include <boost/url.hpp>
 
 #include <atomic>
@@ -208,17 +209,31 @@ private:
         }
 
         // ---- 获取文件路径与总大小 ----
-        char*    raw_path = nullptr;
-        int64_t  file_size = -1;
-        if (dw_get_task_file_info(client_id_.c_str(), natural_key_.c_str(),
-                                  static_cast<int32_t>(file_index_),
-                                  &raw_path, &file_size) != 0 || !raw_path) {
+        boost::json::object info_params;
+        info_params["client_id"] = client_id_;
+        info_params["natural_key"] = natural_key_;
+        info_params["file_index"] = static_cast<int32_t>(file_index_);
+        char *info_resp = dw_get_task_file_info(boost::json::serialize(info_params).c_str());
+        if (!info_resp) {
             send_error(http::status::not_found, "Task or file not found");
             return;
         }
-        file_path_  = raw_path;
-        total_size_ = file_size;
-        dw_free(raw_path);
+        try {
+            auto resp_obj = boost::json::parse(info_resp).as_object();
+            if (resp_obj.at("code").as_int64() != 0) {
+                dw_free(info_resp);
+                send_error(http::status::not_found, "Task or file not found");
+                return;
+            }
+            const auto &data = resp_obj.at("data").as_object();
+            file_path_ = data.at("path").as_string().c_str();
+            total_size_ = data.at("size").as_int64();
+        } catch (const std::exception &) {
+            dw_free(info_resp);
+            send_error(http::status::internal_server_error, "Parse response failed");
+            return;
+        }
+        dw_free(info_resp);
 
         // ---- 开放区间补齐 ----
         if (range_end_ < 0) {
@@ -262,46 +277,44 @@ private:
         auto self = shared_from_this();
 
         // ---- 查询已下载分段（优先缓存，按状态区分） ----
-        dw_byte_range_t* ranges     = nullptr;
-        int32_t          range_count = 0;
-        const int32_t rc = dw_get_file_ranges(client_id_.c_str(), natural_key_.c_str(),
-                                              static_cast<int32_t>(file_index_),
-                                              &ranges, &range_count);
+        boost::json::object ranges_params;
+        ranges_params["client_id"] = client_id_;
+        ranges_params["natural_key"] = natural_key_;
+        ranges_params["file_index"] = static_cast<int32_t>(file_index_);
+        char *ranges_resp = dw_get_file_ranges(boost::json::serialize(ranges_params).c_str());
 
-        if (rc == -1) {
-            // 查询失败（任务不存在等）
-            if (!header_sent_) {
-                send_error(http::status::internal_server_error, "Range query failed");
+        // 解析 JSON 响应中的 ranges 数组
+        std::vector<std::pair<int64_t, int64_t>> segments;
+        if (ranges_resp) {
+            try {
+                auto resp_obj = boost::json::parse(ranges_resp).as_object();
+                if (resp_obj.at("code").as_int64() == 0) {
+                    const auto &data = resp_obj.at("data").as_object();
+                    if (data.contains("ranges")) {
+                        for (const auto &r : data.at("ranges").as_array()) {
+                            const auto &pair = r.as_array();
+                            segments.emplace_back(
+                                static_cast<int64_t>(pair[0].as_int64()),
+                                static_cast<int64_t>(pair[1].as_int64()));
+                        }
+                    }
+                }
+            } catch (const std::exception &) {
+                // 解析失败，segments 为空
             }
-            return;
+            dw_free(ranges_resp);
         }
-
-        if (rc == 2) {
-            // 非下载中且无数据：数据不会增长，停止等待
-            if (!header_sent_) {
-                send_error(http::status::not_found, "No data available");
-            } else {
-                // header 已发送但后续无数据：关闭写端
-                beast::error_code ec;
-                stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
-            }
-            return;
-        }
-
-        // rc == 0（有数据）或 rc == 1（下载中暂无，等待）
 
         // 查找 current_pos 所在的已下载范围
         bool found = false;
         int64_t seg_end = 0;
-        for (int32_t i = 0; i < range_count; ++i) {
-            if (current_pos >= ranges[i].start &&
-                current_pos <= ranges[i].end) {
+        for (const auto &[start, end] : segments) {
+            if (current_pos >= start && current_pos <= end) {
                 found  = true;
-                seg_end = ranges[i].end;
+                seg_end = end;
                 break;
             }
         }
-        dw_byte_range_free(ranges, range_count);
 
         // ========== 情况 1：current_pos 未命中任何分段 → 等待 ==========
         if (!found) {

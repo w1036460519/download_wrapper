@@ -1,10 +1,9 @@
 /**
  * @file memory_util.h
- * @brief dw_file_info_t / dw_submit_result_t 内存工具：节点与集合的申请/释放统一入口。
+ * @brief dw_file_info_t 内存工具：文件信息数组的申请/释放统一入口。
  *
- * 库内所有 dw_file_info_t / dw_submit_result_t 相关堆内存操作（节点构造、集合数组分配、
- * 字符串字段释放、数组整体释放）统一收敛至此；后续新增使用场景
- * 直接复用本工具，不得散落 std::malloc / std::free。
+ * 库内所有 dw_file_info_t 相关堆内存操作（数组分配、字符串字段释放）
+ * 统一收敛至此；后续新增使用场景直接复用本工具，不得散落 std::malloc / std::free。
  */
 #pragma once
 
@@ -30,10 +29,4 @@ namespace dw::utils {
     * @param count 节点数。
     */
     void free_file_list(dw_file_info_t *files, int32_t count);
-
-    /**
-    * 仅释放 dw_submit_result_t 内部字段（message/files/info_hash）并置空，不释放节点本体。
-    * @param result 待清理的提交结果节点。
-    */
-    void free_submit_result_fields(dw_submit_result_t &result);
 }

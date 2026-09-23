@@ -97,6 +97,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/depot_tools
           key: depot-tools-${{ runner.os }}
+          retention-days: 90
 
       # L2: WebRTC 源码 + 编译产物缓存（与 build-wrapper.yml 共享）
       - name: Cache libwebrtc
@@ -109,6 +110,7 @@ jobs:
           key: libwebrtc-cache-${{ matrix.name }}-${{ inputs.force_rebuild && github.run_id || 'fixed' }}
           restore-keys: |
             libwebrtc-cache-${{ matrix.name }}-
+          retention-days: 90
 
       - name: Build
         if: steps.filter.outputs.run == 'true'
@@ -133,4 +135,4 @@ jobs:
         with:
           name: libwebrtc-${{ matrix.name }}
           path: ${{ runner.temp }}/${{ matrix.asset }}
-          retention-days: 30
+          retention-days: 90

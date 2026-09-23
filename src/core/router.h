@@ -13,9 +13,7 @@
 #include <memory>
 #include <string>
 
-// 前向声明：dw_config_t 定义在 extern "C" 块中（全局命名空间）
-struct dw_config;
-typedef struct dw_config dw_config_t;
+#include "internal/downloader_internal.h"
 
 namespace dw {
     class TaskManager;
@@ -48,7 +46,7 @@ namespace dw {
         TaskManager* route(const std::string& client_id) const;
 
         /// 初始化 TaskManager（由 dw_init 调用）。
-        int32_t start(const dw_downloader* owner, const dw_config_t& cfg);
+        int32_t start(const dw_downloader *owner, const Config &cfg);
 
         /// 停止 TaskManager。
         void stop();

@@ -1,6 +1,6 @@
 /**
  * @file memory_util.cpp
- * @brief dw_file_info_t / dw_submit_result_t 内存工具实现。
+ * @brief dw_file_info_t 内存工具实现。
  */
 
 #include "utils/memory_util.h"
@@ -28,17 +28,5 @@ namespace dw::utils {
             std::free(files[i].ext);
         }
         std::free(files);
-    }
-
-    void free_submit_result_fields(dw_submit_result_t &result) {
-        std::free(result.message);
-        result.message = nullptr;
-        if (result.files) {
-            free_file_list(result.files, result.file_count);
-            result.files = nullptr;
-            result.file_count = 0;
-        }
-        std::free(result.info_hash);
-        result.info_hash = nullptr;
     }
 }

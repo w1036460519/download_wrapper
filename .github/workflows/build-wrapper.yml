@@ -3,7 +3,7 @@ name: Build Wrapper
 # 独立构建 download_wrapper（9 个平台）
 # 从缓存读取 libwebrtc 构建产物（key: libwebrtc-cache-{platform}）
 #
-# 触发：代码变更 或 手动触发
+# 触发：仅手动触发
 on:
   workflow_dispatch:
     inputs:
@@ -19,14 +19,6 @@ on:
           - windows
           - android
           - ios
-  push:
-    paths:
-      - 'src/**'
-      - 'include/**'
-      - 'CMakeLists.txt'
-      - 'vcpkg.json'
-      - 'scripts/build_wrapper.py'
-      - '.github/workflows/build-wrapper.yml'
 
 env:
   VCPKG_REF: 'latest'
@@ -121,6 +113,7 @@ jobs:
           key: libwebrtc-cache-${{ matrix.libwebrtc_name }}-fixed
           restore-keys: |
             libwebrtc-cache-${{ matrix.libwebrtc_name }}-
+          retention-days: 90
 
       # 缓存 vcpkg 二进制归档
       - name: Cache vcpkg binary archives
@@ -132,6 +125,7 @@ jobs:
           restore-keys: |
             vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-
             vcpkg-${{ matrix.name }}-
+          retention-days: 90
 
       # 缓存 CMake 构建产物（增量编译）
       - name: Cache CMake build
@@ -145,6 +139,7 @@ jobs:
           key: cmake-build-${{ matrix.name }}-${{ hashFiles('src/**', 'include/**', 'CMakeLists.txt') }}
           restore-keys: |
             cmake-build-${{ matrix.name }}-
+          retention-days: 90
 
       # Linux 系统依赖
       - name: Install Linux build deps

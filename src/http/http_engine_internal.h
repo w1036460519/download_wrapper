@@ -10,6 +10,7 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
+#include "internal/downloader_internal.h"
 
 #include <curl/curl.h>
 
@@ -311,7 +312,7 @@ struct dl_task_ctx {
 namespace dw {
     class TaskManager; // 前向声明
     namespace http_engine {
-        extern dw_config_t g_cfg;
+        extern Config g_cfg;
         extern std::mutex g_map_mtx;
         extern std::unordered_map<std::string, std::unique_ptr<dl_task_ctx> > g_tasks;
         extern std::atomic<bool> g_exit_flag;
@@ -405,10 +406,6 @@ namespace dw {
 
             /** 校验添加输入参数 */
             int validate_add_input(const char *url, const char *output_path, const char **err_out);
-
-            /** 设置提交结果 */
-            void set_result(dw_submit_result_t *r, const char *task_id,
-                            dw_reason_t code, const char *msg, const char *fmt, ...);
         }
     }
 } /* namespace dw::http_engine::internal */

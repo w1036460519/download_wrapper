@@ -87,10 +87,10 @@ DW_API int32_t dw_p2p_create(dw_p2p_handle *out_handle) {
             g_registry.emplace(raw, std::move(entry));
         }
         *out_handle = raw;
-        dw::log_i("p2p", "创建成功: impl=%s", TransportFactory::default_implementation_name());
+        dw::log_i("p2p", "创建成功: impl={}", TransportFactory::default_implementation_name());
         return 0;
     } catch (const std::exception &e) {
-        dw::log_e("p2p", "创建失败: %s", e.what());
+        dw::log_e("p2p", "创建失败: {}", e.what());
         return -1;
     }
 }
@@ -133,7 +133,7 @@ DW_API int32_t dw_p2p_generate_offer(dw_p2p_handle handle,
         const std::string code = e->adapter->generate_offer();
         return write_string(code, out_code, code_size, out_required);
     } catch (const std::exception &err) {
-        dw::log_e("p2p", "生成 offer 失败: %s", err.what());
+        dw::log_e("p2p", "生成 offer 失败: {}", err.what());
         return DW_P2P_ERR_TRANSPORT;
     }
 }
@@ -148,7 +148,7 @@ DW_API int32_t dw_p2p_accept_offer(dw_p2p_handle handle,
         const std::string answer = e->adapter->accept_offer(offer_code);
         return write_string(answer, out_code, code_size, out_required);
     } catch (const std::exception &err) {
-        dw::log_e("p2p", "接受 offer 失败: %s", err.what());
+        dw::log_e("p2p", "接受 offer 失败: {}", err.what());
         return DW_P2P_ERR_DECODE;
     }
 }
@@ -161,7 +161,7 @@ DW_API int32_t dw_p2p_accept_answer(dw_p2p_handle handle,
         e->adapter->accept_answer(answer_code);
         return DW_P2P_OK;
     } catch (const std::exception &err) {
-        dw::log_e("p2p", "接受 answer 失败: %s", err.what());
+        dw::log_e("p2p", "接受 answer 失败: {}", err.what());
         return DW_P2P_ERR_DECODE;
     }
 }
@@ -215,7 +215,7 @@ DW_API int32_t dw_p2p_close(dw_p2p_handle handle) {
         e->adapter->close();
         return 0;
     } catch (const std::exception &err) {
-        dw::log_e("p2p", "关闭失败: %s", err.what());
+        dw::log_e("p2p", "关闭失败: {}", err.what());
         return -1;
     }
 }

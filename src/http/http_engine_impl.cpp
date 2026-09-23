@@ -35,7 +35,7 @@
 /* ===================== 全局变量定义 ===================== */
 namespace dw {
     namespace http_engine {
-        dw_config_t g_cfg{};
+        Config g_cfg{};
         std::mutex g_map_mtx;
         std::unordered_map<std::string, std::unique_ptr<dl_task_ctx> > g_tasks;
         std::atomic<bool> g_exit_flag{false};
@@ -270,8 +270,7 @@ namespace dw {
                         return len;
                     }
 
-                    log_d(tCtx->url.c_str(), "[part %d] header: %.*s",
-                                pCtx->index, static_cast<int>(raw.size()), raw.data());
+                    log_d(tCtx->url.c_str(), "[part {}] header: {}", pCtx->index, static_cast<int>(raw.size()), raw.data());
 
                     if (raw.starts_with("HTTP/")) {
                         if (const auto sp = raw.find(' '); sp != std::string_view::npos) {
@@ -285,11 +284,7 @@ namespace dw {
                                 const bool full_stream_ok = tCtx->parts.size() <= 1
                                                             && tCtx->parts[pCtx->index].done == 0;
                                 if (code == 200 && !full_stream_ok) {
-                                    log_e(tCtx->url.c_str(),
-                                                "[part %d] drift: expected 206, got http_code=%ld (parts=%d done=%lld)",
-                                                pCtx->index, code,
-                                                static_cast<int>(tCtx->parts.size()),
-                                                static_cast<long long>(tCtx->parts[pCtx->index].done));
+                                    log_e(tCtx->url.c_str(), "[part {}] drift: expected 206, got http_code={} (parts={} done={})", pCtx->index, code, static_cast<int>(tCtx->parts.size()), static_cast<long long>(tCtx->parts[pCtx->index].done));
                                     return mark_drift_error();
                                 }
                             }
@@ -315,10 +310,7 @@ namespace dw {
                                         tCtx->total_size = total;
                                     }
                                     if (tCtx->total_size > 0 && total != tCtx->total_size) {
-                                        log_e(tCtx->url.c_str(),
-                                                    "[part %d] drift: Content-Range total=%lld, expected=%lld",
-                                                    pCtx->index, static_cast<long long>(total),
-                                                    static_cast<long long>(tCtx->total_size));
+                                        log_e(tCtx->url.c_str(), "[part {}] drift: Content-Range total={}, expected={}", pCtx->index, static_cast<long long>(total), static_cast<long long>(tCtx->total_size));
                                         return mark_drift_error();
                                     }
                                 }
@@ -344,24 +336,20 @@ namespace dw {
                         pCtx->seen_etag.assign(val);
                         if (tCtx->etag.empty()) tCtx->etag = pCtx->seen_etag;
                         if (!tCtx->etag.empty() && pCtx->seen_etag != tCtx->etag) {
-                            log_e(tCtx->url.c_str(),
-                                        "[part %d] drift: ETag changed, expected=\"%s\", got=\"%s\"",
-                                        pCtx->index, tCtx->etag.c_str(), pCtx->seen_etag.c_str());
+                            log_e(tCtx->url.c_str(), "[part {}] drift: ETag changed, expected=\"{}\", got=\"{}\"", pCtx->index, tCtx->etag, pCtx->seen_etag);
                             return mark_drift_error();
                         }
                     } else if (iequals(name, "Last-Modified")) {
                         pCtx->seen_last_modified.assign(val);
                         if (tCtx->last_modified.empty()) tCtx->last_modified = pCtx->seen_last_modified;
                         if (!tCtx->last_modified.empty() && pCtx->seen_last_modified != tCtx->last_modified) {
-                            log_e(tCtx->url.c_str(),
-                                        "[part %d] drift: Last-Modified changed, expected=\"%s\", got=\"%s\"",
-                                        pCtx->index, tCtx->last_modified.c_str(), pCtx->seen_last_modified.c_str());
+                            log_e(tCtx->url.c_str(), "[part {}] drift: Last-Modified changed, expected=\"{}\", got=\"{}\"", pCtx->index, tCtx->last_modified, pCtx->seen_last_modified);
                             return mark_drift_error();
                         }
                     }
                     return len;
                 } catch (...) {
-                    log_e(tCtx->url.c_str(), "[part %d] header_cb exception", pCtx->index);
+                    log_e(tCtx->url.c_str(), "[part {}] header_cb exception", pCtx->index);
                     return 0;
                 }
             }
@@ -386,10 +374,7 @@ namespace dw {
                 if (tCtx->status == DW_TASK_STATUS_ERROR || tCtx->cancel_req.load() || tCtx->pause_req.load()
                     || len == 0) {
                     // 任务已定错 / 取消 / 暂停 / 空数据：短返回终止本连接（预期控制流）
-                    log_d(tCtx->url.c_str(),
-                                "[part %d] write_cb abort: status=%d cancel=%d pause=%d len=%zu",
-                                pCtx->index, tCtx->status, tCtx->cancel_req.load(),
-                                tCtx->pause_req.load(), len);
+                    log_d(tCtx->url.c_str(), "[part {}] write_cb abort: status={} cancel={} pause={} len={}", pCtx->index, static_cast<int>(tCtx->status), tCtx->cancel_req.load(), tCtx->pause_req.load(), len);
                     return 0;
                 }
 
@@ -400,8 +385,7 @@ namespace dw {
                     finalize_probing(tCtx, pCtx);
                     if (tCtx->status == DW_TASK_STATUS_ERROR) {
                         // 失败细节（建目录/建文件/预分配）已由 finalize_probing 记录 ERROR
-                        log_d(tCtx->url.c_str(),
-                                    "[part %d] write_cb abort: finalize_probing failed", pCtx->index);
+                        log_d(tCtx->url.c_str(), "[part {}] write_cb abort: finalize_probing failed", pCtx->index);
                         push_progress(tCtx, true); // 首帧推送（ERROR 终态）
                         return 0;
                     }
@@ -415,9 +399,7 @@ namespace dw {
                     const int64_t remain = part.size - part.done;
                     if (remain <= 0) {
                         // 分片已满，不再写入
-                        log_d(tCtx->url.c_str(),
-                                    "[part %d] write_cb abort: part full, extra=%zu done=%lld",
-                                    pCtx->index, len, static_cast<long long>(part.done));
+                        log_d(tCtx->url.c_str(), "[part {}] write_cb abort: part full, extra={} done={}", pCtx->index, len, static_cast<long long>(part.done));
                         return 0;
                     }
                     if (static_cast<int64_t>(len) > remain) {
@@ -426,8 +408,7 @@ namespace dw {
                     }
                 }
                 if (!std::filesystem::exists(tCtx->full_file_path)) {
-                    log_e(tCtx->url.c_str(), "[part %d] file missing: path=%s",
-                                pCtx->index, tCtx->full_file_path.c_str());
+                    log_e(tCtx->url.c_str(), "[part {}] file missing: path={}", pCtx->index, tCtx->full_file_path);
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     part.status = DW_TASK_STATUS_ERROR;
                     part.reason = DW_REASON_ERROR;
@@ -439,9 +420,7 @@ namespace dw {
                 }
                 const auto off = static_cast<long long>(part.start + part.done);
                 if (const int werr = pCtx->file.pwrite_at(ptr, write_len, off); werr != 0) {
-                    log_e(tCtx->url.c_str(),
-                                "[part %d] write failed: wanted=%zu errno=%d",
-                                pCtx->index, write_len, werr);
+                    log_e(tCtx->url.c_str(), "[part {}] write failed: wanted={} errno={}", pCtx->index, write_len, werr);
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     part.status = DW_TASK_STATUS_ERROR;
                     part.reason = DW_REASON_ERROR;
@@ -498,17 +477,17 @@ namespace dw {
                 }
                 curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, g_cfg.verify_ssl ? 1L : 0L);
                 curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, g_cfg.verify_ssl ? 2L : 0L);
-                if (g_cfg.ca_bundle && *g_cfg.ca_bundle)
-                    curl_easy_setopt(curl, CURLOPT_CAINFO, g_cfg.ca_bundle);
-                if (g_cfg.proxy && *g_cfg.proxy) {
-                    curl_easy_setopt(curl, CURLOPT_PROXY, g_cfg.proxy);
-                    if (g_cfg.proxy_username && *g_cfg.proxy_username)
-                        curl_easy_setopt(curl, CURLOPT_PROXYUSERNAME, g_cfg.proxy_username);
-                    if (g_cfg.proxy_password && *g_cfg.proxy_password)
-                        curl_easy_setopt(curl, CURLOPT_PROXYPASSWORD, g_cfg.proxy_password);
+                if (!g_cfg.ca_bundle.empty())
+                    curl_easy_setopt(curl, CURLOPT_CAINFO, g_cfg.ca_bundle.c_str());
+                if (!g_cfg.proxy.empty()) {
+                    curl_easy_setopt(curl, CURLOPT_PROXY, g_cfg.proxy.c_str());
+                    if (!g_cfg.proxy_username.empty())
+                        curl_easy_setopt(curl, CURLOPT_PROXYUSERNAME, g_cfg.proxy_username.c_str());
+                    if (!g_cfg.proxy_password.empty())
+                        curl_easy_setopt(curl, CURLOPT_PROXYPASSWORD, g_cfg.proxy_password.c_str());
                 }
                 curl_easy_setopt(curl, CURLOPT_USERAGENT,
-                                 (g_cfg.user_agent && *g_cfg.user_agent) ? g_cfg.user_agent : "download_wrapper/2.0");
+                                 !g_cfg.user_agent.empty() ? g_cfg.user_agent.c_str() : "download_wrapper/2.0");
                 curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
                 // 全局下载限速：libcurl 仅提供单连接级限速（无跨 multi 的总量控制），
@@ -682,8 +661,7 @@ namespace dw {
                     const std::string unique = dw::utils::acquire_wrapper_name(
                         tCtx->output_path, wrapper);
                     if (unique != wrapper) {
-                        log_i(tCtx->url.c_str(),
-                                    "HTTP 判重：wrapper 包层 '%s' -> '%s'", wrapper.c_str(), unique.c_str());
+                        log_i(tCtx->url.c_str(), "HTTP 判重：wrapper 包层 '{}' -> '{}'", wrapper, unique);
                     }
                 
                     // HTTP 单文件模型：头到齐即可确定最终文件，推定名事件（TASK_FILES）。
@@ -716,7 +694,7 @@ namespace dw {
                 if (!tCtx->full_file_path.empty()) {
                     if (const auto dir_path = std::filesystem::path(tCtx->full_file_path).parent_path();
                         !dir_path.empty() && !mkdir_recursive(dir_path.string())) {
-                        log_e(tCtx->url.c_str(), "mkdir failed: %s", dir_path.string().c_str());
+                        log_e(tCtx->url.c_str(), "mkdir failed: {}", dir_path.string());
                         tCtx->status = DW_TASK_STATUS_ERROR;
                         tCtx->reason = DW_REASON_ERROR;
                         tCtx->message = "目录创建失败";
@@ -726,8 +704,7 @@ namespace dw {
                     // 随后按总大小预分配（resize_file 按路径操作，无需持有句柄）。
                     DwFile creator;
                     if (!creator.open(tCtx->full_file_path)) {
-                        log_e(tCtx->url.c_str(), "open failed: %s errno=%d",
-                                    tCtx->full_file_path.c_str(), errno);
+                        log_e(tCtx->url.c_str(), "open failed: {} errno={}", tCtx->full_file_path, errno);
                         tCtx->status = DW_TASK_STATUS_ERROR;
                         tCtx->reason = DW_REASON_ERROR;
                         tCtx->message = (errno == ENOSPC) ? "存储空间不足" : "存储异常，无法保存文件";
@@ -735,8 +712,7 @@ namespace dw {
                     }
                     if (tCtx->total_size > 0 &&
                         !creator.truncate(tCtx->full_file_path, tCtx->total_size)) {
-                        log_e(tCtx->url.c_str(), "truncate failed: size=%lld errno=%d",
-                                    static_cast<long long>(tCtx->total_size), errno);
+                        log_e(tCtx->url.c_str(), "truncate failed: size={} errno={}", static_cast<long long>(tCtx->total_size), errno);
                         tCtx->status = DW_TASK_STATUS_ERROR;
                         tCtx->reason = DW_REASON_ERROR;
                         tCtx->message = (errno == ENOSPC) ? "存储空间不足" : "存储异常，无法保存文件";
@@ -976,10 +952,7 @@ namespace dw {
                     // 误判为完成而截断文件。
                     if (pCtx->probe_window && rc == CURLE_OK && http_code == 206 && part.done > 0) {
                         pCtx->probe_window = 0;
-                        log_i(tCtx->url.c_str(),
-                                    "probe window done, continue: part=%d done=%lld/%lld",
-                                    pCtx->index, static_cast<long long>(part.done),
-                                    static_cast<long long>(part.size));
+                        log_i(tCtx->url.c_str(), "probe window done, continue: part={} done={}/{}", pCtx->index, static_cast<long long>(part.done), static_cast<long long>(part.size));
                         return true;
                     }
                     // 无总长（chunked 200）：连接正常结束即完成，以实收字节补全大小。
@@ -997,9 +970,7 @@ namespace dw {
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     auto &part = tCtx->parts[pCtx->index];
                     // 2xx 但区间未收满（服务器提前断开）：按次数重试续传。
-                    log_i(tCtx->url.c_str(),
-                                "incomplete: part=%d done=%lld/%lld",
-                                pCtx->index, static_cast<long long>(part.done), static_cast<long long>(part.size));
+                    log_i(tCtx->url.c_str(), "incomplete: part={} done={}/{}", pCtx->index, static_cast<long long>(part.done), static_cast<long long>(part.size));
                     if (pCtx->retry_count >= g_cfg.max_retries) {
                         part.status = DW_TASK_STATUS_ERROR;
                         part.reason = DW_REASON_NETWORK;
@@ -1007,21 +978,17 @@ namespace dw {
                         return false;
                     }
                     pCtx->retry_count++;
-                    log_i(tCtx->url.c_str(),
-                                "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
+                    log_i(tCtx->url.c_str(), "retry: part={} attempt={}/{}", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
                     return true;
                 }
 
                 int retryable = 0;
                 const dw_reason_t reason = classify_failure(rc, http_code, &retryable);
-                log_i(tCtx->url.c_str(),
-                            "failed: part=%d rc=%d http=%ld reason=%d retryable=%d",
-                            pCtx->index, static_cast<int>(rc), http_code, static_cast<int>(reason), retryable);
+                log_i(tCtx->url.c_str(), "failed: part={} rc={} http={} reason={} retryable={}", pCtx->index, static_cast<int>(rc), http_code, static_cast<int>(reason), retryable);
 
                 if (retryable && pCtx->retry_count < g_cfg.max_retries) {
                     pCtx->retry_count++;
-                    log_i(tCtx->url.c_str(),
-                                "retry: part=%d attempt=%d/%d", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
+                    log_i(tCtx->url.c_str(), "retry: part={} attempt={}/{}", pCtx->index, pCtx->retry_count, g_cfg.max_retries);
                     return true;
                 }
 
@@ -1082,8 +1049,7 @@ namespace dw {
                     auto add_part = [&](dl_part_ctx *pCtx) -> bool {
                         CURL *curl = build_easy_for_part(tCtx, pCtx);
                         if (!curl) {
-                            log_e(tCtx->url.c_str(), "[part %d] build_easy_for_part failed",
-                                        pCtx->index);
+                            log_e(tCtx->url.c_str(), "[part {}] build_easy_for_part failed", pCtx->index);
                             std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                             tCtx->parts[pCtx->index].status = DW_TASK_STATUS_ERROR;
                             tCtx->parts[pCtx->index].reason = DW_REASON_ERROR;
@@ -1131,7 +1097,7 @@ namespace dw {
                         if (mc == CURLM_OK)
                             mc = curl_multi_poll(multi, nullptr, 0, 200, nullptr);
                         if (mc != CURLM_OK) {
-                            log_e(tCtx->url.c_str(), "curl_multi error: %d", static_cast<int>(mc));
+                            log_e(tCtx->url.c_str(), "curl_multi error: {}", static_cast<int>(mc));
                             break;
                         }
 
@@ -1175,7 +1141,7 @@ namespace dw {
                         push_progress(tCtx);
                     }
                 } catch (const std::exception &e) {
-                    log_e(tCtx->url.c_str(), "run_parts_multi exception: %s", e.what());
+                    log_e(tCtx->url.c_str(), "run_parts_multi exception: {}", e.what());
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->status = DW_TASK_STATUS_ERROR;
                     tCtx->reason = DW_REASON_ERROR;
@@ -1229,7 +1195,7 @@ namespace dw {
                     // 暂停退出（分片下载中被打断）：worker 结束前固化一次续传断点，ctx 随后由 sweep 回收。
                     else if (tCtx->pause_req.load() && !tCtx->cancel_req.load()) maybe_emit_resume(tCtx);
                 } catch (const std::exception &e) {
-                    log_e(tCtx->url.c_str(), "task_thread_func exception: %s", e.what());
+                    log_e(tCtx->url.c_str(), "task_thread_func exception: {}", e.what());
                     std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
                     tCtx->status = DW_TASK_STATUS_ERROR;
                     tCtx->reason = DW_REASON_ERROR;
@@ -1303,31 +1269,6 @@ namespace dw {
                     return 0;
                 }
                 return 1;
-            }
-
-            void set_result(dw_submit_result_t *r, const char *task_id,
-                            dw_reason_t code, const char *msg, const char *fmt, ...) {
-                // task_id 仅用于日志 trace；dw_submit_result_t 不再回传字符串标识。
-                r->code = code;
-                const char *trace_id = (task_id && task_id[0]) ? task_id : "";
-                if (msg) {
-                    const size_t n = std::strlen(msg);
-                    auto p = static_cast<char *>(std::malloc(n + 1));
-                    if (p) std::memcpy(p, msg, n + 1);
-                    r->message = p;
-                } else { r->message = nullptr; }
-                if (code != DW_REASON_NONE) {
-                    if (fmt) {
-                        va_list args;
-                        va_start(args, fmt);
-                        char buf[512];
-                        std::vsnprintf(buf, sizeof(buf), fmt, args);
-                        va_end(args);
-                        log_e(trace_id, "%s", buf);
-                    } else if (msg) {
-                        log_e(trace_id, "%s", msg);
-                    }
-                }
             }
         }
     }

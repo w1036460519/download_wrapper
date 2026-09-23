@@ -20,15 +20,16 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
+#include "internal/downloader_internal.h"
 #include "task_record.h"
 #include "task_store.h"
 #include "utils/memory_util.h"
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -57,36 +58,26 @@ namespace dw {
         void set_engines(IDownloadEngine *http, IDownloadEngine *torrent);
 
         /// 打开 DB、建表、加载注册表、启动调度线程；恢复既有任务由调度线程按并发上限重新准入。
-        int32_t start(const dw_config_t &cfg);
+        int32_t start(const Config &cfg);
 
         /// 停止调度线程、最终刷库、关闭 DB。
         void stop();
 
+        /// 获取默认保存目录（由 dw_config_t.save_path 初始化）。
+        const std::string &save_path() const { return save_path_; }
+
         // ---- 控制操作（C ABI 转发到此） ----
 
-        /// 添加任务。
-        /// @param client_id 客户端标识（必填）。
-        /// @param force 强制重新添加：清理内存与 DB 中的旧记录（含 resume_data），从零开始；
-        ///              false 时若任务已存在则仅刷新 created_at 用于排序置顶。
-        int32_t add(dw_protocol_t proto, const std::string &client_id, const dw_task_params_t *params,
-                    dw_submit_result_t *out, bool force = false);
+        /// 添加任务（三要素从 params 取，无需单独传递）。
+        dw_submit_result_t add(TaskParams &params);
 
-        int32_t pause(dw_protocol_t proto, const std::string &natural_key, dw_submit_result_t *out) const;
+        dw_submit_result_t pause(const TaskParams &params) const;
 
-        int32_t resume(dw_protocol_t proto, const std::string &natural_key,
-                       dw_submit_result_t *out);
+        dw_submit_result_t resume(const TaskParams &params);
 
         /// 删除任务：标记 DELETING + 调引擎 delete_task(delete_files)；
         /// 引擎发 DELETED 事件后 wrapper 回收资源 + 按标识删文件。
-        int32_t remove(dw_protocol_t proto, const std::string &natural_key, int32_t delete_files,
-                       dw_submit_result_t *out);
-
-        int32_t set_priority(dw_protocol_t proto, const std::string &natural_key,
-                             const int32_t *priority_file_indexes, int32_t priority_file_index_size);
-
-        /// 读取断点续传数据（三要素定位）；不存在返回空 vector。
-        std::vector<uint8_t> load_resume(const std::string &client_id, dw_protocol_t proto,
-                                         const std::string &natural_key);
+        dw_submit_result_t remove(const TaskParams &params) const;
 
         /// 保存任务来源（save_path / magnet_link / torrent_file），用于 resume data 尚未生成时的兜底恢复。
         void save_resume_source(const std::string &client_id, dw_protocol_t proto,
@@ -97,13 +88,10 @@ namespace dw {
         TaskStore::ResumeInfo load_resume_info(const std::string &client_id, dw_protocol_t proto,
                                                const std::string &natural_key);
 
-        /// 读取任务保存目录（三要素定位）；任务不存在返回空串。
-        std::string load_save_path(const std::string &client_id, dw_protocol_t proto,
-                                   const std::string &natural_key);
-
-        /// 按 (proto, natural_key) 查询任务记录：内存优先，DB 命中时注册入内存。
-        /// 供低频工具函数（磁力/文件列表）定位任务。命中返回 true。
-        bool load_task_record(dw_protocol_t proto, const std::string &natural_key, FileRecord &out_record);
+        /// 按 (client_id, proto, natural_key) 查询任务记录：内存优先，DB 命中时注册入内存。
+        /// 返回内存中任务的指针（可直接修改）；未找到返回 nullptr。
+        /// recursive_mutex 支持重入，外部调用方须持锁或自行加锁。
+        FileRecord *load_task_record(const std::string &client_id, dw_protocol_t proto, const std::string &natural_key);
 
         // ---- 边下边播缓存（直落 task_store，与协议无关） ----
 
@@ -138,13 +126,8 @@ namespace dw {
         /// 从数据库加载全部文件目录记录（UI 渲染主表）。
         std::vector<FileRecord> list_file_records();
 
-        /// 同步文件记录到内存缓存（供外部经 store 操作后调用，持 mtx_）。
-        /// 缓存未加载时直接返回；已加载时按三要素定位插入或刷新 modified_at。
-        void sync_file_record_cache(const std::string &client_id, dw_protocol_t proto,
-                                    const std::string &natural_key, const FileRecord *fr = nullptr);
-
-        /// 查找文件记录：优先内存缓存，未命中则从 DB 加载到缓存。
-        /// @return 缓存中的 FileRecord 指针，不存在返回 nullptr（假定已持 mtx_）。
+        /// 查找文件记录：优先内存（tasks_），未命中则从 DB 加载并注册入内存。
+        /// @return 内存中的 FileRecord 指针，不存在返回 nullptr。
         FileRecord *find_file_record(const std::string &client_id, dw_protocol_t proto,
                                      const std::string &natural_key);
 
@@ -171,9 +154,9 @@ namespace dw {
         bool resolve_file_path(dw_protocol_t proto, const std::string &natural_key,
                                int32_t file_index, std::string &out_path, int64_t &out_size);
 
-        /// 任务文件列表：BT 引擎实时查询（选中文件，handle 离线返回空）；
-        /// HTTP 从任务记录推导单文件条目。连续数组由 alloc_file_list 分配，调用方负责释放。
-        utils::file_array load_files(dw_protocol_t proto, const std::string &natural_key);
+        /// 任务文件列表：BT 引擎实时查询（全量文件含选中状态）；
+        /// HTTP 从任务记录推导单文件条目。
+        dw_submit_result_t load_files(dw_protocol_t proto, const std::string &natural_key);
 
         // ---- 本地文件浏览与管理 ----
 
@@ -193,6 +176,14 @@ namespace dw {
         /// 下载任务（type=1/2）拒绝，应走 dw_delete_task。
         int32_t delete_local_entry(const std::string &save_path, const std::string &root_name);
 
+        // ---- BT 解析工具（转发至 TorrentEngine 静态方法） ----
+
+        /// 解析磁力链接获取 info_hash。
+        dw_submit_result_t parse_magnet(const std::string &magnet_link);
+
+        /// 解析 .torrent 文件获取 info_hash 和文件列表。
+        dw_submit_result_t parse_torrent_file(const std::string &torrent_file_path);
+
         // ---- 路径与展示辅助（静态，不依赖实例态） ----
 
         /// 根据 FileRecord 计算磁盘根路径。
@@ -208,7 +199,7 @@ namespace dw {
         // ---- 内部访问器（供同库模块经持锁快照访问持久化层） ----
 
         /// 返回内部互斥锁引用，供调用方持锁期间安全访问 store_。
-        std::mutex &get_mutex() { return mtx_; }
+        std::recursive_mutex &get_mutex() { return mtx_; }
         /// 返回持久化存储层引用（调用方须持 mtx_ 保证线程安全）。
         TaskStore &get_store() { return store_; }
 
@@ -237,8 +228,8 @@ namespace dw {
         // 遥测字段已在状态迁移时归零。
         void emit_progress(const FileRecord &rec);
 
-        // 准入队列中任务直到占满并发额度（在调度线程，准入操作均在释锁后执行）。
-        void run_schedule(std::unique_lock<std::mutex> &lock);
+        // 准入队列中任务直到占满并发额度（recursive_mutex 支持同线程重入）。
+        void run_schedule();
 
         // 在引擎恢复任务（不持 mtx_）；引擎内部经三要素自取 resume_data，双行为：
         // handle/ctx 存在直接恢复，不存在则重建。
@@ -250,9 +241,6 @@ namespace dw {
         // ---- 内部工具 ----
         int32_t active_count_locked() const; // 占用下载额度的任务数
         void flush_dirty_locked(); // 同步任务进度遥测到 file_records（节流写，假定已持 mtx_）
-
-        // 确保 file_cache_ 已从 DB 全量加载（假定已持 mtx_；已加载则幂等跳过）。
-        void ensure_file_cache_locked();
 
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
         IDownloadEngine *engine_of(dw_protocol_t proto) const;
@@ -267,12 +255,6 @@ namespace dw {
         // 内存注册：union_id → FileRecord，无冗余索引。
         void register_task(FileRecord task_record);
 
-        // 按 natural_key 查询任务：内存优先，未命中则从 file_records（状态持久化权威）
-        // 重建并注册入内存。成功返回内存中任务的指针（可直接修改）；
-        // 任务不存在返回 nullptr。持 mtx_ 调用。
-        FileRecord *load_task_record_locked(const std::string &client_id, dw_protocol_t proto,
-                                            const std::string &natural_key);
-
         // 注销：清 tasks_，union_id 定位。
         void unregister_task(const std::string &union_id);
 
@@ -282,19 +264,11 @@ namespace dw {
         // 同时检查文件/任务级完成条件。
         void snapshot_segments_locked(FileRecord &task_record);
 
-        std::mutex mtx_;
-        std::condition_variable cv_;
-        // 任务主表：union_id → FileRecord。仅常驻活跃/排队任务，暂停/完成/错误
-        // 状态投影至 file_records 后由 unregister_task 清出。
+        std::recursive_mutex mtx_;
+        // 任务主表：union_id → FileRecord。常驻活跃/排队任务，后续引入淘汰策略。
         std::unordered_map<std::string, FileRecord> tasks_;
         // Boost.Asio 事件队列：引擎 alert 经此投递，B 线程 maintenance_loop 中 poll 消费。
         boost::asio::io_context event_ioc_;
-
-        // 文件目录内存缓存：三要素平铺，key = union_id(client_id|protocol|natural_key)。
-        // 懒加载：首次 list_file_records() 从 DB 全量载入，后续直接返回缓存。
-        // 写穿：insert/update/delete 同步更新缓存；无法定位 key 的操作直接失效重载。
-        std::unordered_map<std::string, FileRecord> file_cache_;
-        bool file_cache_loaded_ = false;
 
         TaskStore store_; // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
         std::thread worker_; // A 线程：轻量采集 + 回调（stop() 显式 join）
@@ -309,6 +283,7 @@ namespace dw {
         IDownloadEngine *http_ = nullptr;
         IDownloadEngine *torrent_ = nullptr;
         std::string client_id_; // App 启动时注入的 UUIDv4
+        std::string save_path_; // 默认保存目录（由 dw_config_t.save_path 初始化）
 
         // 由 (client_id, protocol, raw_key) 构造 union_id，供 tasks_ 查找。
         static std::string union_id_of(const std::string &client_id, const dw_protocol_t proto, const std::string &raw_key) {

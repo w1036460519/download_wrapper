@@ -31,13 +31,12 @@ public:
      * 初始化引擎。
      * @return 0=成功，-1=失败。
      */
-    int32_t init(const dw_config_t* cfg, TaskManager* task_manager) override;
+    int32_t init(const Config *cfg, TaskManager *task_manager) override;
 
     /**
      * 配置热更新：仅刷新数值型字段（限速 / 超时 / 重试 / 分片数）。
-     * 代理、UA、CA 证书等字符串字段被工作线程按裸指针引用，运行期替换将悬垂，故不更新。
      */
-    void update_config(const dw_config_t* cfg) override;
+    void update_config(const Config *cfg) override;
 
     /**
      * 销毁引擎，释放所有资源。
@@ -47,12 +46,11 @@ public:
     /**
      * 添加单个 HTTP 下载任务。
      */
-    int32_t add_task(const dw_task_params_t* params,
-                     dw_submit_result_t*     out_result) override;
+    dw_submit_result_t add_task(const TaskParams *params) override;
 
     /**
      * 恢复单个 HTTP 下载任务（HTTP 无句柄概念，委托 add_task）。
-     * 内部经三要素自取 resume_data（自足含落盘路径）与 save_path（全量重下兑底）。
+     * save_path 从 file_record 获取，resume_data 从 resume_info 获取。
      */
     void resume_task(const std::string &natural_key,
                      const std::string &client_id,
@@ -61,19 +59,16 @@ public:
     /**
      * 暂停单个 HTTP 下载任务。
      */
-    int32_t pause_task(const std::string &id,
-                       const std::string &client_id,
-                       dw_submit_result_t* out_result) override;
+    dw_submit_result_t pause_task(const std::string &id,
+                                  const std::string &client_id) override;
 
     /**
      * 删除单个 HTTP 下载任务（事件驱动模型）：
      * 置取消 + 删除标志，sweep 回收后发 DELETED 事件通知 wrapper。
-     * @return 0=引擎已接管；-1=错误。
      */
-    int32_t delete_task(const std::string &id,
-                        const std::string &client_id,
-                        int32_t             delete_files,
-                        dw_submit_result_t* out_result) override;
+    dw_submit_result_t delete_task(const std::string &id,
+                                   const std::string &client_id,
+                                   int32_t delete_files) override;
 
     /**
      * 查询任务运行时资源是否已释放：ctx 已不在任务表（sweep 已析构，线程 join、

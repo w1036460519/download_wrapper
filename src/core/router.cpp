@@ -26,7 +26,7 @@ namespace dw {
         return nullptr;
     }
 
-    int32_t Router::start(const dw_downloader *owner, const dw_config_t &cfg) {
+    int32_t Router::start(const dw_downloader *owner, const Config &cfg) {
         task_manager_ = std::make_unique<TaskManager>();
 
         // 注入引擎
