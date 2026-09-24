@@ -45,8 +45,11 @@ namespace dw {
         /// @return 本机返回 TaskManager*，远程返回 nullptr（未来返回 RemoteProxy）。
         TaskManager* route(const std::string& client_id) const;
 
-        /// 初始化 TaskManager（由 dw_init 调用）。
-        int32_t start(const dw_downloader *owner, const Config &cfg);
+        /// 创建 TaskManager 实例（引擎初始化前调用）。
+        void create_task_manager(const Config &cfg);
+
+        /// 启动 TaskManager（引擎初始化后调用）。
+        int32_t start();
 
         /// 停止 TaskManager。
         void stop();

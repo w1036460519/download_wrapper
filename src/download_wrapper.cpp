@@ -80,10 +80,10 @@ namespace dw {
         return g_downloader.get();
     }
 
-    void emit_progress(const dw_progress_t *progress) {
-        if (!g_downloader || !progress) return;
+    void emit_progress(const char *json) {
+        if (!g_downloader || !json) return;
         if (auto cb = g_downloader->progress_cb.load()) {
-            cb(progress);
+            cb(json);
         }
     }
 
@@ -159,25 +159,30 @@ DW_API char *dw_init(const char *config_json) {
         return dw::dup_json_string(dw::make_success_response());
     }
 
-    // 创建引擎（先于 Router，因为 Router::start 需要注入引擎）
-    dw::g_downloader->http_engine = std::make_unique<dw::HttpEngine>();
-    dw::g_downloader->torrent_engine = std::make_unique<dw::TorrentEngine>();
+    // 创建 Router + TaskManager，先于引擎（引擎初始化时从 TaskManager config 读取）
+    dw::g_downloader->router = std::make_unique<dw::Router>();
+    dw::g_downloader->router->set_local_client_id(dw::g_downloader->config.client_id);
+    dw::g_downloader->router->create_task_manager(dw::g_downloader->config);
 
-    const dw::Config *cfg_ptr = &dw::g_downloader->config;
-    if (dw::g_downloader->http_engine->init(cfg_ptr, nullptr) != 0) {
+    auto *tm = dw::g_downloader->router->task_manager();
+
+    // 创建引擎（构造时注入 TaskManager）
+    dw::g_downloader->http_engine = std::make_unique<dw::HttpEngine>(tm);
+    dw::g_downloader->torrent_engine = std::make_unique<dw::TorrentEngine>(tm);
+
+    if (dw::g_downloader->http_engine->init() != 0) {
         log_e("", "HTTP 引擎初始化失败");
         return dw::dup_json_string(dw::make_error_response("HTTP 引擎初始化失败"));
     }
-    if (dw::g_downloader->torrent_engine->init(cfg_ptr, nullptr) != 0) {
+    if (dw::g_downloader->torrent_engine->init() != 0) {
         dw::g_downloader->http_engine->destroy();
         log_e("", "BT 引擎初始化失败");
         return dw::dup_json_string(dw::make_error_response("BT 引擎初始化失败"));
     }
 
-    // 创建 Router 并启动 TaskManager
-    dw::g_downloader->router = std::make_unique<dw::Router>();
-    dw::g_downloader->router->set_local_client_id(dw::g_downloader->config.client_id);
-    if (dw::g_downloader->router->start(dw::g_downloader.get(), dw::g_downloader->config) != 0) {
+    // 注入引擎并启动 TaskManager
+    tm->set_engines(dw::g_downloader->http_engine.get(), dw::g_downloader->torrent_engine.get());
+    if (dw::g_downloader->router->start() != 0) {
         log_e("", "下载器启动失败");
         dw::g_downloader->router.reset();
         return dw::dup_json_string(dw::make_error_response("下载器启动失败"));
@@ -243,24 +248,14 @@ DW_API char *dw_set_config(const char *config_json) {
 
     log_i("", "配置开始: {}", config_json);
 
-    // 先在锁内更新配置副本并取出下游目标，再锁外下发：
-    // 引擎 update_config / TaskManager 唤醒内部各自加锁，不可持 d->mutex 调用以规避锁序风险。
-    dw::IDownloadEngine *http = nullptr;
-    dw::IDownloadEngine *torrent = nullptr;
+    // 更新权威配置并下发到 TaskManager（引擎运行时从 TaskManager config 拉取）
     dw::TaskManager *tm = nullptr;
     {
         std::lock_guard<std::mutex> lock(d->mutex);
         d->config = cfg;
-        http = d->http_engine.get();
-        torrent = d->torrent_engine.get();
         if (d->router) tm = d->router->task_manager();
     }
-
-    // 热更新运行期可生效的项：引擎限速 / 做种分享率、调度并发上限。
-    const dw::Config *cfg_ptr = &d->config;
-    if (http) http->update_config(cfg_ptr);
-    if (torrent) torrent->update_config(cfg_ptr);
-    if (tm) tm->set_max_concurrent(cfg.max_concurrent_downloads);
+    if (tm) tm->apply_config(cfg);
 
     log_i("", "配置完成");
     return dw::dup_json_string(dw::make_success_response());
@@ -277,18 +272,25 @@ DW_API char *dw_set_network_allowed(const char *params_json) {
         return dw::dup_json_string(dw::make_error_response("参数为空"));
     }
 
-    // 解析 JSON：{"allowed": true/false}
-    bool allowed = false;
+    // 解析 JSON：{"network_type": 0/1/2} 或 {"allowed": true/false}
+    int32_t network_type = -1;
     try {
         auto obj = boost::json::parse(params_json).as_object();
-        if (auto *v = obj.if_contains("allowed"); v && v->is_bool()) {
-            allowed = v->as_bool();
+        if (auto *v = obj.if_contains("network_type"); v && v->is_int64()) {
+            network_type = static_cast<int32_t>(v->as_int64());
+        } else if (auto *v = obj.if_contains("allowed"); v && v->is_bool()) {
+            // 兼容旧接口：allowed=true -> network_type=1, allowed=false -> network_type=0
+            network_type = v->as_bool() ? 1 : 0;
         }
     } catch (const std::exception &) {
         return dw::dup_json_string(dw::make_error_response("JSON 解析失败"));
     }
 
-    log_i("", "网络切换开始: allowed={}", allowed);
+    if (network_type < 0) {
+        return dw::dup_json_string(dw::make_error_response("参数无效"));
+    }
+
+    log_i("", "网络切换开始: network_type={}", network_type);
     dw::TaskManager *tm = nullptr;
     {
         std::lock_guard<std::mutex> lock(d->mutex);
@@ -297,7 +299,10 @@ DW_API char *dw_set_network_allowed(const char *params_json) {
         }
     }
     if (tm) {
-        tm->set_network_allowed(allowed);
+        // 更新 Config 并重新计算 net_allowed_
+        dw::Config cfg = tm->get_config();
+        cfg.network_type = network_type;
+        tm->apply_config(cfg);
     }
     log_i("", "网络切换完成");
     return dw::dup_json_string(dw::make_success_response());
@@ -646,17 +651,7 @@ DW_API char *dw_get_file_list(const char *params_json) {
     // 构建 JSON 文件列表
     boost::json::array files_arr;
     for (const auto &fi: result.files) {
-        boost::json::object f;
-        f["index"] = fi.index;
-        f["name"] = fi.name;
-        f["full_path"] = fi.full_path;
-        f["size"] = fi.size;
-        f["ext"] = fi.ext;
-        f["status"] = fi.status;
-        f["offset"] = fi.offset;
-        f["downloaded_bytes"] = fi.downloaded_bytes;
-        f["selected"] = fi.selected;
-        files_arr.push_back(std::move(f));
+        files_arr.push_back(dw::to_json(fi));
     }
 
     boost::json::object data;
@@ -724,8 +719,7 @@ DW_API char *dw_get_file_ranges(const char *params_json) {
         return dw::dup_json_string(dw::make_error_response("任务不存在"));
     }
     const bool downloading = (status == DW_TASK_STATUS_DOWNLOADING ||
-                              status == DW_TASK_STATUS_RESOLVING ||
-                              status == DW_TASK_STATUS_PARSED);
+                              status == DW_TASK_STATUS_RESOLVING);
     if (downloading) {
         // 下载中但缓存为空，返回空区间
         boost::json::object data;
@@ -1013,17 +1007,7 @@ DW_API char *dw_load_task_files(const char *params_json) {
 
     boost::json::array files_arr;
     for (const auto &fi: result.files) {
-        boost::json::object f;
-        f["index"] = fi.index;
-        f["name"] = fi.name;
-        f["full_path"] = fi.full_path;
-        f["size"] = fi.size;
-        f["ext"] = fi.ext;
-        f["status"] = fi.status;
-        f["offset"] = fi.offset;
-        f["downloaded_bytes"] = fi.downloaded_bytes;
-        f["selected"] = fi.selected;
-        files_arr.push_back(std::move(f));
+        files_arr.push_back(dw::to_json(fi));
     }
 
     boost::json::object data;
@@ -1266,34 +1250,6 @@ DW_API void dw_file_record_list_free(dw_file_record_t *records, int32_t count) {
         std::free(records[i].message);
     }
     std::free(records);
-}
-
-DW_API char *dw_is_file_record_parsed(const char *params_json) {
-    if (!params_json) {
-        return dw::dup_json_string(dw::make_error_response("参数非法"));
-    }
-    if (!dw::g_downloader) {
-        return dw::dup_json_string(dw::make_error_response("下载器未初始化"));
-    }
-
-    dw::TaskIdentity identity;
-    if (dw::parse_identity(params_json, identity) != 0) {
-        return dw::dup_json_string(dw::make_error_response("JSON 解析失败"));
-    }
-    if (identity.client_id.empty() || identity.natural_key.empty()) {
-        return dw::dup_json_string(dw::make_error_response("参数不完整"));
-    }
-
-    auto *tm = dw::g_downloader->router ? dw::g_downloader->router->task_manager() : nullptr;
-    if (!tm) {
-        return dw::dup_json_string(dw::make_error_response("TaskManager 不可用"));
-    }
-    const bool parsed = tm->is_file_record_parsed(
-        identity.client_id.c_str(), identity.protocol, identity.natural_key.c_str());
-
-    boost::json::object data;
-    data["parsed"] = parsed;
-    return dw::dup_json_string(dw::make_success_response(data));
 }
 
 DW_API void dw_free(void *ptr) {

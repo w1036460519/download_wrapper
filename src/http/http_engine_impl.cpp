@@ -654,36 +654,13 @@ namespace dw {
                     //   wrapper   = strip_extension(raw_name)（wrapper 目录名，去后缀，如 "Inception"）
                     //   unique    = acquire_wrapper_name(...)（判重后实际 wrapper 名，含可能的 (n) 后缀）
                     //   落盘路径  = output_path / unique / raw_name
-                    // 定名即物化占位：acquire_wrapper_name 在磁盘创建 wrapper 目录，
-                    // 后续 TASK_FILES 事件上报给 TaskManager 记录到数据库。
+                    // 定名即物化占位：acquire_wrapper_name 在磁盘创建 wrapper 目录。
                     const std::string raw_name = tCtx->filename;
                     const std::string wrapper = dw::utils::strip_extension(raw_name);
                     const std::string unique = dw::utils::acquire_wrapper_name(
                         tCtx->output_path, wrapper);
                     if (unique != wrapper) {
                         log_i(tCtx->url.c_str(), "HTTP 判重：wrapper 包层 '{}' -> '{}'", wrapper, unique);
-                    }
-                
-                    // HTTP 单文件模型：头到齐即可确定最终文件，推定名事件（TASK_FILES）。
-                    // name=判重后 wrapper 目录名（磁盘根实体），files[0].name=原始文件名（含后缀）。
-                    // 指针字段仅在调用期有效，TaskManager 消费时按值拷贝。
-                    dw_file_info_t f{};
-                    f.index = 0;
-                    f.name = const_cast<char *>(raw_name.c_str());
-                    const std::string ext = dw::utils::file_extension(raw_name);
-                    f.ext = ext.empty() ? nullptr : const_cast<char *>(ext.c_str());
-                    f.size = tCtx->total_size > 0 ? tCtx->total_size : 0;
-                    f.offset = 0; // HTTP 单文件模型，全局偏移恒为 0
-                    f.status = 0;
-                    f.downloaded_bytes = 0;
-                    EngineEvent ev;
-                    ev.type = EngineEventType::TASK_FILES;
-                    ev.engine_key = tCtx->url;
-                    ev.protocol = DW_PROTOCOL_HTTP;
-                    ev.name = unique; // 判重后 wrapper 目录名
-                    ev.files.push_back(f);
-                    if (g_task_manager) {
-                        g_task_manager->on_engine_event(std::move(ev));
                     }
                 
                     // 内部文件物理路径：save_path / wrapper / raw_filename

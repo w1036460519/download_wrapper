@@ -31,10 +31,11 @@ class TaskManager; // 前向声明
  */
 class IDownloadEngine {
 public:
+    explicit IDownloadEngine(TaskManager *task_manager) : task_manager_(task_manager) {}
     virtual ~IDownloadEngine() = default;
 
-    /// 初始化引擎。task_manager 用于事件投递。@return 0=成功，-1=失败。
-    virtual int32_t init(const Config *cfg, TaskManager *task_manager) = 0;
+    /// 初始化引擎。@return 0=成功，-1=失败。
+    virtual int32_t init() = 0;
 
     /// 销毁引擎，释放所有资源。
     virtual void destroy() = 0;
@@ -79,9 +80,6 @@ public:
 
     // ---- 可选钩子（默认空实现，Torrent 覆写） ----
 
-    /// 配置热更新（dw_set_config 调用）：仅应用运行期可生效的字段（限速、做种分享率等）。
-    virtual void update_config(const Config * /*cfg*/) {}
-
     /// 节拍入口（A 线程调用）：BT 覆写（触发 post_torrent_updates 刷新 + 续传检查点），
     /// HTTP 引擎由 worker 自推进度，无需实现。
     virtual void post_updates() {}
@@ -103,6 +101,9 @@ public:
                                               const std::string &/*natural_key*/) {
         return dw_submit_result_t::failure(DW_REASON_ERROR, "不支持");
     }
+
+protected:
+    TaskManager *task_manager_ = nullptr; // 事件投递目标（构造时注入）
 };
 
 } // namespace dw

@@ -21,7 +21,7 @@ namespace dw {
  */
 class HttpEngine final : public IDownloadEngine {
 public:
-    HttpEngine();
+    explicit HttpEngine(TaskManager *task_manager);
     ~HttpEngine() override;
 
     HttpEngine(const HttpEngine&)            = delete;
@@ -31,12 +31,7 @@ public:
      * 初始化引擎。
      * @return 0=成功，-1=失败。
      */
-    int32_t init(const Config *cfg, TaskManager *task_manager) override;
-
-    /**
-     * 配置热更新：仅刷新数值型字段（限速 / 超时 / 重试 / 分片数）。
-     */
-    void update_config(const Config *cfg) override;
+    int32_t init() override;
 
     /**
      * 销毁引擎，释放所有资源。

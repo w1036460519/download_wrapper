@@ -38,11 +38,39 @@ namespace dw {
         std::string full_path;
         int64_t size = 0;
         std::string ext;
-        int32_t status = 0;
+        int32_t status = 0; // 文件状态：0=下载中，1=磁盘已删除，2=完成正常
         int64_t offset = 0;
         int64_t downloaded_bytes = 0;
         bool selected = true; // 是否选中下载（BT 由优先级决定）
+        bool is_dir = false; // 是否为目录
+        std::string segments; // 已下载区间 JSON（原始格式，供 App 序列化透传）
     };
+
+    /// FileInfo → JSON 对象（供 App 序列化输出）。
+    inline boost::json::object to_json(const FileInfo &fi) {
+        boost::json::object obj;
+        obj["index"] = fi.index;
+        obj["name"] = fi.name;
+        obj["full_path"] = fi.full_path;
+        obj["size"] = fi.size;
+        obj["ext"] = fi.ext;
+        obj["status"] = fi.status;
+        obj["offset"] = fi.offset;
+        obj["downloaded_bytes"] = fi.downloaded_bytes;
+        obj["selected"] = fi.selected;
+        obj["is_dir"] = fi.is_dir;
+        // segments 已是 JSON 字符串，解析后嵌入；解析失败则保留空数组
+        if (!fi.segments.empty()) {
+            try {
+                obj["segments"] = boost::json::parse(fi.segments);
+            } catch (...) {
+                obj["segments"] = boost::json::array{};
+            }
+        } else {
+            obj["segments"] = boost::json::array{};
+        }
+        return obj;
+    }
 
     /**
      * 引擎事件类型（引擎 alert / 状态变化经此转递给 Wrapper B 线程消费）。
@@ -53,8 +81,8 @@ namespace dw {
         STATUS_UPDATE, // 状态+进度更新（含冗余状态字段 status）
         RESUME_DATA, // 断点续传数据就绪（BT resume / HTTP 定期存档）
         DELETED, // 任务已从引擎移除（remove_torrent 收敛 / handle 无效直接删除），wrapper 据此回收资源
-        TASK_FILES, // 任务文件列表推送（HTTP 响应头就绪后推送单文件信息）
         FILE_PROGRESS, // 文件进度区间就绪（BT 连续 piece 达阈值后合并上报，HTTP 无此事件）
+        FILE_COMPLETED, // 单个文件下载完成（BT file_completed_alert）
     };
 
     /**
@@ -73,10 +101,9 @@ namespace dw {
         // PARSED 事件字段
         std::string name; // 种子/文件名（HTTP 探测定名或 BT 元数据）
         std::string save_path; // 引擎当前 save_path
-        std::string original_name; // 重名/包装前的原始目录/文件名（未重名时与 content_root 相同）
+        std::string original_name; // 重名/包装前的原始目录/文件名（未重名时与 root_name 相同）
         std::string original_root_name;
-        std::string root_name;
-        std::string content_root; // 磁盘根目录名（重名判定后的最终名称）
+        std::string root_name; // 磁盘根目录名（重名判定后的最终名称）
         bool is_dir = true; // 内容是否为目录（单文件无父路径 = false）
         std::string ext; // 文件后缀（仅单文件时有值，不含 '.'）
         std::vector<dw_file_info_t> files; // 节点树（深拷贝，仅 PARSED 使用）
@@ -103,28 +130,26 @@ namespace dw {
         // DELETED 事件字段
         int32_t delete_files = 0; // 是否删除落盘文件（1=删，0=不删）
 
-        // TASK_FILES 事件字段（HTTP 磁盘定名就绪）：name=判重后 wrapper 目录名
-        //（磁盘根实体名），files[0].name=原始文件名（含后缀）。
-
         // FILE_PROGRESS 事件字段（BT：连续 piece 达 1% 阈值后合并的文件内区间）
         int32_t file_index = -1; // 目标文件索引（libtorrent 文件序号，-1=未设置）
         std::string file_path; // 文件相对路径（引擎侧，handle 视角相对路径）
         std::string full_path; // 完整路径（save_path + file_path，供调用方直接使用）
-        int64_t file_size = 0; // 文件总大小（bytes，供完成判定）
-        std::map<int64_t, int64_t> intervals; // 有序区间集合（key=offset_start, value=offset_end），序列化后保存
+        int64_t size = 0; // 文件总大小（bytes，供完成判定）
+        int64_t downloaded_bytes = 0; // 文件已下载字节数（从 segments 累计）
+        std::map<int64_t, int64_t> segments; // 有序区间集合（key=offset_start, value=offset_end），序列化后保存
     };
 
     // ---- 枚举名称序列化（供 to_string 重载使用）----
 
-    inline const char *to_string(EngineEventType t) {
+    inline const char *to_string(const EngineEventType t) {
         switch (t) {
             case EngineEventType::PARSED: return "PARSED";
             case EngineEventType::DOWNLOAD_FAILED: return "DOWNLOAD_FAILED";
             case EngineEventType::STATUS_UPDATE: return "STATUS_UPDATE";
             case EngineEventType::RESUME_DATA: return "RESUME_DATA";
             case EngineEventType::DELETED: return "DELETED";
-            case EngineEventType::TASK_FILES: return "TASK_FILES";
             case EngineEventType::FILE_PROGRESS: return "FILE_PROGRESS";
+            case EngineEventType::FILE_COMPLETED: return "FILE_COMPLETED";
             default: return "UNKNOWN";
         }
     }
@@ -139,9 +164,9 @@ namespace dw {
             case DW_TASK_STATUS_ERROR: return "ERROR";
             case DW_TASK_STATUS_QUEUED: return "QUEUED";
             case DW_TASK_STATUS_RESOLVING: return "RESOLVING";
-            case DW_TASK_STATUS_PARSED: return "PARSED";
             case DW_TASK_STATUS_INVALIDATED: return "INVALIDATED";
             case DW_TASK_STATUS_DELETING: return "DELETING";
+            case DW_TASK_STATUS_FAIL: return "FAIL";
             default: return "UNKNOWN";
         }
     }
@@ -214,16 +239,16 @@ namespace dw {
         obj["file_index"] = e.file_index;
         obj["file_path"] = e.file_path;
         obj["full_path"] = e.full_path;
-        obj["file_size"] = e.file_size;
+        obj["file_size"] = e.size;
         // 区间集合序列化
-        boost::json::array intervals_arr;
-        for (const auto &[start, end]: e.intervals) {
+        boost::json::array segments_arr;
+        for (const auto &[start, end]: e.segments) {
             boost::json::array interval;
             interval.push_back(start);
             interval.push_back(end);
-            intervals_arr.push_back(std::move(interval));
+            segments_arr.push_back(std::move(interval));
         }
-        obj["intervals"] = std::move(intervals_arr);
+        obj["segments"] = std::move(segments_arr);
         return boost::json::serialize(obj);
     }
 
@@ -268,7 +293,6 @@ namespace dw {
         obj["ul_rate_limit"] = c.upload_rate_limit;
         obj["seed_ratio"] = c.seed_ratio_limit;
         // 通用配置
-        obj["callback_interval"] = c.status_callback_interval_ms;
         obj["log_level"] = static_cast<int>(c.log_level);
         obj["work_dir"] = c.work_dir ? c.work_dir : "";
         obj["client_id"] = c.client_id ? c.client_id : "";
@@ -359,12 +383,15 @@ namespace dw {
         double seed_ratio_limit = 1.0;
 
         // 通用配置
-        int32_t status_callback_interval_ms = 1000;
         dw_log_level_t log_level = DW_LOG_INFO;
         std::string work_dir;
         std::string client_id;
-        std::string save_path;
+        std::string save_path = "."; // 默认保存目录：当前目录
         std::vector<std::string> trackers;
+
+        // 网络控制
+        bool allow_mobile_data = false; // 应用设置：是否允许使用移动数据
+        int32_t network_type = 1; // 网络状态：0=无网络, 1=WiFi, 2=移动数据
     };
 
     // ---- Config JSON 序列化 ----
@@ -390,7 +417,6 @@ namespace dw {
         obj["dl_rate_limit"] = c.download_rate_limit;
         obj["ul_rate_limit"] = c.upload_rate_limit;
         obj["seed_ratio"] = c.seed_ratio_limit;
-        obj["callback_interval"] = c.status_callback_interval_ms;
         obj["log_level"] = static_cast<int>(c.log_level);
         obj["work_dir"] = c.work_dir;
         obj["client_id"] = c.client_id;
@@ -398,6 +424,8 @@ namespace dw {
         boost::json::array trackers_arr;
         for (const auto &t: c.trackers) trackers_arr.emplace_back(t);
         obj["trackers"] = std::move(trackers_arr);
+        obj["allow_mobile_data"] = c.allow_mobile_data;
+        obj["network_type"] = c.network_type;
         return obj;
     }
 
@@ -425,7 +453,6 @@ namespace dw {
         if (auto *v = obj.if_contains("seed_ratio"); v && v->is_double()) {
             c.seed_ratio_limit = v->as_double();
         }
-        json_util::extract(obj, "callback_interval", c.status_callback_interval_ms);
         if (auto *v = obj.if_contains("log_level"); v && v->is_int64()) {
             c.log_level = static_cast<dw_log_level_t>(v->as_int64());
         }
@@ -433,6 +460,10 @@ namespace dw {
         json_util::extract(obj, "client_id", c.client_id);
         json_util::extract(obj, "save_path", c.save_path);
         json_util::extract(obj, "trackers", c.trackers);
+        if (auto *v = obj.if_contains("allow_mobile_data"); v && v->is_bool()) {
+            c.allow_mobile_data = v->as_bool();
+        }
+        json_util::extract(obj, "network_type", c.network_type);
     }
 
     inline int parse_config(const std::string &json, Config &out) {
@@ -495,12 +526,12 @@ namespace dw {
     dw_downloader *global_downloader();
 
     /**
-     * 安全调用进度回调。
+     * 安全调用进度回调（JSON 字符串格式）。
      *
      * 内部检查下载器状态与回调有效性，调用失败（未注册/已销毁）时静默忽略，
      * 不影响业务流程。
      */
-    void emit_progress(const dw_progress_t *progress);
+    void emit_progress(const char *json);
 
     /**
      * 内部日志输出。
@@ -610,7 +641,7 @@ namespace dw {
         std::vector<uint8_t> resume_data; // 断点续传数据
         int32_t priority = 0;
         bool delete_files = false; // 删除任务时是否同时删除本地文件
-        bool force = false;        // 恢复时强制准入（调度器暂停最慢任务让行）
+        bool force = false; // 恢复时强制准入（调度器暂停最慢任务让行）
     };
 
     // ---- JSON 序列化（C++ 对象 → JSON）----
@@ -698,6 +729,11 @@ namespace dw {
     /// TaskParams → JSON 字符串
     inline std::string to_json_string(const TaskParams &p) {
         return boost::json::serialize(to_json(p));
+    }
+
+    /// Config → JSON 字符串（日志输出用）
+    inline std::string to_json_string(const Config &c) {
+        return boost::json::serialize(to_json(c));
     }
 
     /* ================================================================== */

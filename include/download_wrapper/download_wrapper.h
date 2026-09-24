@@ -84,9 +84,8 @@ typedef enum {
     DW_TASK_STATUS_ERROR = 3, /**< 已失败（不可重试，终态）。 */
     DW_TASK_STATUS_QUEUED = 4, /**< 排队中（等待调度）。 */
     DW_TASK_STATUS_RESOLVING = 5, /**< 解析中（BT 等待元数据，占用下载名额；
-                                         元数据就绪后经事件驱动迁 PARSED）。 */
-    DW_TASK_STATUS_PARSED = 6, /**< 解析完成（元数据就绪 + 冲突检测通过，
-                                         文件列表已落库；调度准入后迁 DOWNLOADING）。 */
+                                         元数据就绪后经事件驱动迁 DOWNLOADING）。 */
+    /* 6 = PARSED 已删除，RESOLVING 直接迁 DOWNLOADING */
     DW_TASK_STATUS_INVALIDATED = 7, /**< 已失效（物理文件不存在，仅可删除）。 */
     DW_TASK_STATUS_DELETING = 8, /**< 删除中（已调引擎删除，等待 DELETED 事件回收）。 */
     DW_TASK_STATUS_FAIL = 9, /**< 可重试失败（调度器自动重试）。 */
@@ -136,9 +135,9 @@ typedef struct dw_downloader dw_downloader_t;
  * 周期 / 终态进度回调。
  *
  * 在 IO 线程或后台线程上同步调用，回调内严禁反转调用接口。
- * progress 内所有指针仅在回调持续期间有效。
+ * json 为任务状态 JSON 字符串，仅在回调持续期间有效，调用方如需持有须深拷贝。
  */
-typedef void (*dw_progress_cb)(const struct dw_progress *progress);
+typedef void (*dw_progress_cb)(const char *json);
 
 /**
  * 日志回调。
@@ -704,18 +703,6 @@ DW_API char *dw_list_tasks(const char *params_json);
  *                     响应格式：{"code": 0, "data": {"records": [...]}} 或 {"code": -1, "message": "..."}
  */
 DW_API char *dw_list_file_records(const char *params_json);
-
-/**
- * 查询文件记录的解析状态。
- *
- * 优先从内存缓存查询，未命中则从数据库加载。
- * 用于引擎在重名检测前查询文件记录的解析状态。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "protocol": 1, "natural_key": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"parsed": true}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_is_file_record_parsed(const char *params_json);
 
 /**
  * 设置任务队列优先级（越大越优先）。

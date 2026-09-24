@@ -57,16 +57,9 @@ namespace dw {
         /// 删除任务及其 resume_data / file_progress_cache / file_records（统一按复合键）。
         void remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
 
-        /// 重置任务进度：清除 resume_data / file_progress_cache，file_records 状态回 QUEUED、进度归零。
-        void reset_task_progress(const std::string &client_id, dw_protocol_t protocol,
-                                 const std::string &natural_key) const;
-
         /// 写入 / 覆盖断点续传数据。
         void save_resume(const std::string &client_id, dw_protocol_t protocol,
                          const std::string &natural_key, const uint8_t *data, size_t size) const;
-
-        /// 仅清除某任务的断点续传数据。
-        void clear_resume(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
 
         /// 保存任务来源（save_path / magnet_link / torrent_file），不影响 data 列；用于 resume data 尚未生成时的兜底恢复。
         void save_resume_source(const std::string &client_id, dw_protocol_t protocol,
@@ -140,6 +133,9 @@ namespace dw {
                                        const std::string &task_natural_key,
                                        dw_task_status_t status, dw_reason_t reason, const std::string &message) const;
 
+        /// 根据三要素（client_id, protocol, natural_key）更新文件记录的全部持久化字段。
+        void update_file_record(const FileRecord &rec) const;
+
         /// 按任务关联三要素（client_id + task_protocol + task_natural_key）更新文件记录的
         /// save_path、original_root_name、root_name、full_path、file_type、ext
         /// （PARSED 后修正为解析时保存目录、判重后根名、磁盘根实体全路径、实际形态、文件后缀）。
@@ -169,16 +165,21 @@ namespace dw {
                                    const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t> > > &
                                    file_ranges) const;
 
-        /// 保存完整区间集合（BT piece 事件驱动）：UPSERT 语义，直接覆盖该文件的 intervals 字段，
+        /// 保存完整区间集合（BT piece 事件驱动）：UPSERT 语义，直接覆盖该文件的 segments 字段，
         /// 返回该文件累计已下载字节（供调用方判定文件完成）。
         int64_t save_file_progress(const std::string &client_id, dw_protocol_t protocol,
                                    const std::string &natural_key, int32_t file_index,
                                    const std::string &full_path,
-                                   const std::string &intervals_json) const;
+                                   int64_t size, int64_t downloaded_bytes,
+                                   const std::string &segments_json) const;
 
         /// 按文件删除进度缓存（文件下载完成，区间失去意义）。
         void delete_file_progress_by_file(const std::string &client_id, dw_protocol_t protocol,
                                           const std::string &natural_key, int32_t file_index) const;
+
+        /// 标记文件下载完成：file_done = file_size，intervals = [[0, file_size-1]]。
+        void mark_file_complete(const std::string &client_id, dw_protocol_t protocol,
+                                const std::string &natural_key, int32_t file_index) const;
 
         /// 按任务删除全部进度缓存（任务删除级联）。
         void delete_file_progress_by_task(const std::string &client_id, dw_protocol_t protocol,
@@ -190,6 +191,11 @@ namespace dw {
 
         /// 按完整路径读取某文件的已下载区间（按 offset_start 升序）；不存在返回空 vector。
         std::vector<dw_byte_range_t> load_segments(const std::string &full_path, int32_t file_index) const;
+
+        /// 按完整路径批量查询文件进度（file_done + intervals 原始 JSON）。
+        /// @return full_path -> {file_done, intervals_json} 映射
+        std::unordered_map<std::string, std::pair<int64_t, std::string>>
+        load_file_progress_by_paths(const std::vector<std::string> &paths) const;
 
     private:
         sqlite3 *db_ = nullptr;

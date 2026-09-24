@@ -23,33 +23,27 @@ namespace dw {
     using he::internal::emit_resume;
 
     namespace {
-        /// 运行期可热更新的数值型字段。
-        void apply_runtime_config(const Config *cfg) {
+        /// 从权威配置同步到 HTTP 引擎全局变量。
+        void sync_config(const Config &cfg) {
             auto &g = he::g_cfg;
-            g.connect_timeout_seconds = cfg->connect_timeout_seconds > 0 ? cfg->connect_timeout_seconds : 15;
-            g.request_timeout_seconds = cfg->request_timeout_seconds;
-            g.low_speed_limit_bps = cfg->low_speed_limit_bps >= 0 ? cfg->low_speed_limit_bps : 0;
-            g.low_speed_time = cfg->low_speed_time > 0 ? cfg->low_speed_time : 0;
-            g.max_redirect = cfg->max_redirect > 0 ? cfg->max_redirect : 5;
-            g.verify_ssl = cfg->verify_ssl;
-            g.max_retries = cfg->max_retries >= 0 ? cfg->max_retries : 3;
-            g.default_parts = cfg->default_parts > 0 ? cfg->default_parts : 4;
-            g.min_size_for_split = cfg->min_size_for_split > 0 ? cfg->min_size_for_split : 1 * 1024 * 1024;
-            // 全局下载限速（B/s）：0 = 不限速；新建 easy handle 时均摊到各分片。
-            g.download_rate_limit = cfg->download_rate_limit > 0 ? cfg->download_rate_limit : 0;
-            g.log_level = cfg->log_level >= DW_LOG_DEBUG && cfg->log_level <= DW_LOG_ERROR
-                              ? cfg->log_level
+            g.connect_timeout_seconds = cfg.connect_timeout_seconds > 0 ? cfg.connect_timeout_seconds : 15;
+            g.request_timeout_seconds = cfg.request_timeout_seconds;
+            g.low_speed_limit_bps = cfg.low_speed_limit_bps >= 0 ? cfg.low_speed_limit_bps : 0;
+            g.low_speed_time = cfg.low_speed_time > 0 ? cfg.low_speed_time : 0;
+            g.max_redirect = cfg.max_redirect > 0 ? cfg.max_redirect : 5;
+            g.verify_ssl = cfg.verify_ssl;
+            g.max_retries = cfg.max_retries >= 0 ? cfg.max_retries : 3;
+            g.default_parts = cfg.default_parts > 0 ? cfg.default_parts : 4;
+            g.min_size_for_split = cfg.min_size_for_split > 0 ? cfg.min_size_for_split : 1 * 1024 * 1024;
+            g.download_rate_limit = cfg.download_rate_limit > 0 ? cfg.download_rate_limit : 0;
+            g.log_level = cfg.log_level >= DW_LOG_DEBUG && cfg.log_level <= DW_LOG_ERROR
+                              ? cfg.log_level
                               : DW_LOG_INFO;
-        }
-
-        void apply_config(const Config *cfg) {
-            auto &g = he::g_cfg;
-            g.proxy = cfg->proxy;
-            g.proxy_username = cfg->proxy_username;
-            g.proxy_password = cfg->proxy_password;
-            g.user_agent = cfg->user_agent;
-            g.ca_bundle = cfg->ca_bundle;
-            apply_runtime_config(cfg);
+            g.proxy = cfg.proxy;
+            g.proxy_username = cfg.proxy_username;
+            g.proxy_password = cfg.proxy_password;
+            g.user_agent = cfg.user_agent;
+            g.ca_bundle = cfg.ca_bundle;
         }
 
         bool ensure_running() {
@@ -62,7 +56,9 @@ namespace dw {
         }
     } // anonymous namespace
 
-    HttpEngine::HttpEngine() = default;
+    HttpEngine::HttpEngine(TaskManager *task_manager) : IDownloadEngine(task_manager) {
+        he::g_task_manager = task_manager;
+    }
 
     HttpEngine::~HttpEngine() {
         if (initialized_) {
@@ -70,30 +66,21 @@ namespace dw {
         }
     }
 
-    int32_t HttpEngine::init(const Config *cfg, TaskManager *task_manager) {
-        if (!cfg) {
-            log_e("", "HTTP init 失败: cfg 为空");
+    int32_t HttpEngine::init() {
+        if (!task_manager_) {
+            log_e("", "HTTP init 失败: task_manager 为空");
             return -1;
         }
-
-        /* 设置 HTTP 配置（仅 HTTP 相关字段） */
-        apply_config(cfg);
+        sync_config(task_manager_->config());
 
         if (!ensure_running()) {
             log_e("", "HTTP init 失败: curl_global_init 失败");
             return -1;
         }
 
-        he::g_task_manager = task_manager;
         initialized_ = true;
         log_i("", "HTTP 引擎初始化完成");
         return 0;
-    }
-
-    void HttpEngine::update_config(const Config *cfg) {
-        if (!initialized_ || !cfg) return;
-        apply_runtime_config(cfg);
-        log_i("", "[EVENT] HTTP 配置热更新: rate_limit={} B/s retries={} parts={}", static_cast<long long>(he::g_cfg.download_rate_limit), he::g_cfg.max_retries, he::g_cfg.default_parts);
     }
 
     void HttpEngine::destroy() {

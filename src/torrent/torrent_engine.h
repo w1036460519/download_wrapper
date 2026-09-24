@@ -24,7 +24,7 @@ namespace dw {
  */
 class TorrentEngine final : public IDownloadEngine {
 public:
-    TorrentEngine();
+    explicit TorrentEngine(TaskManager *task_manager);
     ~TorrentEngine() override;
 
     TorrentEngine(const TorrentEngine&)            = delete;
@@ -34,13 +34,7 @@ public:
      * 初始化引擎。
      * @return 0=成功，-1=失败。
      */
-    int32_t init(const Config *cfg, TaskManager *task_manager) override;
-
-    /**
-     * 配置热更新：经 session apply_settings 下发上/下行限速，并刷新做种分享率上限。
-     * 监听端口与默认 trackers 仅 init 时生效。
-     */
-    void update_config(const Config *cfg) override;
+    int32_t init() override;
 
     /**
      * 销毁引擎，释放所有资源。
@@ -158,13 +152,6 @@ public:
 
 private:
     bool initialized_ = false;
-
-    /// 设置文件优先级并预建进度行：按 task_id 从 session 获取 handle（不在 session
-    /// 时可经 client_id 对应的恢复数据重建），将 priority_file_indexes 应用到
-    /// libtorrent，同时预建 file_progress_cache 行。
-    static void apply_file_priorities(const std::string &task_id,
-                                      const std::string &client_id,
-                                      const std::vector<int32_t> &priority_file_indexes);
 };
 
 } // namespace dw

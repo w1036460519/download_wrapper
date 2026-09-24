@@ -67,8 +67,6 @@ namespace dw {
         std::thread g_status_thread;
         // 线程运行标志：destroy() 置 false 后唤醒循环
         std::atomic<bool> g_running{false};
-        // 进度回调间隔（ms）
-        int g_interval_ms = 1000;
         // BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文。
         // 默认 3.0（下载:上传=1:3）；init 从 cfg->seed_ratio_limit 读取（0=默认，<0=永久做种）。
         double g_seed_ratio_limit = 3.0;
@@ -256,7 +254,7 @@ namespace dw {
                 ev.type = EngineEventType::FILE_PROGRESS;
                 ev.engine_key = key;
                 ev.file_index = i;
-                ev.file_size = f_size;
+                ev.size = f_size;
                 ev.file_path = fs.file_path(idx);
                 ev.full_path = (std::filesystem::path(save_path) / fs.file_path(idx)).string();
 
@@ -283,16 +281,17 @@ namespace dw {
                     const int64_t range_end = std::min(static_cast<int64_t>(end + 1) * piece_len - 1, f_end) - f_off;
                     if (range_end < range_start) continue;
 
-                    if (const int64_t bytes = range_end - range_start + 1;
-                        bytes < threshold)
+                    const int64_t bytes = range_end - range_start + 1;
+                    if (bytes < threshold)
                         continue; // 未达阈值，跳过
 
                     // 放入区间集合（std::map 自动按 offset_start 有序）
-                    ev.intervals[range_start] = range_end;
+                    ev.segments[range_start] = range_end;
+                    ev.downloaded_bytes += bytes;
                 }
 
                 // 发送事件（区间集合已完整，调用方直接序列化保存）
-                if (!ev.intervals.empty()) {
+                if (!ev.segments.empty()) {
                     TorrentEngine::post_event(std::move(ev));
                 }
             }
@@ -509,6 +508,18 @@ namespace dw {
             else if (const auto *pf = lt::alert_cast<lt::piece_finished_alert>(a)) {
                 handle_piece_finished(pf->handle, pf->piece_index);
             }
+            // 文件下载完成
+            else if (const auto *fc = lt::alert_cast<lt::file_completed_alert>(a)) {
+                const std::string key = info_hash_hex(fc->handle);
+                if (key.empty()) return;
+                const lt::file_index_t idx = fc->index;
+                EngineEvent ev;
+                ev.type = EngineEventType::FILE_COMPLETED;
+                ev.engine_key = key;
+                ev.file_index = static_cast<int32_t>(idx);
+                TorrentEngine::post_event(std::move(ev));
+                log_i(key.c_str(), "文件下载完成 file_index={}", static_cast<int>(idx));
+            }
             // 状态变化
             else if (const auto *sca = lt::alert_cast<lt::state_changed_alert>(a)) {
                 const std::string key = info_hash_hex(sca->handle);
@@ -554,7 +565,7 @@ namespace dw {
                 if (key.empty()) return;
                 TorrentEngine::post_error(key, "文件错误");
             }
-            // 断点续传数据就绪
+            // 断点续传数据就绪：发送 RESUME_DATA 事件，由 TaskManager 统一保存
             else if (const auto *rd = lt::alert_cast<lt::save_resume_data_alert>(a)) {
                 const std::string key = info_hash_hex(rd->handle);
                 if (key.empty()) return;
@@ -563,14 +574,16 @@ namespace dw {
                     return;
                 }
                 try {
-                    const std::vector<char> buf = lt::write_resume_data_buf(rd->params);
-                    if (!buf.empty() && g_task_manager) {
-                        g_task_manager->get_store().save_resume(
-                            g_task_manager->client_id(), DW_PROTOCOL_TORRENT, key,
-                            reinterpret_cast<const uint8_t *>(buf.data()), buf.size());
+                    if (const std::vector<char> buf = lt::write_resume_data_buf(rd->params); !buf.empty()) {
+                        EngineEvent ev;
+                        ev.type = EngineEventType::RESUME_DATA;
+                        ev.engine_key = key;
+                        ev.protocol = DW_PROTOCOL_TORRENT;
+                        ev.resume_data.assign(buf.begin(), buf.end());
+                        TorrentEngine::post_event(std::move(ev));
                     }
                 } catch (const std::exception &e) {
-                    log_e(key.c_str(), "断点续传数据保存失败: {}", e.what());
+                    log_e(key.c_str(), "断点续传数据序列化失败: {}", e.what());
                 }
             }
             // 存储迁移完成（说明发生了重名）：发送 PARSED 事件
@@ -636,11 +649,39 @@ namespace dw {
             }
         }
 
-        // 每 2 秒触发状态采集（post_torrent_updates）
+        // 每 2 秒触发状态采集 + 同步运行期配置（限速/做种分享率）
         void status_loop() {
+            int64_t last_down_limit = -1;
+            int64_t last_up_limit = -1;
+            double last_seed_ratio = -1.0;
             while (g_running.load()) {
                 if (g_session) {
-                    try { g_session->post_torrent_updates(); } catch (...) {
+                    try {
+                        g_session->post_torrent_updates();
+                        // 同步运行期配置（从 TaskManager 权威配置拉取）
+                        if (g_task_manager) {
+                            const auto &cfg = g_task_manager->config();
+                            lt::settings_pack pack;
+                            bool changed = false;
+                            if (cfg.download_rate_limit != last_down_limit) {
+                                pack.set_int(lt::settings_pack::download_rate_limit,
+                                             static_cast<int>(cfg.download_rate_limit));
+                                last_down_limit = cfg.download_rate_limit;
+                                changed = true;
+                            }
+                            if (cfg.upload_rate_limit != last_up_limit) {
+                                pack.set_int(lt::settings_pack::upload_rate_limit,
+                                             static_cast<int>(cfg.upload_rate_limit));
+                                last_up_limit = cfg.upload_rate_limit;
+                                changed = true;
+                            }
+                            if (changed) g_session->apply_settings(std::move(pack));
+                            if (cfg.seed_ratio_limit != last_seed_ratio) {
+                                g_seed_ratio_limit = cfg.seed_ratio_limit;
+                                last_seed_ratio = cfg.seed_ratio_limit;
+                            }
+                        }
+                    } catch (...) {
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -706,7 +747,9 @@ namespace dw {
     /*                        TorrentEngine 成员实现                          */
     /* ===================================================================== */
 
-    TorrentEngine::TorrentEngine() = default;
+    TorrentEngine::TorrentEngine(TaskManager *task_manager) : IDownloadEngine(task_manager) {
+        g_task_manager = task_manager;
+    }
 
     TorrentEngine::~TorrentEngine() {
         if (initialized_) {
@@ -714,10 +757,11 @@ namespace dw {
         }
     }
 
-    int32_t TorrentEngine::init(const Config *cfg, TaskManager *task_manager) {
+    int32_t TorrentEngine::init() {
         if (initialized_) {
             return 0;
         }
+        const auto &cfg = task_manager_->config();
         try {
             lt::settings_pack pack;
             // 订阅错误、状态、存储与 piece 完成（进度区间维护）；屏蔽 peer/block 等细粒度事件
@@ -725,25 +769,13 @@ namespace dw {
                          lt::alert_category::error | lt::alert_category::status
                          | lt::alert_category::storage | lt::alert_category::piece_progress);
 
-            int listen_port = 0;
-            if (cfg) {
-                g_interval_ms = (cfg->status_callback_interval_ms > 1000) ? cfg->status_callback_interval_ms : 1000;
-                listen_port = cfg->listen_port;
-                if (cfg->download_rate_limit > 0) {
-                    pack.set_int(lt::settings_pack::download_rate_limit, static_cast<int>(cfg->download_rate_limit));
-                }
-                if (cfg->upload_rate_limit > 0) {
-                    pack.set_int(lt::settings_pack::upload_rate_limit, static_cast<int>(cfg->upload_rate_limit));
-                }
-                if (cfg->seed_ratio_limit != 0.0) {
-                    g_seed_ratio_limit = cfg->seed_ratio_limit;
-                }
-                // 默认 trackers：深拷贝到引擎内。
-                g_default_trackers = cfg->trackers;
-            }
-            if (listen_port > 0) {
+            pack.set_int(lt::settings_pack::download_rate_limit, static_cast<int>(cfg.download_rate_limit));
+            pack.set_int(lt::settings_pack::upload_rate_limit, static_cast<int>(cfg.upload_rate_limit));
+            g_seed_ratio_limit = cfg.seed_ratio_limit;
+            g_default_trackers = cfg.trackers;
+            if (cfg.listen_port > 0) {
                 pack.set_str(lt::settings_pack::listen_interfaces,
-                             "0.0.0.0:" + std::to_string(listen_port));
+                             "0.0.0.0:" + std::to_string(cfg.listen_port));
             }
 
             g_session = std::make_unique<lt::session>(std::move(pack));
@@ -757,37 +789,14 @@ namespace dw {
             return -1;
         }
 
-        g_task_manager = task_manager;
         g_running.store(true);
         g_alert_thread = std::thread(alert_loop);
         g_status_thread = std::thread(status_loop);
         g_resume_thread = std::thread(resume_loop);
 
         initialized_ = true;
-        log_i("bt", "初始化引擎完成 interval: {}ms", g_interval_ms);
+        log_i("bt", "初始化引擎完成");
         return 0;
-    }
-
-    void TorrentEngine::update_config(const Config *cfg) {
-        if (!initialized_ || !cfg || !g_session) return;
-        try {
-            lt::settings_pack pack;
-            // libtorrent 以 0 表示不限速，故无需区分“未设置”与“取消限速”，直接下发。
-            pack.set_int(lt::settings_pack::download_rate_limit,
-                         cfg->download_rate_limit > 0 ? static_cast<int>(cfg->download_rate_limit) : 0);
-            pack.set_int(lt::settings_pack::upload_rate_limit,
-                         cfg->upload_rate_limit > 0 ? static_cast<int>(cfg->upload_rate_limit) : 0);
-            g_session->apply_settings(std::move(pack));
-        } catch (const std::exception &e) {
-            log_e("bt", "配置热更新失败: {}", e.what());
-            return;
-        }
-        // 做种分享率上限：0 保持库内默认，非 0（含负数=永久做种）以配置为准。
-        if (cfg->seed_ratio_limit != 0.0) {
-            g_seed_ratio_limit = cfg->seed_ratio_limit;
-        }
-        log_i("bt", "[EVENT] BT 配置热更新: down={} B/s up={} B/s ratio={}", cfg->download_rate_limit,
-              cfg->upload_rate_limit, g_seed_ratio_limit);
     }
 
     void TorrentEngine::destroy() {
@@ -811,41 +820,6 @@ namespace dw {
         g_default_trackers.clear();
         initialized_ = false;
         log_i("bt", "销毁引擎完成");
-    }
-
-    void TorrentEngine::apply_file_priorities(const std::string &task_id,
-                                              const std::string &client_id,
-                                              const std::vector<int32_t> &priority_file_indexes) {
-        log_i(task_id.c_str(), "设置文件优先级: priority_indexes={} count={}", to_string(priority_file_indexes),
-              priority_file_indexes.size());
-        const lt::torrent_handle handle = find_handle(task_id, client_id);
-        if (!handle.is_valid()) {
-            log_e(task_id.c_str(), "handle 无效");
-            return;
-        }
-        const std::shared_ptr<const lt::torrent_info> ti = handle.torrent_file();
-        if (!ti) return;
-        const int n = ti->layout().num_files();
-        // 读取当前优先级，将已有 top_priority 重置为 default（适配取消优先）
-        std::vector<lt::download_priority_t> prio = handle.get_file_priorities();
-        if (static_cast<int>(prio.size()) < n) {
-            prio.resize(static_cast<size_t>(n), lt::dont_download);
-        }
-        for (auto &p: prio) {
-            if (p == lt::top_priority) p = lt::default_priority;
-        }
-        // priority_file_indexes: 优先下载，设为最高优先级
-        for (const int32_t idx: priority_file_indexes) {
-            if (idx >= 0 && idx < n) {
-                prio[static_cast<size_t>(idx)] = lt::top_priority;
-            }
-        }
-        try {
-            handle.prioritize_files(prio);
-        } catch (const std::exception &e) {
-            log_e(task_id.c_str(), "设置文件优先级失败: {}", e.what());
-        }
-        log_i(task_id.c_str(), "设置文件优先级完成");
     }
 
     void TorrentEngine::post_event(EngineEvent ev) {
@@ -984,12 +958,29 @@ namespace dw {
             handle.clear_error();
         }
 
-        // 设置文件优先级
-        apply_file_priorities(info_hash, client_id, priority_file_indexes);
+        if (!priority_file_indexes.empty()) {
+            try {
+                const std::shared_ptr<const lt::torrent_info> ti = handle.torrent_file();
+                if (ti) {
+                    const int n = ti->layout().num_files();
+                    std::vector<lt::download_priority_t> prio(static_cast<size_t>(n), lt::default_priority);
+                    for (const int32_t idx: priority_file_indexes) {
+                        if (idx >= 0 && idx < n) {
+                            prio[static_cast<size_t>(idx)] = lt::top_priority;
+                        }
+                    }
+                    handle.prioritize_files(prio);
+                }
+            } catch (const std::exception &e) {
+                log_e(info_hash.c_str(), "设置文件优先级失败: {}", e.what());
+            }
+        }
+
         try {
             if (const lt::torrent_status st = handle.status(); st.flags & lt::torrent_flags::paused) {
                 handle.set_flags(lt::torrent_flags::auto_managed);
                 handle.resume();
+                log_i(info_hash.c_str(), "恢复成功");
             }
         } catch (const std::exception &e) {
             log_e(info_hash.c_str(), "handle 恢复失败: {}", e.what());

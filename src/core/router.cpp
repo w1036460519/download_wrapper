@@ -26,14 +26,12 @@ namespace dw {
         return nullptr;
     }
 
-    int32_t Router::start(const dw_downloader *owner, const Config &cfg) {
-        task_manager_ = std::make_unique<TaskManager>();
+    void Router::create_task_manager(const Config &cfg) {
+        task_manager_ = std::make_unique<TaskManager>(cfg);
+    }
 
-        // 注入引擎
-        task_manager_->set_engines(owner->http_engine.get(), owner->torrent_engine.get());
-
-        // 启动 TaskManager
-        return task_manager_->start(cfg);
+    int32_t Router::start() {
+        return task_manager_->start();
     }
 
     void Router::stop() {
