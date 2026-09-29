@@ -160,6 +160,8 @@ def build_libtorrent(version: str, plat: str, arch: str, output_dir: Path,
     cmake_args = [
         "cmake", "-S", str(src_dir), "-B", str(build_subdir),
         f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
+        # vcpkg.json 在 build 目录，需显式指定（toolchain 默认在 source 目录找）
+        f"-DVCPKG_MANIFEST_DIR={build_subdir}",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_CXX_STANDARD=20",
         # 库类型
