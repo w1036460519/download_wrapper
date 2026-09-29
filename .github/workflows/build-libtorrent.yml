@@ -6,11 +6,6 @@ name: Build libtorrent
 # 触发：仅手动触发
 on:
   workflow_dispatch:
-    inputs:
-      force_rebuild:
-        description: '强制重新编译（跳过缓存）'
-        type: boolean
-        default: false
 
 jobs:
   # 读取版本配置
