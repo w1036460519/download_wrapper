@@ -148,7 +148,7 @@ def setup_depot_tools(temp_dir: Path) -> Path:
     """克隆 depot_tools 并加入 PATH，返回路径。"""
     depot = temp_dir / "depot_tools"
     if not depot.exists():
-        run(["git", "clone", "--depth", "1",
+        run(["git", "clone",
              "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
              str(depot)])
 
