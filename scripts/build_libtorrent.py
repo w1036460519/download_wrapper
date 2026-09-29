@@ -167,6 +167,7 @@ def build_libtorrent(version: str, plat: str, arch: str, output_dir: Path,
         "-DCMAKE_CXX_STANDARD=20",
         # 库类型
         "-DBUILD_SHARED_LIBS=OFF",        # 静态库
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",  # -fPIC（静态库需链接进 .so）
         "-DBUILD_TESTING=OFF",
         "-DBUILD_TOOLS=OFF",              # 不需要独立工具程序
         "-DBUILD_EXAMPLES=OFF",

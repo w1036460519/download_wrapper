@@ -90,6 +90,7 @@ PLATFORMS = {
         "abi": "arm64-v8a",
         "api": 28,
         "output": "download-android-arm64.so",
+        "overlay_triplets": True,
     },
     "android-x64": {
         "os": "android",
@@ -97,6 +98,7 @@ PLATFORMS = {
         "abi": "x86_64",
         "api": 28,
         "output": "download-android-x64.so",
+        "overlay_triplets": True,
     },
 }
 
@@ -174,7 +176,7 @@ def _get_github_repo(workspace: Path) -> str:
 
 
 def _download_from_release(workspace: Path, release_tag: str, asset: str,
-                           component: str, version: str) -> Path | None:
+                           component: str, version: str, platform_tag: str = None) -> Path | None:
     """从 GitHub Release 下载并解压预编译产物。
     
     Args:
@@ -183,11 +185,14 @@ def _download_from_release(workspace: Path, release_tag: str, asset: str,
         asset: 文件名 (如 'libtorrent-v2.1.2-macos.tar.gz')
         component: 组件名 (如 'libtorrent', 'libwebrtc')
         version: 版本号
+        platform_tag: 平台标识 (如 'windows-arm64')，用于区分架构
     
     Returns:
         解压目录路径，失败返回 None
     """
-    dest = workspace / "third_party" / f"{component}-{version}"
+    # 路径包含平台标识，避免不同架构产物混用
+    subdir = f"{component}-{version}-{platform_tag}" if platform_tag else f"{component}-{version}"
+    dest = workspace / "third_party" / subdir
     
     # 已存在则跳过
     if (dest / "lib").exists():
@@ -238,7 +243,7 @@ def download_libwebrtc(workspace: Path, platform_name: str) -> Path | None:
     """从 GitHub Release 下载 libwebrtc 预编译产物。"""
     asset = get_libwebrtc_asset_name(platform_name)
     release_tag = get_libwebrtc_release_tag()
-    return _download_from_release(workspace, release_tag, asset, "libwebrtc", LIBWEBRTC_VERSION)
+    return _download_from_release(workspace, release_tag, asset, "libwebrtc", LIBWEBRTC_VERSION, platform_name)
 
 
 # ── Step 2.5: libtorrent 获取 ──
@@ -253,7 +258,7 @@ def download_libtorrent(workspace: Path, platform_name: str) -> Path | None:
     
     asset = get_libtorrent_asset_name(platform_tag)
     release_tag = get_libtorrent_release_tag()
-    return _download_from_release(workspace, release_tag, asset, "libtorrent", LIBTORRENT_VERSION)
+    return _download_from_release(workspace, release_tag, asset, "libtorrent", LIBTORRENT_VERSION, platform_tag)
 
 
 def ensure_libtorrent(workspace: Path, libtorrent_dir: Path | None,
