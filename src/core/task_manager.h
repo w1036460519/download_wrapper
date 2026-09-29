@@ -47,7 +47,6 @@ namespace dw {
     class TaskManager {
     public:
         TaskManager() = default;
-        explicit TaskManager(const Config &cfg) { apply_config(cfg); }
 
         ~TaskManager();
 
@@ -58,8 +57,8 @@ namespace dw {
         /// 注入引擎（由 download_wrapper.cpp 在 init 时提供，经统一接口分发）。
         void set_engines(IDownloadEngine *http, IDownloadEngine *torrent);
 
-        /// 校验并深拷贝配置到内部；运行期可重复调用，启动参数忽略仅日志提示。
-        void apply_config(const Config &cfg);
+        /// 校验并深拷贝配置到内部；参数非法时返回失败原因。
+        dw_submit_result_t apply_config(const Config &cfg);
 
         /// 当前有效配置（已校验，引擎直接消费无需再判合法）。
         const Config &config() const { return config_; }
@@ -84,7 +83,7 @@ namespace dw {
 
         /// 删除任务：标记 DELETING + 调引擎 delete_task(delete_files)；
         /// 引擎发 DELETED 事件后 wrapper 回收资源 + 按标识删文件。
-        dw_submit_result_t remove(const TaskParams &params) const;
+        dw_submit_result_t remove(const TaskParams &params);
 
         /// 保存任务来源（save_path / magnet_link / torrent_file），用于 resume data 尚未生成时的兜底恢复。
         void save_resume_source(const std::string &client_id, dw_protocol_t proto,
@@ -109,18 +108,10 @@ namespace dw {
         /// 读取文件播放进度（毫秒）；无记录返回 0。
         int64_t get_play_position(dw_protocol_t proto, const std::string &natural_key, int32_t file_index);
 
-        /// 读取某文件已下载区间快照（任务未加载进引擎时的播放兜底）；无记录返回空 vector。
-        std::vector<dw_byte_range_t> load_segments(dw_protocol_t proto, const std::string &natural_key,
-                                                   int32_t file_index);
-
-        // ---- 分段内存缓存（STATUS_UPDATE 事件时从引擎拉取并缓存） ----
-
-        /// 读取缓存的已下载区间（代理热路径，无需查引擎或 DB）；未缓存返回空 vector。
-        std::vector<dw_byte_range_t> get_cached_segments(dw_protocol_t proto, const std::string &natural_key,
-                                                         int32_t file_index);
-
-        /// 查询任务当前状态（mtx_ 保护）；任务不存在返回 -1。
-        int32_t get_task_status(dw_protocol_t proto, const std::string &natural_key);
+        /// 查询任务的文件进度缓存（按三要素查询）；不存在返回空 vector。
+        std::vector<FileProgressInfo> get_file_progress(const std::string &client_id,
+                                                         dw_protocol_t proto,
+                                                         const std::string &natural_key);
 
         // ---- 引擎事件消费（Boost.Asio 事件投递入口） ----
         /// 引擎 alert 经 Boost.Asio io_context::post 投递到此，B 线程消费。
@@ -128,10 +119,8 @@ namespace dw {
         void on_engine_event(EngineEvent event);
 
         // ---- 快照查询 ----
-        int32_t list(dw_task_snapshot_t **out_tasks, int32_t *out_count);
-
-        /// 从数据库加载全部文件目录记录（UI 渲染主表）。
-        std::vector<FileRecord> list_file_records();
+        /// 查询全部任务记录（供 App 启动恢复列表）。
+        std::vector<FileRecord> list();
 
         /// 查找文件记录：优先内存（tasks_），未命中则从 DB 加载并注册入内存。
         /// @return 内存中的 FileRecord 指针，不存在返回 nullptr。
@@ -149,40 +138,17 @@ namespace dw {
         bool resolve_file_path(dw_protocol_t proto, const std::string &natural_key,
                                int32_t file_index, std::string &out_path, int64_t &out_size);
 
-        /// 任务文件列表：BT 引擎实时查询（全量文件含选中状态）；
-        /// HTTP 从任务记录推导单文件条目。
-        dw_submit_result_t load_files(dw_protocol_t proto, const std::string &natural_key);
-
         /// 根据目录路径查询下一级文件和目录信息（不递归）。
         /// @param dir_path 目录路径
         /// @return 文件和目录列表（FileInfo，目录的 size=0）
-        std::vector<FileInfo> get_files(const std::string &dir_path);
-
-        /// 查询任务中的所有文件（复用引擎 get_file_list）。
-        /// @param client_id 客户端标识
-        /// @param proto 协议类型
-        /// @param natural_key 任务标识
-        /// @return dw_submit_result_t（files 为文件列表，含填充的下载进度与区间）
-        dw_submit_result_t get_task_files(const std::string &client_id, dw_protocol_t proto,
-                                          const std::string &natural_key);
+        std::vector<FileInfo> get_files(const std::string &dir_path) const;
 
         // ---- 本地文件浏览与管理 ----
 
-        /// 增量扫描本地文件任务：扫描目录，仅添加新文件（不删除旧记录），返回新增任务快照。
-        int32_t scan_local_tasks(const std::string &save_path,
-                                 dw_task_snapshot_t **out_tasks,
-                                 int32_t *out_count);
-
-        /// 校验本地文件任务的存在性：物理文件不存在则标记为 INVALIDATED。
-        int32_t validate_local_tasks(const std::string &save_path,
-                                     int32_t *out_invalidated_count);
-
-        /// 全量清理指定 save_path 下的本地文件条目（type=0）：DB + 物理文件。
-        int32_t clear_local_tasks(const std::string &save_path);
-
-        /// 删除单个本地文件条目（type=0）：仅 DB + 磁盘清理，不涉及 engine 层。
-        /// 下载任务（type=1/2）拒绝，应走 dw_delete_task。
-        int32_t delete_local_entry(const std::string &save_path, const std::string &root_name);
+        /// 扫描本地文件：校验全量记录存在性 + 增量发现新文件/目录。
+        /// @param catalog_paths 扫描目录路径集合（用于判断 save_path 是否仍有效）
+        /// @return affected_count = 本次新增记录数（失效/删除记录经回调通知，不计入）
+        dw_submit_result_t scan_local_file(const std::vector<std::string> &catalog_paths);
 
         // ---- BT 解析工具（转发至 TorrentEngine 静态方法） ----
 
@@ -191,15 +157,6 @@ namespace dw {
 
         /// 解析 .torrent 文件获取 info_hash 和文件列表。
         dw_submit_result_t parse_torrent_file(const std::string &torrent_file_path);
-
-        // ---- 路径与展示辅助（静态，不依赖实例态） ----
-
-        /// 根据 FileRecord 计算磁盘根路径。
-        /// 统一为 save_path / root_name。
-        static std::string disk_root_path(const FileRecord &rec);
-
-        /// 根据 FileRecord 计算展示名：root_name（已含可能的去重后缀）。
-        static std::string display_name(const FileRecord &rec);
 
         /// 当前本机 clientId（从 config_ 读取）。
         const std::string &client_id() const { return config_.client_id; }
@@ -215,7 +172,7 @@ namespace dw {
         /// 本机任务添加（入队等待调度）。
         dw_submit_result_t self_add(TaskParams &params);
 
-        /// 远程任务添加（经 Router 转发）。
+        /// 远程任务添加（预留扩展）。
         dw_submit_result_t remote_add(TaskParams &params);
 
         /// 本机任务暂停。
@@ -231,10 +188,10 @@ namespace dw {
         dw_submit_result_t remote_resume(const TaskParams &params);
 
         /// 本机任务删除。
-        dw_submit_result_t self_remove(const TaskParams &params) const;
+        dw_submit_result_t self_remove(const TaskParams &params);
 
         /// 远程任务删除。
-        dw_submit_result_t remote_remove(const TaskParams &params) const;
+        dw_submit_result_t remote_remove(const TaskParams &params);
 
         // A 线程（轻量）：周期任务调度准入。
         // stop() 置 running_=false 后由 notify_all 唤醒等待点并退出循环。
@@ -250,12 +207,8 @@ namespace dw {
         // RESUME_DATA/PAUSED/RESUMED/DELETED）。
         void consume_engine_event(const EngineEvent &event);
 
-        // 复位运行态遥测（速率/探测/原因/消息）：任务离开活跃态转 PAUSED/QUEUED 时调用，避免合成帧残留旧速率。
-        static void reset_live_telemetry(FileRecord &rec);
-
         // ---- 内部工具 ----
         int32_t active_count_locked() const; // 占用下载额度的任务数
-        void flush_dirty_locked(); // 同步任务进度遥测到 file_records（节流写，假定已持 mtx_）
 
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
         IDownloadEngine *engine_of(dw_protocol_t proto) const;
@@ -275,12 +228,6 @@ namespace dw {
 
         // 注销：清 tasks_，union_id 定位。
         void unregister_task(const std::string &union_id);
-
-        // HTTP 周期快照：单文件已下载连续区间全量重写落库（file_index=0）；
-        // BT 进度由 FILE_PROGRESS 事件（piece 驱动）增量维护不经此路径。
-        // 供任务未加载进引擎时的播放兜底。假定已持 mtx_，仅短暂访问引擎自有锁，无死锁。
-        // 同时检查文件/任务级完成条件。
-        void snapshot_segments_locked(FileRecord &task_record);
 
         std::recursive_mutex mtx_;
         // 任务主表：union_id → FileRecord。常驻活跃/排队任务，后续引入淘汰策略。

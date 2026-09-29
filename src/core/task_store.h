@@ -51,9 +51,6 @@ namespace dw {
         /// 检测到旧 schema（task_id 列）则 DROP 全部表重建（项目未上线）。
         void init_schema() const;
 
-        /// 清理指定 save_path 下的 file_records 中 type=0（本地文件条目）。
-        void clear_local_tasks(const std::string &client_id, const std::string &save_path) const;
-
         /// 删除任务及其 resume_data / file_progress_cache / file_records（统一按复合键）。
         void remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
 
@@ -83,26 +80,22 @@ namespace dw {
         /// 新增文件记录：自增 id 回填到 r.id。
         void insert_file_record(FileRecord &r) const;
 
-        /// 按任务关联三要素（client_id + task_protocol + task_natural_key）判存，
-        /// 用于占位插入的幂等检查，避免重复新建。
-        bool has_file_record(const std::string &client_id, dw_protocol_t task_protocol,
-                             const std::string &task_natural_key) const;
-
-        /// 按任务关联三要素加载单条文件记录；不存在返回 false。
+        /// 按任务关联三要素（client_id + task_protocol + task_natural_key）加载单条文件记录；不存在返回 false。
         bool find_file_record(const std::string &client_id, dw_protocol_t task_protocol,
                               const std::string &task_natural_key, FileRecord &out) const;
+
+        /// 按 full_path 检查文件记录是否已存在。
+        bool file_record_exists_by_path(const std::string &full_path) const;
 
         /// 按任务关联三要素刷新 modified_at 为当前时间，用于排序置顶。
         void touch_file_record(const std::string &client_id, dw_protocol_t task_protocol,
                                const std::string &task_natural_key) const;
 
-        /// 载入指定客户端的全部文件记录（按 modified_at DESC）。
-        std::vector<FileRecord> load_file_records(const std::string &client_id) const;
+        /// 载入全部文件记录（按 modified_at DESC）。
+        std::vector<FileRecord> load_file_records() const;
 
-        /// 载入指定客户端指定状态集合的文件记录（按 modified_at DESC）。
-        /// 用于启动时按需加载活跃态任务，避免全量加载浪费。
-        std::vector<FileRecord> load_file_records(const std::string &client_id,
-                                                  const std::vector<dw_task_status_t> &statuses) const;
+        /// 载入指定客户端的文件记录（按 modified_at DESC）。
+        std::vector<FileRecord> load_file_records(const std::string &client_id) const;
 
         /// 载入指定客户端、指定协议集合、指定状态集合的文件记录（按 modified_at DESC）。
         /// 用于按协议维度精确过滤，避免加载不相关协议的任务。
@@ -110,43 +103,15 @@ namespace dw {
                                                   const std::vector<dw_protocol_t> &protocols,
                                                   const std::vector<dw_task_status_t> &statuses) const;
 
-        /// 载入指定客户端某 save_path 下的文件记录（按 modified_at DESC）。
-        std::vector<FileRecord> load_file_records_by_save_path(const std::string &client_id,
-                                                               const std::string &save_path) const;
-
-        /// 按 save_path + root_name 删除单条文件记录（LOCAL 条目删除）。
-        void delete_file_record_by_name(const std::string &client_id, const std::string &save_path,
-                                        const std::string &root_name) const;
+        /// 按 full_path 删除单条文件记录。
+        void delete_file_record_by_path(const std::string &full_path) const;
 
         /// 按 save_path + root_name 同步文件记录状态（validate_local_tasks 用）。
         void update_file_record_status_by_name(const std::string &save_path, const std::string &root_name,
                                                int32_t status) const;
 
-        /// 同步文件记录的进度与错误信息冗余字段，免全字段 UPDATE。
-        void sync_file_record_progress(dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                       int32_t status, int64_t total_size, int64_t total_done,
-                                       int32_t reason, const std::string &message) const;
-
-        /// 任务状态迁移即时写（权威列）：QUEUED/DOWNLOADING/PAUSED/COMPLETED/ERROR 等关键迁移点调用，
-        /// 不受进度遥测节流影响；与 sync_file_record_progress 的差异为不带进度、可带错误文本。
-        void update_file_record_status(const std::string &client_id, dw_protocol_t task_protocol,
-                                       const std::string &task_natural_key,
-                                       dw_task_status_t status, dw_reason_t reason, const std::string &message) const;
-
-        /// 根据三要素（client_id, protocol, natural_key）更新文件记录的全部持久化字段。
+        /// 按三要素更新文件记录的运行时可变字段（元数据 + 状态 + 进度），单次 SQL。
         void update_file_record(const FileRecord &rec) const;
-
-        /// 按任务关联三要素（client_id + task_protocol + task_natural_key）更新文件记录的
-        /// save_path、original_root_name、root_name、full_path、file_type、ext
-        /// （PARSED 后修正为解析时保存目录、判重后根名、磁盘根实体全路径、实际形态、文件后缀）。
-        /// full_path = save_path/root_name（目录与单文件统一公式）；
-        /// ext 不含点（如 "mp4"），目录场景传空串保持 NULL。
-        void update_file_record_meta(const std::string &client_id,
-                                     dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                     const std::string &task_save_path,
-                                     const std::string &original_root_name, const std::string &root_name,
-                                     const std::string &full_path,
-                                     bool file_type, const std::string &ext) const;
 
         // ---- 播放进度（独立表 play_progress，以完整路径为键）----
 
@@ -181,16 +146,14 @@ namespace dw {
         void mark_file_complete(const std::string &client_id, dw_protocol_t protocol,
                                 const std::string &natural_key, int32_t file_index) const;
 
-        /// 按任务删除全部进度缓存（任务删除级联）。
-        void delete_file_progress_by_task(const std::string &client_id, dw_protocol_t protocol,
-                                          const std::string &natural_key) const;
-
         /// 聚合文件累计已下载字节；无记录返回 0。
         int64_t sum_file_progress_by_file(const std::string &client_id, dw_protocol_t protocol,
                                           const std::string &natural_key, int32_t file_index) const;
 
-        /// 按完整路径读取某文件的已下载区间（按 offset_start 升序）；不存在返回空 vector。
-        std::vector<dw_byte_range_t> load_segments(const std::string &full_path, int32_t file_index) const;
+        /// 按任务三要素查询文件进度缓存（每个文件一条记录）；不存在返回空 vector。
+        std::vector<FileProgressInfo> load_file_progress(const std::string &client_id,
+                                                          dw_protocol_t protocol,
+                                                          const std::string &natural_key) const;
 
         /// 按完整路径批量查询文件进度（file_done + intervals 原始 JSON）。
         /// @return full_path -> {file_done, intervals_json} 映射

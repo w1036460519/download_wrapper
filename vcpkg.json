@@ -9,9 +9,17 @@
     "boost-beast",
     "boost-url",
     "boost-json",
-    {
-      "name": "libtorrent",
-      "default-features": false
-    }
-  ]
+    "boost-system",
+    "boost-random",
+    "boost-crc",
+    "boost-multi-index",
+    "boost-variant",
+    "boost-iterator",
+    "boost-scope-exit",
+    "boost-chrono",
+    "boost-date-time",
+    "boost-pool",
+    "boost-multiprecision"
+  ],
+  "builtin-baseline": "771b0a2e7c473c3a6bee56553be4d5bb32bb653c"
 }

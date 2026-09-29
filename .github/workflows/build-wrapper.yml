@@ -1,7 +1,7 @@
 name: Build Wrapper
 
 # 独立构建 download_wrapper（9 个平台）
-# 从缓存读取 libwebrtc 构建产物（key: libwebrtc-cache-{platform}）
+# 从 Release 下载 libwebrtc/libtorrent 预编译产物
 #
 # 触发：仅手动触发
 on:
@@ -24,8 +24,28 @@ env:
   VCPKG_REF: 'latest'
 
 jobs:
+  # 读取版本配置
+  config:
+    name: config
+    runs-on: ubuntu-latest
+    outputs:
+      libtorrent_version: ${{ steps.version.outputs.libtorrent_version }}
+      libwebrtc_version: ${{ steps.version.outputs.libwebrtc_version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read versions from versions.py
+        id: version
+        run: |
+          LT_VERSION=$(python3 -c "from scripts.versions import LIBTORRENT_VERSION; print(LIBTORRENT_VERSION)")
+          LW_VERSION=$(python3 -c "from scripts.versions import LIBWEBRTC_VERSION; print(LIBWEBRTC_VERSION)")
+          echo "libtorrent_version=$LT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "libwebrtc_version=$LW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "libtorrent: $LT_VERSION"
+          echo "libwebrtc: $LW_VERSION"
+
   build:
     name: wrapper-${{ matrix.name }}
+    needs: config
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +122,17 @@ jobs:
           DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
           echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
 
+      # 从缓存读取 libtorrent 预编译产物（与 build-libtorrent.yml 共享）
+      - name: Cache libtorrent (from build-libtorrent workflow)
+        if: steps.filter.outputs.run == 'true'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/libtorrent-${{ matrix.name }}
+          key: libtorrent-cache-${{ matrix.name }}-v${{ needs.config.outputs.libtorrent_version }}
+          restore-keys: |
+            libtorrent-cache-${{ matrix.name }}-
+          retention-days: 90
+
       # 从缓存读取 libwebrtc 构建产物（与 build-libwebrtc.yml 共享）
       - name: Cache libwebrtc (from build-libwebrtc workflow)
         if: steps.filter.outputs.run == 'true'
@@ -110,7 +141,7 @@ jobs:
           path: |
             ${{ runner.temp }}/webrtc_src
             ${{ runner.temp }}/webrtc_build
-          key: libwebrtc-cache-${{ matrix.libwebrtc_name }}-fixed
+          key: libwebrtc-cache-${{ matrix.libwebrtc_name }}-${{ needs.config.outputs.libwebrtc_version }}
           restore-keys: |
             libwebrtc-cache-${{ matrix.libwebrtc_name }}-
           retention-days: 90
@@ -163,7 +194,8 @@ jobs:
             --vcpkg-ref "${{ env.VCPKG_REF }}" \
             --workspace "${{ github.workspace }}" \
             --temp-dir "${{ runner.temp }}" \
-            --libwebrtc-dir "${{ runner.temp }}/webrtc_build"
+            --libwebrtc-dir "${{ runner.temp }}/webrtc_build" \
+            --libtorrent-dir "${{ runner.temp }}/libtorrent-${{ matrix.name }}"
 
           echo "== 构建后磁盘 =="
           df -h / || true

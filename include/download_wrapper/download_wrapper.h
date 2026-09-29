@@ -388,40 +388,6 @@ typedef struct dw_task_snapshot {
     char *content_root; /**< save_path 下的实际根目录名。物理路径 = save_path / content_root。空串=尚未定名。 */
 } dw_task_snapshot_t;
 
-/* ------------------------------------------------------------------ */
-/*  dw_file_record_t — 文件目录记录（UI 渲染主表）                     */
-/* ------------------------------------------------------------------ */
-
-/**
- * 文件目录记录快照。
- *
- * 由 dw_list_file_records 返回，用于 App 启动时一次性还原文件列表。
- * 所有字符串由库分配，整个数组通过 dw_file_record_list_free 统一释放。
- */
-typedef struct dw_file_record {
-    int64_t id; /**< 自增主键。 */
-    char *client_id; /**< 客户端标识。 */
-    int32_t type; /**< 任务类型：0=文件任务 1=HTTP任务 2=BT任务（dw_source_t）。 */
-    bool is_remote; /**< 远程标识。 */
-    char *save_path; /**< 保存路径。 */
-    char *original_root_name; /**< 重名/包装前的原始目录/文件名。 */
-    char *root_name; /**< 根目录/文件名（重名/包装后的最终名称）。 */
-    char *full_path; /**< 磁盘根实体全路径（save_path/root_name）；占位阶段为空串。 */
-    bool file_type; /**< true=目录 false=文件。 */
-    char *ext; /**< 文件后缀（不含点）；目录为空串。 */
-    bool parsed; /**< 元数据已解析（PARSED 事件后为 true）。 */
-    dw_protocol_t task_protocol; /**< 关联任务协议（DW_PROTOCOL_LOCAL=无关联）。 */
-    char *task_natural_key; /**< 关联任务的 natural_key（无关联时为空串）。 */
-    int32_t status; /**< 冗余任务状态（dw_task_status_t）。 */
-    int64_t total_size; /**< 冗余总字节；-1=未知。 */
-    int64_t total_done; /**< 冗余已完成字节。 */
-    int32_t priority; /**< 队列优先级（越大越优先）。 */
-    int32_t reason; /**< 错误原因码（dw_reason_t）；仅 ERROR 态有效。 */
-    char *message; /**< 错误文本 / 状态描述；无错误时为空串。 */
-    int64_t created_at; /**< 创建时间（Unix 毫秒）。 */
-    int64_t modified_at; /**< 最近修改时间（Unix 毫秒）。 */
-} dw_file_record_t;
-
 /* ================================================================== */
 /*                            生命周期                                */
 /* ================================================================== */
@@ -472,19 +438,6 @@ DW_API void dw_destroy(void);
  *                     响应格式：{"code": 0} 或 {"code": -1, "message": "..."}
  */
 DW_API char *dw_set_config(const char *config_json);
-
-/**
- * 流量闸门：由调用方根据网络状态主动下发。
- *
- * allowed=false 时逐任务暂停所有活跃下载（BT 暂停句柄 / HTTP 停传输线程）并回落 QUEUED，
- *   调度线程不再准入新任务；session 存活以维持连接与心跳（不分享载荷）。
- * allowed=true 时唤醒调度按 QUEUED→准入路径重启（BT 经 add_task 幂等分支恢复）。
- * 幂等：状态未变时直接跳过。
- *
- * @param params_json  JSON 字符串：{"allowed": true/false}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- */
-DW_API char *dw_set_network_allowed(const char *params_json);
 
 /* ================================================================== */
 /*                            回调注册                                */
@@ -617,17 +570,6 @@ DW_API char *dw_parse_torrent_file(const char *params_json);
  */
 DW_API char *dw_info_hash_to_magnet(const char *params_json);
 
-/**
- * 获取已存在任务的文件列表（元数据就绪后可用）。
- *
- * 用于磁力链接任务元数据就绪后获取文件列表。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"files": [...]}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_get_file_list(const char *params_json);
-
 /* ================================================================== */
 /*                        边下边播（区间 / 提优 / 进度）              */
 /* ================================================================== */
@@ -693,18 +635,6 @@ DW_API char *dw_get_play_position(const char *params_json);
 DW_API char *dw_list_tasks(const char *params_json);
 
 /**
- * 获取全部文件目录记录。
- *
- * 用于 App 启动时一次性还原文件列表（UI 渲染主表）。
- * 数据来自库内 SQLite file_records 表，无需引擎运行即可返回。
- *
- * @param params_json  JSON 字符串：{"client_id": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"records": [...]}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_list_file_records(const char *params_json);
-
-/**
  * 设置任务队列优先级（越大越优先）。
  *
  * 立即持久化并触发一次队列调度；对下载中任务仅更新优先级、不中断。
@@ -719,64 +649,19 @@ DW_API char *dw_set_task_priority(const char *params_json);
 /* ================================================================== */
 
 /**
- * 获取任务的文件清单（实时查询，task_files 表已移除）。
+ * 扫描本地文件：校验全量记录存在性 + 增量发现新文件/目录。
  *
- * 用于任务详情页展示文件列表。BT 经引擎 handle 实时查询（需引擎在线，
- * QUEUED 未恢复 / ERROR 态无清单）；HTTP 由任务记录推导（wrapper 目录模型），
- * 离线亦可返回。
+ * 1. 查询全量 file_records，逐条校验物理文件存在性：
+ *    - 本地文件不存在：删除 DB，经进度回调通知 App。
+ *    - 下载任务不存在：状态改为 ERROR（可利用 resume_data 重新下载）。
+ *    - 文件存在但 save_path 不在传入集合中：删除本地文件记录。
+ * 2. 扫描传入目录集合，将未登记的条目注册为本地文件条目。
  *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"files": [...]}} 或 {"code": -1, "message": "..."}
+ * @param params_json  JSON 字符串：{"client_id": "...", "catalog_paths": ["/path1", "/path2"]}
+ * @return             成功返回 JSON 响应（调用者 dw_free 释放）。
+ *                     响应格式：{"code": 0, "data": {"affected_count": 3}} 或 {"code": -1, "message": "..."}
  */
-DW_API char *dw_load_task_files(const char *params_json);
-
-/**
- * 增量扫描本地文件条目。
- *
- * 扫描 save_path 目录，将非下载任务占用且尚未登记的条目注册为本地文件条目
- * （source=DW_SOURCE_LOCAL_FILE，protocol=DW_PROTOCOL_LOCAL，status=COMPLETED）。
- * 已登记条目不做任何处理（增量添加，不删旧记录）。
- * 仅返回本次新增的快照。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "save_path": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"tasks": [...]}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_scan_local_tasks(const char *params_json);
-
-/**
- * 校验本地文件条目的存在性。
- *
- * 遍历 save_path 下所有 source=DW_SOURCE_LOCAL_FILE 的条目，检查物理文件是否仍存在。
- * 不存在的条目状态迁移为 INVALIDATED。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "save_path": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"invalidated_count": 5}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_validate_local_tasks(const char *params_json);
-
-/**
- * 全量清理指定 save_path 下的本地文件条目（source=DW_SOURCE_LOCAL_FILE）。
- *
- * 删除物理文件 + DB 记录，不涉及 engine 层；HTTP / BT 下载任务不受影响。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "save_path": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- */
-DW_API char *dw_clear_local_tasks(const char *params_json);
-
-/**
- * 删除单个本地文件条目（source=DW_SOURCE_LOCAL_FILE）。
- *
- * 仅 DB + 磁盘清理，不涉及 engine 层。
- * 目标条目为 HTTP / BT 下载任务时拒绝并返回错误，应走 dw_delete_task。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "save_path": "...", "root_name": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- */
-DW_API char *dw_delete_local_entry(const char *params_json);
+DW_API char *dw_scan_local_file(const char *params_json);
 
 /* ================================================================== */
 /*                          资源释放                                  */
@@ -797,14 +682,6 @@ DW_API void dw_file_list_free(dw_file_info_t *files, int32_t count);
  * @param count  数组长度。
  */
 DW_API void dw_task_list_free(dw_task_snapshot_t *tasks, int32_t count);
-
-/**
- * 释放文件目录记录数组（含各字段字符串）。
- *
- * @param records  dw_list_file_records 返回的数组。
- * @param count    数组长度。
- */
-DW_API void dw_file_record_list_free(dw_file_record_t *records, int32_t count);
 
 /**
  * 通用内存释放。

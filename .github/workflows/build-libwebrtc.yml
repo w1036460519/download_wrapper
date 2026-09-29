@@ -1,138 +1,188 @@
 name: Build libwebrtc
 
 # 独立构建 libwebrtc（9 个平台）
-# 缓存 key: libwebrtc-cache-{platform}（与 build-wrapper.yml 共享）
+# 编译后上传到 GitHub Release
 #
 # 触发：仅手动触发
 on:
   workflow_dispatch:
     inputs:
-      webrtc_branch:
-        description: 'webrtc-sdk/webrtc 分支'
-        required: true
-        default: 'm144_release'
-      platforms:
-        description: '选择平台'
-        required: true
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - macos
-          - linux
-          - windows
-          - android
-          - ios
       force_rebuild:
-        description: '强制重新下载源码（跳过缓存）'
+        description: '强制重新编译（跳过缓存）'
         type: boolean
         default: false
 
-env:
-  LIBWEBRTC_TAG: 'libwebrtc.m144.7559.09'
-
 jobs:
+  # 读取版本配置
+  config:
+    name: config
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read version from versions.py
+        id: version
+        run: |
+          VERSION=$(python3 -c "from scripts.versions import LIBWEBRTC_VERSION; print(LIBWEBRTC_VERSION)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=libwebrtc-$VERSION" >> "$GITHUB_OUTPUT"
+          echo "libwebrtc version: $VERSION"
+          echo "release tag: libwebrtc-$VERSION"
+
   build:
     name: libwebrtc-${{ matrix.name }}
+    needs: config
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: macos,           os: macos-latest,    target_os: mac,     asset: libwebrtc-macos-release.zip }
-          - { name: linux-x64,       os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-x64-release.zip }
-          - { name: linux-arm64,     os: ubuntu-latest,   target_os: linux,   asset: libwebrtc-linux-arm64-release.zip }
-          - { name: windows-x64,     os: windows-2022,    target_os: win,     asset: libwebrtc-windows-x64-release.zip }
-          - { name: windows-arm64,   os: windows-2022,    target_os: win,     asset: libwebrtc-windows-arm64-release.zip }
-          - { name: android-arm64,   os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-arm64-release.zip }
-          - { name: android-x64,     os: ubuntu-latest,   target_os: android, asset: libwebrtc-android-x64-release.zip }
-          - { name: ios-arm64,       os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-arm64-release.zip }
-          - { name: ios-simulator,   os: macos-latest,    target_os: ios,     asset: libwebrtc-ios-simulator-release.zip }
+          - { name: macos,           os: macos-latest,    target_os: mac,     platform: macos,     arch: universal }
+          - { name: linux-x64,       os: ubuntu-latest,   target_os: linux,   platform: linux,     arch: x64 }
+          - { name: linux-arm64,     os: ubuntu-latest,   target_os: linux,   platform: linux,     arch: arm64 }
+          - { name: windows-x64,     os: windows-2022,    target_os: win,     platform: windows,   arch: x64 }
+          - { name: windows-arm64,   os: windows-2022,    target_os: win,     platform: windows,   arch: arm64 }
+          - { name: android-arm64,   os: ubuntu-latest,   target_os: android, platform: android,   arch: arm64 }
+          - { name: android-x64,     os: ubuntu-latest,   target_os: android, platform: android,   arch: x64 }
+          - { name: ios-arm64,       os: macos-latest,    target_os: ios,     platform: ios,       arch: arm64 }
+          - { name: ios-simulator,   os: macos-latest,    target_os: ios,     platform: ios,       arch: universal }
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Check platform filter
-        id: filter
-        shell: bash
-        run: |
-          PLATFORM="${{ matrix.name }}"
-          SELECTED="${{ inputs.platforms || 'all' }}"
-          if [ "$SELECTED" = "all" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SELECTED" = "macos" ] && [[ "$PLATFORM" == macos* ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SELECTED" = "linux" ] && [[ "$PLATFORM" == linux* ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SELECTED" = "windows" ] && [[ "$PLATFORM" == windows* ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SELECTED" = "android" ] && [[ "$PLATFORM" == android* ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SELECTED" = "ios" ] && [[ "$PLATFORM" == ios* ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/checkout@v5
 
       - name: Normalize paths
-        if: steps.filter.outputs.run == 'true'
         shell: bash
         run: |
           DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
           echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
 
       - name: Setup Android NDK
-        if: steps.filter.outputs.run == 'true' && matrix.target_os == 'android'
+        if: matrix.target_os == 'android'
         shell: bash
         run: |
           NDK=$(echo "${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" | tr '\\' '/')
           echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
 
-      # L1: depot_tools 缓存（工具链稳定，极少变化）
+      # L1: depot_tools 缓存
       - name: Cache depot_tools
-        if: steps.filter.outputs.run == 'true'
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/depot_tools
           key: depot-tools-${{ runner.os }}
           retention-days: 90
 
-      # L2: WebRTC 源码 + 编译产物缓存（与 build-wrapper.yml 共享）
+      # L2: WebRTC 源码 + 编译产物缓存
       - name: Cache libwebrtc
-        if: steps.filter.outputs.run == 'true'
+        if: inputs.force_rebuild != true
+        id: cache
         uses: actions/cache@v5
         with:
           path: |
             ${{ runner.temp }}/webrtc_src
             ${{ runner.temp }}/webrtc_build
-          key: libwebrtc-cache-${{ matrix.name }}-${{ inputs.force_rebuild && github.run_id || 'fixed' }}
+          key: libwebrtc-cache-${{ matrix.name }}-fixed
           restore-keys: |
             libwebrtc-cache-${{ matrix.name }}-
           retention-days: 90
 
       - name: Build
-        if: steps.filter.outputs.run == 'true'
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
-        env:
-          WEBRTC_BRANCH: ${{ inputs.webrtc_branch || 'm144_release' }}
         run: |
           echo "== 构建前磁盘 =="
           df -h / || true
 
           python3 "${{ github.workspace }}/scripts/build_libwebrtc.py" \
             --platform "${{ matrix.name }}" \
-            --webrtc-branch "$WEBRTC_BRANCH" \
             --temp-dir "$DW_TEMP"
 
           echo "== 构建后磁盘 =="
           df -h / || true
 
+      - name: Pack artifact
+        shell: bash
+        env:
+          LT_VERSION: ${{ needs.config.outputs.version }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          python3 << 'PYEOF'
+          import tarfile
+          import os
+          from pathlib import Path
+          
+          platform = os.environ["MATRIX_PLATFORM"]
+          arch = os.environ["MATRIX_ARCH"]
+          if arch == "universal":
+              platform_tag = platform
+          else:
+              platform_tag = f"{platform}-{arch}"
+          
+          version = os.environ["LT_VERSION"]
+          asset_name = f"libwebrtc-{version}-{platform_tag}.tar.gz"
+          
+          build_dir = Path(os.environ["DW_TEMP"]) / "webrtc_build"
+          asset_path = Path(os.environ["DW_TEMP"]) / asset_name
+          
+          with tarfile.open(asset_path, "w:gz") as tar:
+              for subdir in ["include", "lib", "src"]:
+                  path = build_dir / subdir
+                  if path.exists():
+                      tar.add(path, arcname=subdir)
+          
+          print(f"Packed: {asset_path}")
+          print(f"Size: {asset_path.stat().st_size / 1024 / 1024:.1f} MB")
+          PYEOF
+
       - name: Upload artifact
-        if: steps.filter.outputs.run == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: libwebrtc-${{ matrix.name }}
-          path: ${{ runner.temp }}/${{ matrix.asset }}
+          path: ${{ runner.temp }}/libwebrtc-${{ needs.config.outputs.version }}-*.tar.gz
           retention-days: 90
+
+  # 所有平台构建完成后，上传到 Release
+  release:
+    name: Upload to Release
+    needs: [config, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create/Update Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.config.outputs.release_tag }}"
+          echo "Release tag: $TAG"
+          
+          # 创建或更新 Release
+          gh release view "$TAG" 2>/dev/null || \
+            gh release create "$TAG" \
+              --title "libwebrtc ${{ needs.config.outputs.version }}" \
+              --notes "libwebrtc ${{ needs.config.outputs.version }} 预编译产物" \
+              --target main
+          
+          # 上传所有 tar.gz 文件
+          for file in artifacts/libwebrtc-*.tar.gz; do
+            if [ -f "$file" ]; then
+              echo "Uploading: $file"
+              gh release upload "$TAG" "$file" --clobber
+            fi
+          done
+          
+          echo "✅ Release 上传完成"

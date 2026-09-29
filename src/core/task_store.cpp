@@ -164,19 +164,6 @@ namespace dw {
         sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
     }
 
-    void TaskStore::clear_local_tasks(const std::string &client_id, const std::string &save_path) const {
-        // 仅清理本客户端、本目录下的本地文件条目（type=DW_SOURCE_LOCAL_FILE），
-        // 不得跨 client_id 删除，也不得连带 HTTP / BT 下载任务的记录。
-        constexpr auto sql =
-                "DELETE FROM file_records WHERE client_id=:client_id AND save_path=:save_path AND type=0;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_text(st, ":client_id", client_id);
-        bind_text(st, ":save_path", save_path);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
     void TaskStore::remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const {
         // resume_data / file_progress_cache 仍用 protocol + natural_key 列名
         auto del_by_key = [this, &client_id, &protocol, &natural_key](const char *table) {
@@ -208,55 +195,25 @@ namespace dw {
         }
     }
 
-    void TaskStore::update_file_record_status(const std::string &client_id, const dw_protocol_t task_protocol,
-                                              const std::string &task_natural_key,
-                                              const dw_task_status_t status, const dw_reason_t reason,
-                                              const std::string &message) const {
-        // 任务状态迁移即时写（权威列），不携带进度。
-        constexpr auto sql = R"(
-            UPDATE file_records SET status=:status, reason=:reason, message=:message, modified_at=:modified_at
-            WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_int(st, ":status", static_cast<int>(status));
-        bind_int(st, ":reason", static_cast<int>(reason));
-        bind_text(st, ":message", message);
-        bind_int64(st, ":modified_at", now_unix_ms());
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":task_protocol", static_cast<int>(task_protocol));
-        bind_text(st, ":task_natural_key", task_natural_key);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
     void TaskStore::update_file_record(const FileRecord &rec) const {
-        // 根据三要素（client_id, protocol, natural_key）更新全部字段
         constexpr auto sql = R"(
-            UPDATE file_records SET
-                type=:type, is_remote=:is_remote, save_path=:save_path,
-                original_root_name=:original_root_name, root_name=:root_name,
-                full_path=:full_path, file_type=:file_type, ext=:ext, parsed=:parsed,
+            UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name,
+                root_name=:root_name, full_path=:full_path, file_type=:file_type, ext=:ext,
                 status=:status, total_size=:total_size, total_done=:total_done,
-                priority=:priority, reason=:reason, message=:message,
-                modified_at=:modified_at
+                reason=:reason, message=:message, modified_at=:modified_at
             WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
         )";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_int(st, ":type", static_cast<int>(rec.type));
-        bind_int(st, ":is_remote", rec.is_remote ? 1 : 0);
         bind_text(st, ":save_path", rec.save_path);
         bind_text(st, ":original_root_name", rec.original_root_name);
         bind_text(st, ":root_name", rec.root_name);
         bind_text(st, ":full_path", rec.full_path);
         bind_int(st, ":file_type", rec.file_type ? 1 : 0);
-        bind_text(st, ":ext", rec.ext);
-        bind_int(st, ":parsed", rec.parsed ? 1 : 0);
+        bind_text_or_null(st, ":ext", rec.ext);
         bind_int(st, ":status", rec.status);
         bind_int64(st, ":total_size", rec.total_size);
         bind_int64(st, ":total_done", rec.total_done);
-        bind_int(st, ":priority", rec.priority);
         bind_int(st, ":reason", rec.reason);
         bind_text(st, ":message", rec.message);
         bind_int64(st, ":modified_at", now_unix_ms());
@@ -373,22 +330,6 @@ namespace dw {
         }
     } // namespace
 
-    bool TaskStore::has_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
-                                    const std::string &task_natural_key) const {
-        constexpr auto sql =
-                "SELECT 1 FROM file_records WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key LIMIT 1;";
-        sqlite3_stmt *st = nullptr;
-        bool exists = false;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
-            bind_text(st, ":client_id", client_id);
-            bind_int(st, ":task_protocol", static_cast<int>(task_protocol));
-            bind_text(st, ":task_natural_key", task_natural_key);
-            exists = sqlite3_step(st) == SQLITE_ROW;
-            sqlite3_finalize(st);
-        }
-        return exists;
-    }
-
     bool TaskStore::find_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
                                      const std::string &task_natural_key, FileRecord &out) const {
         constexpr auto sql =
@@ -403,6 +344,19 @@ namespace dw {
                 fill_file_record(st, out);
                 found = true;
             }
+            sqlite3_finalize(st);
+        }
+        return found;
+    }
+
+    bool TaskStore::file_record_exists_by_path(const std::string &full_path) const {
+        constexpr auto sql =
+                "SELECT 1 FROM file_records WHERE full_path=:full_path LIMIT 1;";
+        sqlite3_stmt *st = nullptr;
+        bool found = false;
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
+            bind_text(st, ":full_path", full_path);
+            found = (sqlite3_step(st) == SQLITE_ROW);
             sqlite3_finalize(st);
         }
         return found;
@@ -467,13 +421,11 @@ namespace dw {
         r.id = sqlite3_last_insert_rowid(db_);
     }
 
-    std::vector<FileRecord> TaskStore::load_file_records(const std::string &client_id) const {
+    std::vector<FileRecord> TaskStore::load_file_records() const {
         std::vector<FileRecord> out;
-        constexpr auto sql =
-                "SELECT * FROM file_records WHERE client_id=:client_id ORDER BY modified_at DESC;";
+        constexpr auto sql = "SELECT * FROM file_records ORDER BY modified_at DESC;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        bind_text(st, ":client_id", client_id);
         while (sqlite3_step(st) == SQLITE_ROW) {
             FileRecord r;
             fill_file_record(st, r);
@@ -483,25 +435,13 @@ namespace dw {
         return out;
     }
 
-    std::vector<FileRecord> TaskStore::load_file_records(const std::string &client_id,
-                                                         const std::vector<dw_task_status_t> &statuses) const {
+    std::vector<FileRecord> TaskStore::load_file_records(const std::string &client_id) const {
         std::vector<FileRecord> out;
-        if (statuses.empty()) return out;
-        // 动态构建 IN 子句：status IN (?, ?, ...)
-        std::string placeholders;
-        for (size_t i = 0; i < statuses.size(); ++i) {
-            if (i > 0) placeholders += ", ";
-            placeholders += "?";
-        }
-        const std::string sql =
-                "SELECT * FROM file_records WHERE client_id=? AND status IN (" + placeholders +
-                ") ORDER BY modified_at DESC;";
+        constexpr auto sql =
+                "SELECT * FROM file_records WHERE client_id=:client_id ORDER BY modified_at DESC;";
         sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return out;
-        sqlite3_bind_text(st, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
-        for (size_t i = 0; i < statuses.size(); ++i) {
-            sqlite3_bind_int(st, static_cast<int>(i + 2), static_cast<int>(statuses[i]));
-        }
+        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
+        bind_text(st, ":client_id", client_id);
         while (sqlite3_step(st) == SQLITE_ROW) {
             FileRecord r;
             fill_file_record(st, r);
@@ -548,34 +488,13 @@ namespace dw {
         return out;
     }
 
-    std::vector<FileRecord> TaskStore::load_file_records_by_save_path(const std::string &client_id,
-                                                                      const std::string &save_path) const {
-        std::vector<FileRecord> out;
+    void TaskStore::delete_file_record_by_path(const std::string &full_path) const {
         constexpr auto sql =
-                "SELECT * FROM file_records WHERE client_id=:client_id AND save_path=:save_path ORDER BY modified_at DESC;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        bind_text(st, ":client_id", client_id);
-        bind_text(st, ":save_path", save_path);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            FileRecord r;
-            fill_file_record(st, r);
-            out.push_back(std::move(r));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
-    void TaskStore::delete_file_record_by_name(const std::string &client_id, const std::string &save_path,
-                                               const std::string &root_name) const {
-        constexpr auto sql =
-                "DELETE FROM file_records WHERE client_id=:client_id AND save_path=:save_path AND root_name=:root_name;";
+                "DELETE FROM file_records WHERE full_path=:full_path;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
             return;
-        bind_text(st, ":client_id", client_id);
-        bind_text(st, ":save_path", save_path);
-        bind_text(st, ":root_name", root_name);
+        bind_text(st, ":full_path", full_path);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
@@ -591,57 +510,6 @@ namespace dw {
         bind_int64(st, ":modified_at", now_unix_ms());
         bind_text(st, ":save_path", save_path);
         bind_text(st, ":root_name", root_name);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void TaskStore::sync_file_record_progress(const dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                              const int32_t status, const int64_t total_size,
-                                              const int64_t total_done, const int32_t reason,
-                                              const std::string &message) const {
-        constexpr auto sql = R"(
-            UPDATE file_records SET status=:status, total_size=:total_size, total_done=:total_done,
-                reason=:reason, message=:message, modified_at=:modified_at
-            WHERE task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_int(st, ":status", status);
-        bind_int64(st, ":total_size", total_size);
-        bind_int64(st, ":total_done", total_done);
-        bind_int(st, ":reason", reason);
-        bind_text(st, ":message", message);
-        bind_int64(st, ":modified_at", now_unix_ms());
-        bind_int(st, ":task_protocol", static_cast<int>(task_protocol));
-        bind_text(st, ":task_natural_key", task_natural_key);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void TaskStore::update_file_record_meta(const std::string &client_id,
-                                            const dw_protocol_t task_protocol, const std::string &task_natural_key,
-                                            const std::string &task_save_path,
-                                            const std::string &original_root_name, const std::string &root_name,
-                                            const std::string &full_path,
-                                            const bool file_type, const std::string &ext) const {
-        constexpr auto sql = R"(
-            UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name, root_name=:root_name,
-                full_path=:full_path, file_type=:file_type, ext=:ext,
-                parsed=1, modified_at=:modified_at
-            WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_text(st, ":save_path", task_save_path);
-        bind_text(st, ":original_root_name", original_root_name);
-        bind_text(st, ":root_name", root_name);
-        bind_text(st, ":full_path", full_path);
-        bind_int(st, ":file_type", file_type ? 1 : 0);
-        bind_text_or_null(st, ":ext", ext);
-        bind_int64(st, ":modified_at", now_unix_ms());
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":task_protocol", static_cast<int>(task_protocol));
-        bind_text(st, ":task_natural_key", task_natural_key);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
@@ -786,20 +654,6 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    void TaskStore::delete_file_progress_by_task(const std::string &client_id, const dw_protocol_t protocol,
-                                                 const std::string &natural_key) const {
-        constexpr auto sql =
-                "DELETE FROM file_progress_cache WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
-            return;
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
     int64_t TaskStore::sum_file_progress_by_file(const std::string &client_id, const dw_protocol_t protocol,
                                                  const std::string &natural_key, const int32_t file_index) const {
         constexpr auto sql =
@@ -835,18 +689,29 @@ namespace dw {
         return total;
     }
 
-    std::vector<dw_byte_range_t> TaskStore::load_segments(const std::string &full_path, int32_t file_index) const {
-        std::vector<dw_byte_range_t> out;
-        // 按完整路径查询已下载区间（App 播放器按路径消费；file_index 辅助定位）。
+    std::vector<FileProgressInfo> TaskStore::load_file_progress(const std::string &client_id,
+                                                                  const dw_protocol_t protocol,
+                                                                  const std::string &natural_key) const {
+        std::vector<FileProgressInfo> out;
         constexpr auto sql =
-                "SELECT segments FROM file_progress_cache WHERE full_path=:full_path AND file_index=:file_index;";
+                "SELECT file_index, full_path, size, downloaded_bytes, segments FROM file_progress_cache "
+                "WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key "
+                "ORDER BY file_index;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        bind_text(st, ":full_path", full_path);
-        bind_int(st, ":file_index", file_index);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            const char *json_str = reinterpret_cast<const char *>(sqlite3_column_text(st, 0));
-            if (json_str) {
+        bind_text(st, ":client_id", client_id);
+        bind_int(st, ":protocol", static_cast<int>(protocol));
+        bind_text(st, ":natural_key", natural_key);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            FileProgressInfo info;
+            info.file_index = sqlite3_column_int(st, 0);
+            if (const char *p = reinterpret_cast<const char *>(sqlite3_column_text(st, 1)); p) {
+                info.full_path = p;
+            }
+            info.size = sqlite3_column_int64(st, 2);
+            info.downloaded_bytes = sqlite3_column_int64(st, 3);
+            // 解析 segments JSON
+            if (const char *json_str = reinterpret_cast<const char *>(sqlite3_column_text(st, 4)); json_str) {
                 try {
                     auto json = boost::json::parse(json_str);
                     if (json.is_array()) {
@@ -855,14 +720,15 @@ namespace dw {
                                 dw_byte_range_t seg{};
                                 seg.start = interval.as_array()[0].as_int64();
                                 seg.end = interval.as_array()[1].as_int64();
-                                out.push_back(seg);
+                                info.segments.push_back(seg);
                             }
                         }
                     }
                 } catch (...) {
-                    // JSON 解析失败，返回空
+                    // JSON 解析失败，忽略
                 }
             }
+            out.push_back(std::move(info));
         }
         sqlite3_finalize(st);
         return out;

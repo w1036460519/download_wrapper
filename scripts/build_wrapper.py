@@ -26,7 +26,16 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # ── 常量 ──
-LIBWEBRTC_RELEASE_TAG = "libwebrtc-v1"
+# 从 versions.py 读取版本
+sys.path.insert(0, str(Path(__file__).parent))
+from versions import (
+    LIBTORRENT_VERSION, LIBWEBRTC_VERSION,
+    get_libtorrent_release_tag, get_libwebrtc_release_tag,
+    get_libtorrent_asset_name, get_libwebrtc_asset_name,
+)
+
+# 兼容旧代码
+LIBWEBRTC_RELEASE_TAG = get_libwebrtc_release_tag()
 
 # ── 平台配置 ──
 # universal=True: 双架构编译后合并（macOS lipo / iOS libtool+lipo）
@@ -91,17 +100,17 @@ PLATFORMS = {
     },
 }
 
-# 平台名 → libwebrtc 产物 zip 名
-LIBWEBRTC_ASSETS = {
-    "macos-universal": "libwebrtc-macos-release.zip",
-    "linux-x64": "libwebrtc-linux-x64-release.zip",
-    "linux-arm64": "libwebrtc-linux-arm64-release.zip",
-    "windows-x64": "libwebrtc-windows-x64-release.zip",
-    "windows-arm64": "libwebrtc-windows-arm64-release.zip",
-    "ios-arm64": "libwebrtc-ios-arm64-release.zip",
-    "ios-simulator-universal": "libwebrtc-ios-simulator-release.zip",
-    "android-arm64": "libwebrtc-android-arm64-release.zip",
-    "android-x64": "libwebrtc-android-x64-release.zip",
+# ── 平台名 → libtorrent 构建参数映射 ──
+LIBTORRENT_PLATFORM_MAP = {
+    "macos-universal": ("macos", "universal"),
+    "linux-x64": ("linux", "x64"),
+    "linux-arm64": ("linux", "arm64"),
+    "windows-x64": ("windows", "x64"),
+    "windows-arm64": ("windows", "arm64"),
+    "ios-arm64": ("ios", "arm64"),
+    "ios-simulator-universal": ("ios", "universal"),
+    "android-arm64": ("android", "arm64"),
+    "android-x64": ("android", "x64"),
 }
 
 
@@ -150,67 +159,168 @@ def setup_vcpkg(workspace: Path, vcpkg_ref: str, temp_dir: Path) -> Path:
     return vcpkg_dir
 
 
-# ── Step 2: libwebrtc 预编译产物 ──
+# ── 通用 Release 下载 ──
 
-def download_libwebrtc(workspace: Path, platform_name: str) -> Path | None:
-    """从 GitHub Release 下载 libwebrtc 预编译产物，解压到 third_party/libwebrtc/。"""
-    asset = LIBWEBRTC_ASSETS.get(platform_name)
-    if not asset:
-        print(f"跳过: 平台 {platform_name} 无 libwebrtc 产物")
-        return None
-
-    dest = workspace / "third_party" / "libwebrtc"
-    dest.mkdir(parents=True, exist_ok=True)
-
+def _get_github_repo(workspace: Path) -> str:
+    """获取 GitHub 仓库 owner/repo"""
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     if not repo:
-        # 本地测试时从 git remote 推断
         result = run_capture(["git", "remote", "get-url", "origin"], cwd=str(workspace))
         if result.returncode == 0:
-            # 从 URL 提取 owner/repo
             url = result.stdout.strip()
             parts = url.rstrip("/").split("/")
             repo = f"{parts[-2]}/{parts[-1].replace('.git', '')}"
+    return repo
 
-    url = f"https://github.com/{repo}/releases/download/{LIBWEBRTC_RELEASE_TAG}/{asset}"
-    print(f"下载 libwebrtc: {url}")
 
-    zip_path = workspace / "libwebrtc.zip"
+def _download_from_release(workspace: Path, release_tag: str, asset: str,
+                           component: str, version: str) -> Path | None:
+    """从 GitHub Release 下载并解压预编译产物。
+    
+    Args:
+        workspace: 项目根目录
+        release_tag: Release tag (如 'libtorrent-v2.1.2')
+        asset: 文件名 (如 'libtorrent-v2.1.2-macos.tar.gz')
+        component: 组件名 (如 'libtorrent', 'libwebrtc')
+        version: 版本号
+    
+    Returns:
+        解压目录路径，失败返回 None
+    """
+    dest = workspace / "third_party" / f"{component}-{version}"
+    
+    # 已存在则跳过
+    if (dest / "lib").exists():
+        print(f"{component} 已存在: {dest}")
+        return dest
+    
+    dest.mkdir(parents=True, exist_ok=True)
+    
+    repo = _get_github_repo(workspace)
+    if not repo:
+        print(f"警告: 无法获取 GitHub 仓库信息")
+        return None
+    
+    url = f"https://github.com/{repo}/releases/download/{release_tag}/{asset}"
+    print(f"下载 {component}: {url}")
+    
+    # 支持 token（私有仓库）
+    token = os.environ.get("GITHUB_TOKEN")
+    headers = {"Authorization": f"token {token}"} if token else {}
+    
+    tar_path = workspace / f"{component}.tar.gz"
     try:
-        urllib.request.urlretrieve(url, zip_path)
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as response, open(tar_path, 'wb') as f:
+            f.write(response.read())
     except Exception as e:
-        print(f"警告: libwebrtc 产物下载失败 ({asset})，P2P 模块将跳过\n       {e}")
+        print(f"{component} 下载失败: {e}")
         if dest.exists():
             shutil.rmtree(dest)
         return None
-
-    # 解压
-    tmp_dir = workspace / "lw_tmp"
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    with zipfile.ZipFile(zip_path, 'r') as zf:
-        zf.extractall(tmp_dir)
-
-    # libwebrtc-pkg/ 顶层目录处理
-    pkg_dir = tmp_dir / "libwebrtc-pkg"
-    src_dir = pkg_dir if pkg_dir.exists() else tmp_dir
-    if src_dir.exists():
-        for item in src_dir.iterdir():
-            shutil.move(str(item), str(dest / item.name))
-
+    
+    # 解压 tar.gz
+    import tarfile
+    with tarfile.open(tar_path, 'r:gz') as tar:
+        tar.extractall(dest)
+    
     # 清理
-    zip_path.unlink()
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-
-    print(f"libwebrtc 文件数: include={sum(1 for _ in (dest / 'include').rglob('*') if _.is_file())}")
+    tar_path.unlink()
+    
+    file_count = sum(1 for _ in (dest / 'include').rglob('*') if _.is_file())
+    print(f"{component} 下载完成: {dest} (include 文件数: {file_count})")
     return dest
+
+
+# ── Step 2: libwebrtc 预编译产物 ──
+
+def download_libwebrtc(workspace: Path, platform_name: str) -> Path | None:
+    """从 GitHub Release 下载 libwebrtc 预编译产物。"""
+    asset = get_libwebrtc_asset_name(platform_name)
+    release_tag = get_libwebrtc_release_tag()
+    return _download_from_release(workspace, release_tag, asset, "libwebrtc", LIBWEBRTC_VERSION)
+
+
+# ── Step 2.5: libtorrent 获取 ──
+
+def download_libtorrent(workspace: Path, platform_name: str) -> Path | None:
+    """从 GitHub Release 下载 libtorrent 预编译产物。"""
+    if platform_name not in LIBTORRENT_PLATFORM_MAP:
+        return None
+    
+    lt_platform, lt_arch = LIBTORRENT_PLATFORM_MAP[platform_name]
+    platform_tag = lt_platform if lt_arch == "universal" else f"{lt_platform}-{lt_arch}"
+    
+    asset = get_libtorrent_asset_name(platform_tag)
+    release_tag = get_libtorrent_release_tag()
+    return _download_from_release(workspace, release_tag, asset, "libtorrent", LIBTORRENT_VERSION)
+
+
+def ensure_libtorrent(workspace: Path, libtorrent_dir: Path | None,
+                      platform_name: str, vcpkg_dir: Path) -> Path | None:
+    """确保 libtorrent 存在。
+    
+    优先级：
+    1. 指定目录有效 → 使用
+    2. 从 Release 下载
+    3. 自动编译
+    """
+    # 1. 检查指定目录
+    if libtorrent_dir and (libtorrent_dir / "lib").exists():
+        print(f"libtorrent 已存在: {libtorrent_dir}")
+        return libtorrent_dir
+    
+    # 2. 尝试从 Release 下载
+    print("\n== 尝试从 Release 下载 libtorrent ==")
+    release_dir = download_libtorrent(workspace, platform_name)
+    if release_dir:
+        return release_dir
+    
+    # 3. 自动编译
+    print("\n== 自动编译 libtorrent ==")
+    if platform_name not in LIBTORRENT_PLATFORM_MAP:
+        print(f"警告: 平台 {platform_name} 无 libtorrent 映射，跳过")
+        return None
+    
+    lt_platform, lt_arch = LIBTORRENT_PLATFORM_MAP[platform_name]
+    output_dir = libtorrent_dir or (workspace / "build-libtorrent" / platform_name)
+    
+    # 检查是否已编译
+    if (output_dir / "lib").exists():
+        print(f"libtorrent 已存在: {output_dir}")
+        return output_dir
+    
+    print(f"  平台: {lt_platform}-{lt_arch}")
+    print(f"  输出: {output_dir}")
+    
+    build_script = workspace / "scripts" / "build_libtorrent.py"
+    if not build_script.exists():
+        print(f"警告: 找不到 {build_script}，跳过 libtorrent 编译")
+        return None
+    
+    cmd = [
+        sys.executable, str(build_script),
+        "--platform", lt_platform,
+        "--arch", lt_arch,
+        "--output-dir", str(output_dir),
+    ]
+    
+    env = os.environ.copy()
+    env["VCPKG_ROOT"] = str(vcpkg_dir)
+    
+    print(f"\n>>> {' '.join(cmd)}")
+    result = subprocess.run(cmd, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"libtorrent 编译失败: {result.returncode}")
+    
+    return output_dir
 
 
 # ── Step 3: CMake 构建 ──
 
 def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
                     vcpkg_dir: Path, libwebrtc_dir: Path | None,
+                    libtorrent_dir: Path | None = None,
                     extra_args: list[str] = None):
     """构造并执行 cmake configure 命令。"""
     toolchain = vcpkg_dir / "scripts" / "buildsystems" / "vcpkg.cmake"
@@ -241,6 +351,10 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
     # libwebrtc
     if libwebrtc_dir:
         cmd.append(f"-DDW_LIBWEBRTC_DIR={libwebrtc_dir}")
+
+    # libtorrent
+    if libtorrent_dir:
+        cmd.append(f"-DDW_LIBTORRENT_DIR={libtorrent_dir}")
 
     # iOS 特殊处理
     if cfg.get("os") == "ios":
@@ -361,10 +475,11 @@ def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path) -> Path:
 # ── 主流程 ──
 
 def build_single_arch(workspace: Path, cfg: dict, vcpkg_dir: Path,
-                      libwebrtc_dir: Path | None, build_name: str):
+                      libwebrtc_dir: Path | None, libtorrent_dir: Path | None,
+                      build_name: str):
     """单架构构建（Linux/Windows/iOS-arm64/Android）。"""
     build_dir = workspace / "build"
-    cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libwebrtc_dir)
+    cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
     cmake_build(build_dir)
 
     # 查找并复制产物
@@ -384,21 +499,21 @@ def build_single_arch(workspace: Path, cfg: dict, vcpkg_dir: Path,
 
 
 def build_macos_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
-                          libwebrtc_dir: Path | None):
+                          libwebrtc_dir: Path | None, libtorrent_dir: Path | None):
     """macOS universal: arm64 + x64 编译后 lipo 合并。"""
     deploy = cfg["deploy_target"]
 
     # arm64
     cmake_configure(workspace / "build-arm64", workspace,
                     {**cfg, "triplet": "arm64-osx", "deploy_target": deploy},
-                    vcpkg_dir, libwebrtc_dir,
+                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=arm64"])
     cmake_build(workspace / "build-arm64")
 
     # x64
     cmake_configure(workspace / "build-x64", workspace,
                     {**cfg, "triplet": "x64-osx", "deploy_target": deploy},
-                    vcpkg_dir, libwebrtc_dir,
+                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=x86_64"])
     cmake_build(workspace / "build-x64")
 
@@ -418,19 +533,19 @@ def build_macos_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
 
 
 def build_ios_simulator_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
-                                  libwebrtc_dir: Path | None):
+                                  libwebrtc_dir: Path | None, libtorrent_dir: Path | None):
     """iOS simulator universal: arm64 + x64 各编译后合并。"""
     # arm64 模拟器
     cmake_configure(workspace / "build-sim-arm64", workspace,
                     {**cfg, "triplet": "arm64-ios-simulator", "simulator": True},
-                    vcpkg_dir, libwebrtc_dir,
+                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=arm64"])
     cmake_build(workspace / "build-sim-arm64")
 
     # x64 模拟器
     cmake_configure(workspace / "build-sim-x64", workspace,
                     {**cfg, "triplet": "x64-ios-simulator", "simulator": True},
-                    vcpkg_dir, libwebrtc_dir,
+                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=x86_64"])
     cmake_build(workspace / "build-sim-x64")
 
@@ -451,6 +566,8 @@ def main():
                         help="临时目录")
     parser.add_argument("--libwebrtc-dir",
                         help="本地 libwebrtc 目录（跳过下载）")
+    parser.add_argument("--libtorrent-dir",
+                        help="本地 libtorrent 目录（跳过 FetchContent）")
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
@@ -478,20 +595,25 @@ def main():
         # 从 GitHub Release 下载
         libwebrtc_dir = download_libwebrtc(workspace, args.platform)
 
-    # 3. 构建
-    print("\n== Step 3: CMake 构建 ==")
+    # 3. libtorrent（自动检测/编译）
+    print("\n== Step 3: libtorrent ==")
+    libtorrent_dir = Path(args.libtorrent_dir).resolve() if args.libtorrent_dir else None
+    libtorrent_dir = ensure_libtorrent(workspace, libtorrent_dir, args.platform, vcpkg_dir)
+
+    # 4. 构建
+    print("\n== Step 4: CMake 构建 ==")
     if args.platform == "macos-universal":
-        output = build_macos_universal(workspace, cfg, vcpkg_dir, libwebrtc_dir)
+        output = build_macos_universal(workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
     elif args.platform == "ios-simulator-universal":
-        output = build_ios_simulator_universal(workspace, cfg, vcpkg_dir, libwebrtc_dir)
+        output = build_ios_simulator_universal(workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
     elif cfg.get("static") and cfg["os"] == "ios":
         # iOS arm64 单架构静态库
         build_dir = workspace / "build"
-        cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libwebrtc_dir)
+        cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
         cmake_build(build_dir)
         output = merge_ios_static_libs(workspace, cfg, vcpkg_dir)
     else:
-        output = build_single_arch(workspace, cfg, vcpkg_dir, libwebrtc_dir, args.platform)
+        output = build_single_arch(workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir, args.platform)
 
     print(f"\n== 构建完成 ==")
     print(f"产物: {output}")

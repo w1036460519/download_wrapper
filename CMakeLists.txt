@@ -13,8 +13,37 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
-find_package(LibtorrentRasterbar CONFIG REQUIRED)
-find_package(Boost REQUIRED COMPONENTS url json)
+find_package(Boost REQUIRED COMPONENTS url json system random)
+find_package(OpenSSL REQUIRED)  # libtorrent 需要（encryption 功能）
+
+# libtorrent-rasterbar: 使用预编译二进制
+# 版本由 scripts/versions.py 统一管理，build_wrapper.py 负责获取
+# DW_LIBTORRENT_DIR 指向预编译目录（包含 include/ 和 lib/）
+if(DEFINED ENV{DW_LIBTORRENT_DIR} AND NOT DEFINED DW_LIBTORRENT_DIR)
+    set(DW_LIBTORRENT_DIR "$ENV{DW_LIBTORRENT_DIR}")
+endif()
+
+if(NOT DEFINED DW_LIBTORRENT_DIR)
+    message(FATAL_ERROR "DW_LIBTORRENT_DIR 未指定\n"
+        "请通过 build_wrapper.py 构建，或手动设置 DW_LIBTORRENT_DIR")
+endif()
+
+if(EXISTS "${DW_LIBTORRENT_DIR}/include/libtorrent/version.hpp"
+   AND EXISTS "${DW_LIBTORRENT_DIR}/lib")
+    message(STATUS "libtorrent: 使用预编译库 (${DW_LIBTORRENT_DIR})")
+    add_library(torrent-rasterbar STATIC IMPORTED)
+    if(WIN32)
+        set_target_properties(torrent-rasterbar PROPERTIES
+            IMPORTED_LOCATION "${DW_LIBTORRENT_DIR}/lib/torrent-rasterbar.lib")
+    else()
+        set_target_properties(torrent-rasterbar PROPERTIES
+            IMPORTED_LOCATION "${DW_LIBTORRENT_DIR}/lib/libtorrent-rasterbar.a")
+    endif()
+    target_include_directories(torrent-rasterbar INTERFACE "${DW_LIBTORRENT_DIR}/include")
+else()
+    message(FATAL_ERROR "DW_LIBTORRENT_DIR 指向无效目录: ${DW_LIBTORRENT_DIR}\n"
+        "需要包含 include/libtorrent/version.hpp 和 lib/libtorrent-rasterbar.a")
+endif()
 
 # P2P 打洞库（libwebrtc）：多端共享基础。通过 GitHub Release 预编译二进制提供，
 # 不走 vcpkg。开关关闭时跳过 P2P 模块编译，仅影响 dw_p2p_* 系列 C API
@@ -134,10 +163,12 @@ target_include_directories(download_wrapper
 target_link_libraries(download_wrapper PRIVATE
     CURL::libcurl
     Threads::Threads
-    LibtorrentRasterbar::torrent-rasterbar
+    torrent-rasterbar
     unofficial::sqlite3::sqlite3
     Boost::url
     Boost::json
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 # P2P 模块链接：libwebrtc 通过 DW_LIBWEBRTC_DIR 指定预编译二进制
