@@ -43,11 +43,13 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from versions import LIBTORRENT_VERSION
 DEFAULT_VERSION = LIBTORRENT_VERSION
 
-# vcpkg 路径
-VCPKG_DIR = Path(os.environ.get("VCPKG_ROOT", ""))
-if not VCPKG_DIR:
+# vcpkg 路径（resolve 确保绝对路径，避免 Path("") 退化为相对路径）
+_vcpkg_root = os.environ.get("VCPKG_ROOT", "")
+if _vcpkg_root:
+    VCPKG_DIR = Path(_vcpkg_root).resolve()
+else:
     # 本地开发默认路径
-    VCPKG_DIR = Path.home() / "Documents" / "code" / "cpp" / "vcpkg"
+    VCPKG_DIR = (Path.home() / "Documents" / "code" / "cpp" / "vcpkg").resolve()
 
 
 def get_platform_arch():
