@@ -122,6 +122,21 @@ jobs:
             vcpkg-libtorrent-${{ matrix.name }}-
           retention-days: 90
 
+      - name: Setup vcpkg
+        shell: bash
+        run: |
+          VCPKG_DIR="${{ runner.temp }}/vcpkg"
+          if [ ! -d "$VCPKG_DIR" ]; then
+            git clone https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
+          fi
+          # bootstrap
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            "$VCPKG_DIR/bootstrap-vcpkg.bat" -disableMetrics
+          else
+            "$VCPKG_DIR/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          echo "VCPKG_ROOT=$VCPKG_DIR" >> "$GITHUB_ENV"
+
       - name: Build
         shell: bash
         env:
