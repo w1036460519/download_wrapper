@@ -234,6 +234,12 @@ def build_libtorrent(version: str, plat: str, arch: str, output_dir: Path,
                 "-DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++",
             ])
     
+    elif plat == "windows":
+        if arch == "arm64":
+            cmake_args.extend(["-A", "ARM64"])
+        elif arch == "x64":
+            cmake_args.extend(["-A", "x64"])
+    
     run(cmake_args, env=build_env)
     
     # 编译
