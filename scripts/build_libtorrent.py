@@ -127,6 +127,7 @@ def build_libtorrent(version: str, plat: str, arch: str, output_dir: Path,
   "name": "libtorrent-build",
   "version": "1.0.0",
   "dependencies": [
+    "openssl",
     "boost-asio",
     "boost-beast",
     "boost-url",
