@@ -40,6 +40,8 @@ if(EXISTS "${DW_LIBTORRENT_DIR}/include/libtorrent/version.hpp"
             IMPORTED_LOCATION "${DW_LIBTORRENT_DIR}/lib/libtorrent-rasterbar.a")
     endif()
     target_include_directories(torrent-rasterbar INTERFACE "${DW_LIBTORRENT_DIR}/include")
+    # libtorrent 构建时启用了 OpenSSL（encryption），消费者需同步定义
+    target_compile_definitions(torrent-rasterbar INTERFACE TORRENT_USE_OPENSSL=1)
 else()
     message(FATAL_ERROR "DW_LIBTORRENT_DIR 指向无效目录: ${DW_LIBTORRENT_DIR}\n"
         "需要包含 include/libtorrent/version.hpp 和 lib/libtorrent-rasterbar.a")
