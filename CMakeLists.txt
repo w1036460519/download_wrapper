@@ -14,7 +14,7 @@ find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS url json system random)
-find_package(OpenSSL REQUIRED)  # libtorrent 需要（encryption 功能）
+find_package(OpenSSL CONFIG REQUIRED)  # libtorrent 需要（encryption 功能）
 
 # libtorrent-rasterbar: 使用预编译二进制
 # 版本由 scripts/versions.py 统一管理，build_wrapper.py 负责获取

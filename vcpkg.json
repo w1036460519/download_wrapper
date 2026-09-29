@@ -5,6 +5,7 @@
   "dependencies": [
     "curl",
     "sqlite3",
+    "openssl",
     "boost-asio",
     "boost-beast",
     "boost-url",
