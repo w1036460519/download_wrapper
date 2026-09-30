@@ -211,13 +211,16 @@ def integrate_libwebrtc(webrtc_src: Path):
              "https://github.com/webrtc-sdk/libwebrtc.git",
              str(libwebrtc_dir)])
 
-    # 应用补丁（如果存在）
+    # 应用补丁（如果存在）；已应用则跳过（缓存源码树幂等），其余失败必须报错
     patch = libwebrtc_dir / "patches" / "custom_audio_source_m144.patch"
     if patch.exists():
-        try:
+        already_applied = subprocess.run(
+            ["git", "apply", "--reverse", "--check", str(patch)],
+            cwd=str(webrtc_src)).returncode == 0
+        if already_applied:
+            print("补丁已应用，跳过")
+        else:
             run(["git", "apply", str(patch)], cwd=str(webrtc_src))
-        except subprocess.CalledProcessError:
-            print("警告: 补丁应用失败，跳过")
 
     # 将 libwebrtc 加入 BUILD.gn 依赖
     build_gn = webrtc_src / "BUILD.gn"

@@ -11,3 +11,6 @@ set(VCPKG_OSX_DEPLOYMENT_TARGET "17.0")
 # C++20 支持
 set(VCPKG_C_FLAGS "-std=c99")
 set(VCPKG_CXX_FLAGS "-std=c++20")
+
+# 仅构建 Release：分发产物不消费 Debug 库，跳过多余的 Debug 构建
+set(VCPKG_BUILD_TYPE release)
