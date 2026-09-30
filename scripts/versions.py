@@ -18,6 +18,11 @@ LIBTORRENT_VERSION = "2.1.2"
 # 示例: libwebrtc-m144.7559.09
 LIBWEBRTC_VERSION = "m144.7559.09"
 
+# download_wrapper 自身版本
+# Release tag: wrapper-v{version}
+# 示例: wrapper-v0.0.1
+WRAPPER_VERSION = "0.0.1"
+
 # ── Release 配置 ──
 
 def get_libtorrent_release_tag() -> str:
@@ -28,6 +33,10 @@ def get_libwebrtc_release_tag() -> str:
     """获取 libwebrtc Release tag"""
     return f"libwebrtc-{LIBWEBRTC_VERSION}"
 
+def get_wrapper_release_tag() -> str:
+    """获取 wrapper Release tag"""
+    return f"wrapper-v{WRAPPER_VERSION}"
+
 def get_libtorrent_asset_name(platform: str) -> str:
     """获取 libtorrent asset 文件名"""
     return f"libtorrent-v{LIBTORRENT_VERSION}-{platform}.tar.gz"
@@ -35,3 +44,7 @@ def get_libtorrent_asset_name(platform: str) -> str:
 def get_libwebrtc_asset_name(platform: str) -> str:
     """获取 libwebrtc asset 文件名"""
     return f"libwebrtc-{LIBWEBRTC_VERSION}-{platform}.tar.gz"
+
+def get_wrapper_asset_name(platform: str) -> str:
+    """获取 wrapper asset 文件名"""
+    return f"wrapper-v{WRAPPER_VERSION}-{platform}.tar.gz"

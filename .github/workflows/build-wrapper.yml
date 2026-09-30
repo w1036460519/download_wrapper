@@ -31,6 +31,8 @@ jobs:
     outputs:
       libtorrent_version: ${{ steps.version.outputs.libtorrent_version }}
       libwebrtc_version: ${{ steps.version.outputs.libwebrtc_version }}
+      wrapper_version: ${{ steps.version.outputs.wrapper_version }}
+      wrapper_release_tag: ${{ steps.version.outputs.wrapper_release_tag }}
     steps:
       - uses: actions/checkout@v5
       - name: Read versions from versions.py
@@ -38,10 +40,15 @@ jobs:
         run: |
           LT_VERSION=$(python3 -c "from scripts.versions import LIBTORRENT_VERSION; print(LIBTORRENT_VERSION)")
           LW_VERSION=$(python3 -c "from scripts.versions import LIBWEBRTC_VERSION; print(LIBWEBRTC_VERSION)")
+          W_VERSION=$(python3 -c "from scripts.versions import WRAPPER_VERSION; print(WRAPPER_VERSION)")
+          W_TAG=$(python3 -c "from scripts.versions import get_wrapper_release_tag; print(get_wrapper_release_tag())")
           echo "libtorrent_version=$LT_VERSION" >> "$GITHUB_OUTPUT"
           echo "libwebrtc_version=$LW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "wrapper_version=$W_VERSION" >> "$GITHUB_OUTPUT"
+          echo "wrapper_release_tag=$W_TAG" >> "$GITHUB_OUTPUT"
           echo "libtorrent: $LT_VERSION"
           echo "libwebrtc: $LW_VERSION"
+          echo "wrapper: $W_VERSION (tag: $W_TAG)"
 
   build:
     name: wrapper-${{ matrix.name }}
@@ -122,12 +129,12 @@ jobs:
           DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
           echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
 
-      # 从缓存读取 libtorrent 预编译产物（与 build-libtorrent.yml 共享）
-      - name: Cache libtorrent (from build-libtorrent workflow)
+      # 缓存 Release 下载的 libtorrent 预编译产物（third_party 下，命中则跳过重复下载）
+      - name: Cache libtorrent (downloaded from Release)
         if: steps.filter.outputs.run == 'true'
         uses: actions/cache@v5
         with:
-          path: ${{ runner.temp }}/libtorrent-${{ matrix.name }}
+          path: ${{ github.workspace }}/third_party/libtorrent-*
           key: libtorrent-cache-${{ matrix.name }}-v${{ needs.config.outputs.libtorrent_version }}
           restore-keys: |
             libtorrent-cache-${{ matrix.name }}-
@@ -167,7 +174,9 @@ jobs:
             ${{ github.workspace }}/build
             ${{ github.workspace }}/build-arm64
             ${{ github.workspace }}/build-x64
-          key: cmake-build-${{ matrix.name }}-${{ hashFiles('src/**', 'include/**', 'CMakeLists.txt') }}
+            ${{ github.workspace }}/build-sim-arm64
+            ${{ github.workspace }}/build-sim-x64
+          key: cmake-build-${{ matrix.name }}-${{ hashFiles('src/**', 'include/**', 'CMakeLists.txt', 'vcpkg.json') }}
           restore-keys: |
             cmake-build-${{ matrix.name }}-
           retention-days: 90
@@ -200,10 +209,71 @@ jobs:
           echo "== 构建后磁盘 =="
           df -h / || true
 
+      # 打包 Release 产物（二进制 + 公共头文件）
+      - name: Pack release asset
+        if: steps.filter.outputs.run == 'true'
+        shell: bash
+        run: |
+          ASSET=$(python3 -c "from scripts.versions import get_wrapper_asset_name; print(get_wrapper_asset_name('${{ matrix.name }}'))")
+          echo "Packing: $ASSET"
+          python3 - "$ASSET" <<'PYEOF'
+          import sys, tarfile
+          from pathlib import Path
+          asset = sys.argv[1]
+          with tarfile.open(asset, "w:gz") as tar:
+              for f in Path("dist").iterdir():
+                  tar.add(f, arcname=f.name)
+              tar.add("include", arcname="include")
+          print(f"Packed: {asset}")
+          PYEOF
+
       - name: Upload artifact
         if: steps.filter.outputs.run == 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: download_wrapper-${{ matrix.name }}
-          path: dist/*
+          name: wrapper-${{ matrix.name }}
+          path: wrapper-v*.tar.gz
           if-no-files-found: error
+
+  # 所有平台构建完成后，上传到 Release
+  release:
+    name: Upload to Release
+    needs: [config, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create/Update Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.config.outputs.wrapper_release_tag }}"
+          echo "Release tag: $TAG"
+
+          # 创建或更新 Release
+          gh release view "$TAG" 2>/dev/null || \
+            gh release create "$TAG" \
+              --title "wrapper v${{ needs.config.outputs.wrapper_version }}" \
+              --notes "download_wrapper v${{ needs.config.outputs.wrapper_version }} 预编译产物" \
+              --target main
+
+          # 上传所有 tar.gz 文件（覆盖同名）
+          for file in artifacts/wrapper-v*.tar.gz; do
+            if [ -f "$file" ]; then
+              echo "Uploading: $file"
+              gh release upload "$TAG" "$file" --clobber
+            fi
+          done
+
+          echo "✅ Release 上传完成"
