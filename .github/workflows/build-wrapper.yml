@@ -138,7 +138,6 @@ jobs:
           key: libtorrent-cache-${{ matrix.name }}-v${{ needs.config.outputs.libtorrent_version }}
           restore-keys: |
             libtorrent-cache-${{ matrix.name }}-
-          retention-days: 90
 
       # 从缓存读取 libwebrtc 构建产物（与 build-libwebrtc.yml 共享）
       - name: Cache libwebrtc (from build-libwebrtc workflow)
@@ -151,7 +150,6 @@ jobs:
           key: libwebrtc-cache-${{ matrix.libwebrtc_name }}-${{ needs.config.outputs.libwebrtc_version }}
           restore-keys: |
             libwebrtc-cache-${{ matrix.libwebrtc_name }}-
-          retention-days: 90
 
       # 缓存 vcpkg 二进制归档
       - name: Cache vcpkg binary archives
@@ -163,7 +161,6 @@ jobs:
           restore-keys: |
             vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-
             vcpkg-${{ matrix.name }}-
-          retention-days: 90
 
       # 缓存 CMake 构建产物（增量编译）
       - name: Cache CMake build
@@ -179,7 +176,6 @@ jobs:
           key: cmake-build-${{ matrix.name }}-${{ hashFiles('src/**', 'include/**', 'CMakeLists.txt', 'vcpkg.json') }}
           restore-keys: |
             cmake-build-${{ matrix.name }}-
-          retention-days: 90
 
       # Linux 系统依赖
       - name: Install Linux build deps

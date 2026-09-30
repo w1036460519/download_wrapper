@@ -115,7 +115,6 @@ jobs:
           key: vcpkg-libtorrent-${{ matrix.name }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
             vcpkg-libtorrent-${{ matrix.name }}-
-          retention-days: 90
 
       - name: Setup vcpkg
         shell: bash

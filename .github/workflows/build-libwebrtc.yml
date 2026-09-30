@@ -67,7 +67,6 @@ jobs:
         with:
           path: ${{ runner.temp }}/depot_tools
           key: depot-tools-${{ runner.os }}
-          retention-days: 90
 
       # L2: WebRTC 源码 + 编译产物缓存
       - name: Cache libwebrtc
@@ -80,7 +79,6 @@ jobs:
           key: libwebrtc-cache-${{ matrix.name }}-fixed
           restore-keys: |
             libwebrtc-cache-${{ matrix.name }}-
-          retention-days: 90
 
       - name: Build
         if: steps.cache.outputs.cache-hit != 'true'
