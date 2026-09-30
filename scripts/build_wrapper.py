@@ -246,6 +246,33 @@ def download_libwebrtc(workspace: Path, platform_name: str) -> Path | None:
     return _download_from_release(workspace, release_tag, asset, "libwebrtc", LIBWEBRTC_VERSION, platform_name)
 
 
+def _libwebrtc_dir_valid(d: Path) -> bool:
+    """校验 libwebrtc 目录完整性（判定条件与 CMakeLists 保持一致）。"""
+    return (d / "include" / "libwebrtc.h").exists() and (d / "lib").exists()
+
+
+def ensure_libwebrtc(workspace: Path, libwebrtc_dir: Path | None,
+                     platform_name: str) -> Path | None:
+    """确保 libwebrtc 可用：本地目录有效则使用，否则回退 Release 下载。
+
+    Returns:
+        有效目录；未指定本地目录且下载失败时返回 None（表示跳过 P2P）
+    """
+    if libwebrtc_dir and _libwebrtc_dir_valid(libwebrtc_dir):
+        print(f"libwebrtc 已存在: {libwebrtc_dir}")
+        return libwebrtc_dir
+    if libwebrtc_dir:
+        print(f"本地 libwebrtc 无效: {libwebrtc_dir}，回退 Release 下载")
+    release_dir = download_libwebrtc(workspace, platform_name)
+    if release_dir:
+        return release_dir
+    # 显式指定了本地目录却仍不可用属配置/产物错误；未指定则允许跳过 P2P
+    if libwebrtc_dir:
+        raise RuntimeError(
+            f"libwebrtc 不可用：本地目录无效且 Release 下载失败 ({platform_name})")
+    return None
+
+
 # ── Step 2.5: libtorrent 获取 ──
 
 def download_libtorrent(workspace: Path, platform_name: str) -> Path | None:
@@ -590,15 +617,10 @@ def main():
     print("\n== Step 1: vcpkg ==")
     vcpkg_dir = setup_vcpkg(workspace, args.vcpkg_ref, temp_dir)
 
-    # 2. libwebrtc
+    # 2. libwebrtc（本地目录优先，无效回退 Release 下载）
     print("\n== Step 2: libwebrtc ==")
-    if args.libwebrtc_dir:
-        # 使用本地 libwebrtc 目录（合并工作流场景）
-        libwebrtc_dir = Path(args.libwebrtc_dir).resolve()
-        print(f"使用本地 libwebrtc: {libwebrtc_dir}")
-    else:
-        # 从 GitHub Release 下载
-        libwebrtc_dir = download_libwebrtc(workspace, args.platform)
+    libwebrtc_dir = Path(args.libwebrtc_dir).resolve() if args.libwebrtc_dir else None
+    libwebrtc_dir = ensure_libwebrtc(workspace, libwebrtc_dir, args.platform)
 
     # 3. libtorrent（自动检测/编译）
     print("\n== Step 3: libtorrent ==")
