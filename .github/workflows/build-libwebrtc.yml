@@ -76,7 +76,7 @@ jobs:
           path: |
             ${{ runner.temp }}/webrtc_src
             ${{ runner.temp }}/webrtc_build
-          key: libwebrtc-cache-${{ matrix.name }}-fixed
+          key: libwebrtc-cache-${{ matrix.name }}-v${{ needs.config.outputs.version }}
           restore-keys: |
             libwebrtc-cache-${{ matrix.name }}-
 

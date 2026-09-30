@@ -131,7 +131,16 @@ jobs:
           fi
           echo "VCPKG_ROOT=$VCPKG_DIR" >> "$GITHUB_ENV"
 
+      # 构建产物缓存（版本 + vcpkg 依赖不变时复用）
+      - name: Cache libtorrent build output
+        id: lt-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/libtorrent-${{ matrix.name }}
+          key: libtorrent-build-${{ matrix.name }}-v${{ needs.config.outputs.version }}-${{ hashFiles('vcpkg.json') }}
+
       - name: Build
+        if: steps.lt-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           LT_VERSION: ${{ needs.config.outputs.version }}
