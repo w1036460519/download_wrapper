@@ -50,7 +50,9 @@ endif()
 # P2P 打洞库（libwebrtc）：多端共享基础。通过 GitHub Release 预编译二进制提供，
 # 不走 vcpkg。开关关闭时跳过 P2P 模块编译，仅影响 dw_p2p_* 系列 C API
 # 的链接可用性，下载主流程不受影响。
-option(DW_ENABLE_P2P "启用 P2P 多端共享模块（libwebrtc）" ON)
+# 暂停期默认 OFF：wrapper 打包不依赖 libwebrtc，先跑通主线功能。
+# 恢复 RTC 对接时改回 ON（或构建时传 -DDW_ENABLE_P2P=ON）并提供有效 DW_LIBWEBRTC_DIR。
+option(DW_ENABLE_P2P "启用 P2P 多端共享模块（libwebrtc）" OFF)
 if(DW_ENABLE_P2P)
     # libwebrtc 二进制解压目录由 CI 或手动指定，需含 include/ + lib/
     if(DEFINED ENV{DW_LIBWEBRTC_DIR} AND NOT DEFINED DW_LIBWEBRTC_DIR)
