@@ -95,19 +95,31 @@ target_os = ['{target_os}']
 
 # ── Step B: 注入 PoC gn 目标 + 拷贝回环测试 ──
 
+# 追加到根 BUILD.gn 的标记，保证幂等（缓存源码树重复运行不重复追加）。
+POC_MARKER = "# ---- download_wrapper Phase 0 PoC (auto-injected) ----"
+
+
 def inject_poc_target(webrtc_src: Path, poc_cc: Path):
-    """把回环测试拷进 src/poc/ 并写 BUILD.gn（executable + 完整静态库）。"""
+    """把回环测试拷进 src/poc/，并将 gn 目标追加到根 //BUILD.gn（top-level）。
+
+    GN 只加载「从根 BUILD.gn 可达」的构建文件；孤立的 poc/BUILD.gn 不会被发现
+    （首轮 CI 即因此报 unknown target）。根 //BUILD.gn 必定被加载，其中定义的
+    target 必然生成 ninja 规则，故直接追加到根文件末尾，绕开脆弱的字符串替换。
+    """
     poc_dir = webrtc_src / "poc"
     poc_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(poc_cc, poc_dir / "datachannel_loopback.cc")
 
-    deps_gn = ",\n".join(f'    "{d}"' for d in DATAONLY_DEPS)
-    (poc_dir / "BUILD.gn").write_text(f"""\
-# Phase 0 PoC 自动生成：data-only 回环验证目标。
-# executable 直接随源码树编译，复用 WebRTC 全部默认 config（defines/include）。
+    root_gn = webrtc_src / "BUILD.gn"
+    content = root_gn.read_text()
+    if POC_MARKER not in content:
+        deps_gn = ",\n".join(f'    "{d}"' for d in DATAONLY_DEPS)
+        content += f"""
 
+{POC_MARKER}
+# executable 直接随源码树编译，复用 WebRTC 全部默认 config（defines/include）。
 executable("datachannel_loopback") {{
-  sources = [ "datachannel_loopback.cc" ]
+  sources = [ "poc/datachannel_loopback.cc" ]
   deps = [
 {deps_gn},
   ]
@@ -121,8 +133,9 @@ static_library("webrtc_dataonly") {{
 {deps_gn},
   ]
 }}
-""")
-    print(f"[OK] 注入 PoC 目标: {poc_dir / 'BUILD.gn'}")
+"""
+        root_gn.write_text(content)
+    print("[OK] 追加 PoC 目标到根 //BUILD.gn（sources: poc/datachannel_loopback.cc）")
 
 
 # ── Step C: GN 配置（data-only） ──
@@ -154,7 +167,7 @@ def gn_gen(webrtc_src: Path, target_os: str, target_cpu: str):
 
 def build_and_run_loopback(webrtc_src: Path) -> bool:
     out = webrtc_src / "out" / "Release"
-    run(_depot_cmd("ninja", "-C", "out/Release", "poc:datachannel_loopback"),
+    run(_depot_cmd("ninja", "-C", "out/Release", "datachannel_loopback"),
         cwd=str(webrtc_src))
 
     # 定位可执行文件（gn 默认输出到 out 根目录）。
@@ -178,7 +191,7 @@ def build_and_run_loopback(webrtc_src: Path) -> bool:
 
 def package_dataonly(webrtc_src: Path, temp_dir: Path):
     out = webrtc_src / "out" / "Release"
-    run(_depot_cmd("ninja", "-C", "out/Release", "poc:webrtc_dataonly"),
+    run(_depot_cmd("ninja", "-C", "out/Release", "webrtc_dataonly"),
         cwd=str(webrtc_src))
 
     libs = glob.glob(str(out / "obj" / "**" / "libwebrtc_dataonly.a"),
