@@ -16,7 +16,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 # Windows 默认 cp1252 无法输出中文，强制 UTF-8
@@ -33,55 +32,46 @@ PLATFORMS = {
     "macos-universal": {
         "target_os": "mac",
         "universal": True,
-        "asset": "libwebrtc-macos-release.zip",
     },
     "linux-x64": {
         "target_os": "linux",
         "target_cpu": "x64",
-        "asset": "libwebrtc-linux-x64-release.zip",
     },
     "linux-arm64": {
         "target_os": "linux",
         "target_cpu": "arm64",
-        "asset": "libwebrtc-linux-arm64-release.zip",
     },
     "windows-x64": {
         "target_os": "win",
         "target_cpu": "x64",
         "extra": {"use_lld": False},
-        "asset": "libwebrtc-windows-x64-release.zip",
     },
     "windows-arm64": {
         "target_os": "win",
         "target_cpu": "arm64",
         "extra": {"use_lld": False},
-        "asset": "libwebrtc-windows-arm64-release.zip",
     },
     "android-arm64": {
         "target_os": "android",
         "target_cpu": "arm64",
         "needs_ndk": True,
         "extra": {"android_static_analysis": "off"},
-        "asset": "libwebrtc-android-arm64-release.zip",
     },
     "android-x64": {
         "target_os": "android",
         "target_cpu": "x64",
         "needs_ndk": True,
         "extra": {"android_static_analysis": "off"},
-        "asset": "libwebrtc-android-x64-release.zip",
     },
     "ios-arm64": {
         "target_os": "ios",
         "target_cpu": "arm64",
         "extra": {"target_environment": "device"},
-        "asset": "libwebrtc-ios-arm64-release.zip",
     },
     "ios-simulator-universal": {
         "target_os": "ios",
         "universal": True,
         "target_environment": "simulator",
-        "asset": "libwebrtc-ios-simulator-release.zip",
     },
 }
 
@@ -348,9 +338,13 @@ def _merge_universal(webrtc_src: Path):
 # ── Step 6: 打包产物 ──
 
 def package(webrtc_src: Path, platform_name: str, temp_dir: Path):
-    """打包 include/ + lib/ + src/ 为 zip。"""
-    cfg = PLATFORMS[platform_name]
-    pkg_dir = temp_dir / "libwebrtc-pkg"
+    """将编译产物组装为 webrtc_build/ 目录树（include/ + lib/ + src/）。
+
+    webrtc_build/ 是 CI 缓存与 build_wrapper.py --libwebrtc-dir 的约定路径：
+    build-libwebrtc.yml 的 Pack artifact 步骤据此打成
+    libwebrtc-{version}-{platform}.tar.gz 上传 Release，供各平台 wrapper 构建下载。
+    """
+    pkg_dir = temp_dir / "webrtc_build"
 
     if pkg_dir.exists():
         shutil.rmtree(pkg_dir)
@@ -398,19 +392,9 @@ def package(webrtc_src: Path, platform_name: str, temp_dir: Path):
         count = sum(1 for _ in (pkg_dir / sub).rglob("*") if _.is_file())
         print(f"  {sub}/: {count} 文件")
 
-    # 打包 zip
-    asset = cfg["asset"]
-    zip_path = temp_dir / asset
-    if zip_path.exists():
-        zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(pkg_dir):
-            for file in files:
-                fp = Path(root) / file
-                zf.write(fp, fp.relative_to(pkg_dir))
-
-    print(f"\n产物: {zip_path} ({zip_path.stat().st_size / 1024 / 1024:.1f} MB)")
-    return zip_path
+    # 产物即 webrtc_build/ 目录树，由 CI 的 Pack artifact 步骤统一打成 tar.gz 上传
+    print(f"\n产物目录: {pkg_dir} (平台: {platform_name})")
+    return pkg_dir
 
 
 # ── 入口 ──

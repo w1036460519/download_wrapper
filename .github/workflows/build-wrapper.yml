@@ -196,6 +196,19 @@ jobs:
           echo "== 构建后磁盘 =="
           df -h / || true
 
+      # 构建失败时上传 vcpkg 端口编译日志（openssl 等端口的真实 clang 报错），
+      # 避免仅凭 CI 摘要推断根因
+      - name: Upload vcpkg logs on failure
+        if: steps.filter.outputs.run == 'true' && failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: vcpkg-logs-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/vcpkg/buildtrees/**/*.log
+            ${{ github.workspace }}/build*/vcpkg-manifest-install.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       # 打包 Release 产物（二进制 + 公共头文件）
       - name: Pack release asset
         if: steps.filter.outputs.run == 'true'
