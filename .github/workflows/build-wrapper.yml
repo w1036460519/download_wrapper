@@ -120,28 +120,6 @@ jobs:
           DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
           echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
 
-      # 缓存 Release 下载的 libtorrent 预编译产物（third_party 下，命中则跳过重复下载）
-      - name: Cache libtorrent (downloaded from Release)
-        if: steps.filter.outputs.run == 'true'
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/third_party/libtorrent-*
-          key: libtorrent-cache-${{ matrix.name }}-v${{ needs.config.outputs.libtorrent_version }}
-          restore-keys: |
-            libtorrent-cache-${{ matrix.name }}-
-
-      # 从缓存读取 libwebrtc 构建产物（与 build-libwebrtc.yml 共享）
-      - name: Cache libwebrtc (from build-libwebrtc workflow)
-        if: steps.filter.outputs.run == 'true'
-        uses: actions/cache@v5
-        with:
-          path: |
-            ${{ runner.temp }}/webrtc_src
-            ${{ runner.temp }}/webrtc_build
-          key: libwebrtc-cache-${{ matrix.name }}-${{ needs.config.outputs.libwebrtc_version }}
-          restore-keys: |
-            libwebrtc-cache-${{ matrix.name }}-
-
       # 缓存 vcpkg 二进制归档
       - name: Cache vcpkg binary archives
         if: steps.filter.outputs.run == 'true'
