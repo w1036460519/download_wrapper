@@ -1,0 +1,84 @@
+name: PoC stock WebRTC (data-only)
+
+# Phase 0 验证装置：在 GitHub Actions 美国 runner 上验证「Google 官方源
+# stock WebRTC + 纯数据通道（不 EnableMedia）」的构建可行性。
+#
+# 与生产 build-libwebrtc.yml 相互独立，验证通过后再改造生产流程（Phase 3/4）。
+# 单平台 ubuntu-latest 先取最快信号；核心门禁是 data-only 回环 DataChannel 收发。
+#
+# 触发：仅手动触发（可指定官方源 ref）。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "官方源 ref（webrtc.googlesource.com/src）"
+        required: false
+        default: "branch-heads/7559"
+
+# 同一时刻只跑一个 PoC，避免重复占用 runner（构建成本高）。
+concurrency:
+  group: poc-stock-webrtc
+  cancel-in-progress: false
+
+jobs:
+  poc:
+    name: data-only-loopback (linux-x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Normalize paths
+        shell: bash
+        run: |
+          DW_TEMP=$(echo "$RUNNER_TEMP" | tr '\\' '/')
+          echo "DW_TEMP=$DW_TEMP" >> "$GITHUB_ENV"
+
+      # depot_tools 工具链缓存（体积小、命中稳定，与生产 workflow 共用 key）。
+      - name: Cache depot_tools
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/depot_tools
+          key: depot-tools-${{ runner.os }}
+
+      - name: Disk before
+        run: df -h / || true
+
+      - name: Build & run data-only loopback PoC
+        shell: bash
+        env:
+          # 通过环境变量传递事件输入，避免直接插值进 shell（防注入）。
+          POC_REF: ${{ github.event.inputs.ref }}
+        run: |
+          # 校验 ref 形态：仅允许分支/tag/commit 常见字符，拒绝 shell 元字符。
+          if [[ ! "$POC_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "[ERROR] 非法 ref: $POC_REF" >&2
+            exit 1
+          fi
+          python3 "${{ github.workspace }}/scripts/build_webrtc_poc.py" \
+            --ref "$POC_REF" \
+            --temp-dir "$DW_TEMP" 2>&1 | tee "$DW_TEMP/poc-build.log"
+
+      - name: Disk after
+        if: always()
+        run: df -h / || true
+
+      # 无论成败都上传构建日志与打包产物，单轮 CI 取回最大信息量。
+      - name: Upload PoC log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: poc-build-log
+          path: ${{ runner.temp }}/poc-build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload data-only package
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: poc-webrtc-build
+          path: ${{ runner.temp }}/webrtc_build/lib
+          if-no-files-found: ignore
+          retention-days: 14
