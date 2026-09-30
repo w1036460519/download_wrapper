@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macos
+          - name: macos-universal
             os: macos-latest
             platform: macos
             arch: universal
@@ -63,7 +63,7 @@ jobs:
             platform: ios
             arch: arm64
 
-          - name: ios-simulator
+          - name: ios-simulator-universal
             os: macos-latest
             platform: ios
             arch: universal
@@ -145,6 +145,7 @@ jobs:
             --version "$LT_VERSION" \
             --platform "${{ matrix.platform }}" \
             --arch "${{ matrix.arch }}" \
+            --tag "${{ matrix.name }}" \
             --output-dir "$OUTPUT_DIR" \
             --pack
 
@@ -198,5 +199,17 @@ jobs:
               gh release upload "$TAG" "$file" --clobber
             fi
           done
-          
+
+          # 清理孤儿资产：同版本前缀下本次未产出的历史资产（如平台改名遗留）
+          for name in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
+            case "$name" in
+              libtorrent-v${{ needs.config.outputs.version }}-*)
+                if [ ! -f "artifacts/$name" ]; then
+                  echo "删除孤儿资产: $name"
+                  gh release delete-asset "$TAG" "$name" --yes
+                fi
+                ;;
+            esac
+          done
+
           echo "✅ Release 上传完成"

@@ -33,15 +33,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos,           os: macos-latest,    target_os: mac,     platform: macos,     arch: universal }
-          - { name: linux-x64,       os: ubuntu-latest,   target_os: linux,   platform: linux,     arch: x64 }
-          - { name: linux-arm64,     os: ubuntu-latest,   target_os: linux,   platform: linux,     arch: arm64 }
-          - { name: windows-x64,     os: windows-2022,    target_os: win,     platform: windows,   arch: x64 }
-          - { name: windows-arm64,   os: windows-2022,    target_os: win,     platform: windows,   arch: arm64 }
-          - { name: android-arm64,   os: ubuntu-latest,   target_os: android, platform: android,   arch: arm64 }
-          - { name: android-x64,     os: ubuntu-latest,   target_os: android, platform: android,   arch: x64 }
-          - { name: ios-arm64,       os: macos-latest,    target_os: ios,     platform: ios,       arch: arm64 }
-          - { name: ios-simulator,   os: macos-latest,    target_os: ios,     platform: ios,       arch: universal }
+          - { name: macos-universal,         os: macos-latest,  target_os: mac }
+          - { name: linux-x64,               os: ubuntu-latest, target_os: linux }
+          - { name: linux-arm64,             os: ubuntu-latest, target_os: linux }
+          - { name: windows-x64,             os: windows-2022,  target_os: win }
+          - { name: windows-arm64,           os: windows-2022,  target_os: win }
+          - { name: android-arm64,           os: ubuntu-latest, target_os: android }
+          - { name: android-x64,             os: ubuntu-latest, target_os: android }
+          - { name: ios-arm64,               os: macos-latest,  target_os: ios }
+          - { name: ios-simulator-universal, os: macos-latest,  target_os: ios }
 
     runs-on: ${{ matrix.os }}
 
@@ -98,21 +98,14 @@ jobs:
         shell: bash
         env:
           LT_VERSION: ${{ needs.config.outputs.version }}
-          MATRIX_PLATFORM: ${{ matrix.platform }}
-          MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_TAG: ${{ matrix.name }}
         run: |
           python3 << 'PYEOF'
           import tarfile
           import os
           from pathlib import Path
           
-          platform = os.environ["MATRIX_PLATFORM"]
-          arch = os.environ["MATRIX_ARCH"]
-          if arch == "universal":
-              platform_tag = platform
-          else:
-              platform_tag = f"{platform}-{arch}"
-          
+          platform_tag = os.environ["MATRIX_TAG"]
           version = os.environ["LT_VERSION"]
           asset_name = f"libwebrtc-{version}-{platform_tag}.tar.gz"
           
@@ -176,5 +169,17 @@ jobs:
               gh release upload "$TAG" "$file" --clobber
             fi
           done
-          
+
+          # 清理孤儿资产：同版本前缀下本次未产出的历史资产（如平台改名遗留）
+          for name in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
+            case "$name" in
+              libwebrtc-${{ needs.config.outputs.version }}-*)
+                if [ ! -f "artifacts/$name" ]; then
+                  echo "删除孤儿资产: $name"
+                  gh release delete-asset "$TAG" "$name" --yes
+                fi
+                ;;
+            esac
+          done
+
           echo "✅ Release 上传完成"

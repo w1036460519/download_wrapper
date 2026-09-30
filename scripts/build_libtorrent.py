@@ -281,19 +281,16 @@ def build_libtorrent(version: str, plat: str, arch: str, output_dir: Path,
     print(f"   库文件: {lib_dir}")
 
 
-def pack_release(output_dir: Path, version: str, plat: str, arch: str) -> Path:
+def pack_release(output_dir: Path, version: str, plat: str, arch: str,
+                 tag: str | None = None) -> Path:
     """将构建产物打包为 Release tar.gz。
-    
-    Returns:
-        打包文件路径
+
+    tag: 统一平台标识（优先）；缺省时由 plat/arch 推导
     """
     # 确定平台标识
-    if arch == "universal":
-        platform_tag = plat
-    else:
-        platform_tag = f"{plat}-{arch}"
+    platform_tag = tag or (plat if arch == "universal" else f"{plat}-{arch}")
     
-    # 文件名: libtorrent-v2.1.2-macos.tar.gz
+    # 文件名: libtorrent-v2.1.2-macos-universal.tar.gz
     asset_name = f"libtorrent-v{version}-{platform_tag}.tar.gz"
     asset_path = output_dir.parent / asset_name
     
@@ -328,6 +325,7 @@ def main():
                         help="vcpkg triplet (如 arm64-osx, x64-linux)")
     parser.add_argument("--pack", action="store_true", 
                         help="打包为 Release tar.gz")
+    parser.add_argument("--tag", help="统一平台标识（用于 Release 资产命名）")
     parser.add_argument("--clean", action="store_true", help="清理后重新构建")
     args = parser.parse_args()
     
@@ -361,7 +359,7 @@ def main():
         
         # 打包 Release
         if args.pack:
-            pack_release(output_dir, args.version, plat, arch)
+            pack_release(output_dir, args.version, plat, arch, tag=args.tag)
             
     except Exception as e:
         print(f"\n❌ 构建失败: {e}", file=sys.stderr)

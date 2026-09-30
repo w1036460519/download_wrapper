@@ -30,7 +30,7 @@ LIBWEBRTC_TAG = "libwebrtc.m144.7559.09"
 # ── 平台配置 ──
 # 每个平台的 GN 参数由 Python dict 构造，彻底消除 bash 引号转义问题。
 PLATFORMS = {
-    "macos": {
+    "macos-universal": {
         "target_os": "mac",
         "universal": True,
         "asset": "libwebrtc-macos-release.zip",
@@ -77,7 +77,7 @@ PLATFORMS = {
         "extra": {"target_environment": "device"},
         "asset": "libwebrtc-ios-arm64-release.zip",
     },
-    "ios-simulator": {
+    "ios-simulator-universal": {
         "target_os": "ios",
         "universal": True,
         "target_environment": "simulator",
@@ -277,7 +277,7 @@ def gn_gen(webrtc_src: Path, platform_name: str, ndk_path: str = ""):
 
     if cfg.get("universal"):
         # macOS / iOS simulator：双架构
-        if platform_name == "macos":
+        if cfg["target_os"] == "mac":
             _gn("out/Release", {"target_cpu": "arm64", "target_os": "mac", "is_clang": True})
             _gn("out/Release-x64", {"target_cpu": "x64", "target_os": "mac", "is_clang": True})
         else:

@@ -103,6 +103,8 @@ PLATFORMS = {
 }
 
 # ── 平台名 → libtorrent 构建参数映射 ──
+# wrapper 平台名 → build_libtorrent 的 (plat, arch)，仅服务于自动编译兜底；
+# Release 资产命名直接使用统一平台 tag（= wrapper 平台名）
 LIBTORRENT_PLATFORM_MAP = {
     "macos-universal": ("macos", "universal"),
     "linux-x64": ("linux", "x64"),
@@ -182,7 +184,7 @@ def _download_from_release(workspace: Path, release_tag: str, asset: str,
     Args:
         workspace: 项目根目录
         release_tag: Release tag (如 'libtorrent-v2.1.2')
-        asset: 文件名 (如 'libtorrent-v2.1.2-macos.tar.gz')
+        asset: 文件名 (如 'libtorrent-v2.1.2-macos-universal.tar.gz')
         component: 组件名 (如 'libtorrent', 'libwebrtc')
         version: 版本号
         platform_tag: 平台标识 (如 'windows-arm64')，用于区分架构
@@ -279,13 +281,9 @@ def download_libtorrent(workspace: Path, platform_name: str) -> Path | None:
     """从 GitHub Release 下载 libtorrent 预编译产物。"""
     if platform_name not in LIBTORRENT_PLATFORM_MAP:
         return None
-    
-    lt_platform, lt_arch = LIBTORRENT_PLATFORM_MAP[platform_name]
-    platform_tag = lt_platform if lt_arch == "universal" else f"{lt_platform}-{lt_arch}"
-    
-    asset = get_libtorrent_asset_name(platform_tag)
+    asset = get_libtorrent_asset_name(platform_name)
     release_tag = get_libtorrent_release_tag()
-    return _download_from_release(workspace, release_tag, asset, "libtorrent", LIBTORRENT_VERSION, platform_tag)
+    return _download_from_release(workspace, release_tag, asset, "libtorrent", LIBTORRENT_VERSION, platform_name)
 
 
 def ensure_libtorrent(workspace: Path, libtorrent_dir: Path | None,

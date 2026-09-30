@@ -59,39 +59,30 @@ jobs:
         include:
           - name: macos-universal
             os: macos-latest
-            libwebrtc_name: macos
             bincache: ~/.cache/vcpkg/archives
           - name: linux-x64
             os: ubuntu-latest
-            libwebrtc_name: linux-x64
             bincache: ~/.cache/vcpkg/archives
           - name: linux-arm64
             os: ubuntu-latest
-            libwebrtc_name: linux-arm64
             bincache: ~/.cache/vcpkg/archives
           - name: windows-x64
             os: windows-2022
-            libwebrtc_name: windows-x64
             bincache: ~\AppData\Local\vcpkg\archives
           - name: windows-arm64
             os: windows-2022
-            libwebrtc_name: windows-arm64
             bincache: ~\AppData\Local\vcpkg\archives
           - name: ios-arm64
             os: macos-latest
-            libwebrtc_name: ios-arm64
             bincache: ~/.cache/vcpkg/archives
           - name: ios-simulator-universal
             os: macos-latest
-            libwebrtc_name: ios-simulator
             bincache: ~/.cache/vcpkg/archives
           - name: android-arm64
             os: ubuntu-latest
-            libwebrtc_name: android-arm64
             bincache: ~/.cache/vcpkg/archives
           - name: android-x64
             os: ubuntu-latest
-            libwebrtc_name: android-x64
             bincache: ~/.cache/vcpkg/archives
 
     runs-on: ${{ matrix.os }}
@@ -147,9 +138,9 @@ jobs:
           path: |
             ${{ runner.temp }}/webrtc_src
             ${{ runner.temp }}/webrtc_build
-          key: libwebrtc-cache-${{ matrix.libwebrtc_name }}-${{ needs.config.outputs.libwebrtc_version }}
+          key: libwebrtc-cache-${{ matrix.name }}-${{ needs.config.outputs.libwebrtc_version }}
           restore-keys: |
-            libwebrtc-cache-${{ matrix.libwebrtc_name }}-
+            libwebrtc-cache-${{ matrix.name }}-
 
       # 缓存 vcpkg 二进制归档
       - name: Cache vcpkg binary archives
@@ -271,5 +262,20 @@ jobs:
               gh release upload "$TAG" "$file" --clobber
             fi
           done
+
+          # 清理孤儿资产：仅全平台运行才做差集清理，避免过滤运行误删未构建平台的历史资产
+          SELECTED="${{ inputs.platforms || 'all' }}"
+          if [ "$SELECTED" = "all" ]; then
+            for name in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
+              case "$name" in
+                wrapper-v${{ needs.config.outputs.wrapper_version }}-*)
+                  if [ ! -f "artifacts/$name" ]; then
+                    echo "删除孤儿资产: $name"
+                    gh release delete-asset "$TAG" "$name" --yes
+                  fi
+                  ;;
+              esac
+            done
+          fi
 
           echo "✅ Release 上传完成"
