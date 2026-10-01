@@ -418,6 +418,10 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
                 f"-DANDROID_ABI={cfg['abi']}",
                 f"-DANDROID_PLATFORM=android-{cfg['api']}",
             ])
+        # 设环境变量 ANDROID_ABI：vcpkg cmake-get-vars probe 是独立 CMake 调用，
+        # 拿不到上面的 -DANDROID_ABI；overlay triplet 里 set(ANDROID_ABI ... FORCE)
+        # 也不生效（原因待查）。环境变量是 NDK toolchain 和 vcpkg probe 都能读到的机制。
+        os.environ["ANDROID_ABI"] = cfg["abi"]
 
     if extra_args:
         cmd.extend(extra_args)

@@ -1,4 +1,6 @@
 # Android arm64-v8a triplet
+message(STATUS "[DEBUG] Loading overlay triplet: arm64-android.cmake, setting ANDROID_ABI=arm64-v8a FORCE")
+set(ANDROID_ABI arm64-v8a CACHE STRING "Android ABI target" FORCE)
 set(VCPKG_TARGET_ARCHITECTURE arm64)
 set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_LIBRARY_LINKAGE dynamic)
