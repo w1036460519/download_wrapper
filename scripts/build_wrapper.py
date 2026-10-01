@@ -377,6 +377,9 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
         overlay = workspace / "vcpkg-triplets"
         if overlay.exists():
             cmd.append(f"-DVCPKG_OVERLAY_TRIPLETS={overlay}")
+            # vcpkg cmake-get-vars probe 是独立 CMake 调用，不继承主调用的
+            # -DVCPKG_OVERLAY_TRIPLETS。设环境变量让 probe 也能找到 overlay triplet。
+            os.environ["VCPKG_OVERLAY_TRIPLETS"] = str(overlay)
 
     # libwebrtc
     if libwebrtc_dir:
