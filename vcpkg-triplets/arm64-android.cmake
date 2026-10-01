@@ -6,11 +6,10 @@ set(VCPKG_LIBRARY_LINKAGE dynamic)
 set(VCPKG_CMAKE_SYSTEM_NAME Android)
 set(VCPKG_CMAKE_SYSTEM_VERSION 28)
 
-# NDK android.toolchain.cmake 把 ANDROID_ABI 当 CACHE 变量处理；triplet 里普通 set()
-# 设的是普通变量，NDK toolchain 的 if(NOT DEFINED ANDROID_ABI) 检查不到，会默认
-# armeabi-v7a（32 位），导致 openssl 等端口编译 128 位整数代码时硬错误。
-# 必须用 CACHE STRING 写入 cache，与 NDK toolchain 的契约对齐。
-set(ANDROID_ABI arm64-v8a CACHE STRING "Android ABI target")
+# NDK android.toolchain.cmake 无条件 set(ANDROID_ABI armeabi-v7a)（不用 if(NOT DEFINED) 检查），
+# 创建普通变量遮蔽 triplet 里的 cache 变量。必须用 FORCE：写入 cache 并删除同名普通变量，
+# 确保 NDK toolchain 后续的普通 set() 不再覆盖。这是 CMake 提供的正常机制，不是绕过。
+set(ANDROID_ABI arm64-v8a CACHE STRING "Android ABI target" FORCE)
 
 # 共享库需 -fPIC（Android 构建 .so 必须）
 # 不强制 -std：NDK clang 18 下 -std=c99 会关闭 GNU/POSIX 特性宏，隐藏 bionic
