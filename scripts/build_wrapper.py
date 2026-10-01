@@ -372,14 +372,11 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
         if cross_tc.exists():
             cmd.append(f"-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE={cross_tc}")
 
-    # overlay triplets（macOS/iOS 需要自定义部署目标）
+    # overlay triplets（macOS/iOS/Android 需要自定义设置）
     if cfg.get("overlay_triplets"):
         overlay = workspace / "vcpkg-triplets"
         if overlay.exists():
             cmd.append(f"-DVCPKG_OVERLAY_TRIPLETS={overlay}")
-            # vcpkg cmake-get-vars probe 是独立 CMake 调用，不继承主调用的
-            # -DVCPKG_OVERLAY_TRIPLETS。设环境变量让 probe 也能找到 overlay triplet。
-            os.environ["VCPKG_OVERLAY_TRIPLETS"] = str(overlay)
 
     # libwebrtc
     if libwebrtc_dir:
@@ -421,10 +418,6 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
                 f"-DANDROID_ABI={cfg['abi']}",
                 f"-DANDROID_PLATFORM=android-{cfg['api']}",
             ])
-        # 设环境变量 ANDROID_ABI：vcpkg cmake-get-vars probe 是独立 CMake 调用，
-        # 拿不到上面的 -DANDROID_ABI；overlay triplet 里 set(ANDROID_ABI ... FORCE)
-        # 也不生效（原因待查）。环境变量是 NDK toolchain 和 vcpkg probe 都能读到的机制。
-        os.environ["ANDROID_ABI"] = cfg["abi"]
 
     if extra_args:
         cmd.extend(extra_args)

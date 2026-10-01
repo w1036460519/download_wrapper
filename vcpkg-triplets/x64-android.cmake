@@ -1,4 +1,7 @@
 # Android x86_64 triplet
+# 覆盖 vcpkg 内置 x64-android triplet，补充项目自定义设置。
+# 关键：必须设 VCPKG_CMAKE_CONFIGURE_OPTIONS -DANDROID_ABI=...，
+# 否则 cmake-get-vars probe 拿不到 ANDROID_ABI，默认 armeabi-v7a。
 set(VCPKG_TARGET_ARCHITECTURE x64)
 set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_LIBRARY_LINKAGE dynamic)
@@ -6,10 +9,9 @@ set(VCPKG_LIBRARY_LINKAGE dynamic)
 set(VCPKG_CMAKE_SYSTEM_NAME Android)
 set(VCPKG_CMAKE_SYSTEM_VERSION 28)
 
-# NDK android.toolchain.cmake 无条件 set(ANDROID_ABI armeabi-v7a)（不用 if(NOT DEFINED) 检查），
-# 创建普通变量遮蔽 triplet 里的 cache 变量。必须用 FORCE：写入 cache 并删除同名普通变量，
-# 确保 NDK toolchain 后续的普通 set() 不再覆盖。这是 CMake 提供的正常机制，不是绕过。
-set(ANDROID_ABI x86_64 CACHE STRING "Android ABI target" FORCE)
+# 传递 ANDROID_ABI 给 cmake-get-vars probe（probe 不加载 triplet 的 set()，
+# 但会读取 VCPKG_CMAKE_CONFIGURE_OPTIONS 里的 -D 参数）。
+set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DANDROID_ABI=x86_64)
 
 # 共享库需 -fPIC（Android 构建 .so 必须）
 # 不强制 -std：NDK clang 18 下 -std=c99 会关闭 GNU/POSIX 特性宏，隐藏 bionic
