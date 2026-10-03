@@ -262,10 +262,44 @@ namespace dw {
             return dw_submit_result_t::success();
         }
         const int32_t delete_files = params.delete_files ? 1 : 0;
-        if (IDownloadEngine *eng = engine_of(params.protocol)) {
-            return eng->delete_task(params.natural_key, params.client_id, delete_files);
+        const int32_t protocol = params.protocol;
+        const std::string &client_id = params.client_id;
+        const std::string &natural_key = params.natural_key;
+        dw_submit_result_t result = dw_submit_result_t::success();
+        if (IDownloadEngine *eng = engine_of(protocol)) {
+            result = eng->delete_task(natural_key, client_id, delete_files);
         }
-        return dw_submit_result_t::failure(DW_REASON_ERROR, "引擎不可用");
+        // 引擎 success 涵盖两种情况：任务已提交移出 session，或任务本来就
+        // 不在 session（handle 构建失败）。后者不会产生 torrent_removed /
+        // torrent_deleted_alert，DELETED 事件永不投递，记录清理完全落空，
+        // 导致后续 add 同一任务命中"已存在"幂等分支、永远无法重新入列。
+        // 因此这里必须同步清理本地记录，不依赖引擎事件兑底。
+        std::string save_path;
+        std::string root_name;
+        std::string original_root_name;
+        {
+            std::scoped_lock lock(mtx_);
+            if (FileRecord *tr = load_task_record(client_id, protocol, natural_key)) {
+                save_path = tr->save_path;
+                root_name = tr->root_name;
+                original_root_name = tr->original_root_name;
+                tr->is_delete = true;
+                tr->dirty = false; // 满足调度器清理条件，解除内存登记
+            }
+            store_.remove(client_id, protocol, natural_key);
+        }
+        if (delete_files) {
+            // 任务不在 session 时 remove_torrent(delete_files) 不会执行，
+            // 由这里兑底删除数据目录（与 DELETED 分支一致；重复删除幂等）。
+            std::error_code ec;
+            if (!root_name.empty()) {
+                std::filesystem::remove_all(std::filesystem::path(save_path) / root_name, ec);
+            }
+            if (!original_root_name.empty()) {
+                std::filesystem::remove_all(std::filesystem::path(save_path) / original_root_name, ec);
+            }
+        }
+        return result;
     }
 
     dw_submit_result_t TaskManager::remote_remove(const TaskParams & /*params*/) {
