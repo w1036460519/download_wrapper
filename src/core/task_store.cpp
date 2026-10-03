@@ -134,6 +134,7 @@ namespace dw {
                 priority        INTEGER DEFAULT 0,
                 reason          INTEGER DEFAULT 0,
                 message         TEXT NOT NULL DEFAULT '',
+                priority_file_indexes TEXT NOT NULL DEFAULT '',  -- 优先下载文件索引，逗号分隔；空=全部下载
                 created_at      INTEGER,
                 modified_at     INTEGER
             );
@@ -162,6 +163,11 @@ namespace dw {
             );
         )";
         sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
+        // 存量库迁移：补建 priority_file_indexes 列（SQLite 无 ADD COLUMN IF NOT EXISTS，
+        // 列已存在时 exec 报错，静默忽略）。
+        sqlite3_exec(db_,
+                     "ALTER TABLE file_records ADD COLUMN priority_file_indexes TEXT NOT NULL DEFAULT '';",
+                     nullptr, nullptr, nullptr);
     }
 
     void TaskStore::remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const {
@@ -200,7 +206,8 @@ namespace dw {
             UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name,
                 root_name=:root_name, full_path=:full_path, file_type=:file_type, ext=:ext,
                 status=:status, total_size=:total_size, total_done=:total_done,
-                reason=:reason, message=:message, modified_at=:modified_at
+                reason=:reason, message=:message, priority_file_indexes=:priority_file_indexes,
+                modified_at=:modified_at
             WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
         )";
         sqlite3_stmt *st = nullptr;
@@ -216,6 +223,7 @@ namespace dw {
         bind_int64(st, ":total_done", rec.total_done);
         bind_int(st, ":reason", rec.reason);
         bind_text(st, ":message", rec.message);
+        bind_text(st, ":priority_file_indexes", utils::join_ints(rec.priority_file_indexes));
         bind_int64(st, ":modified_at", now_unix_ms());
         bind_text(st, ":client_id", rec.client_id);
         bind_int(st, ":task_protocol", static_cast<int>(rec.task_protocol));
@@ -325,6 +333,7 @@ namespace dw {
             r.reason = cm.getInt("reason");
             r.message = cm.getText("message");
             // support_range/etag/last_modified 不再从 file_records 读取（已在 resume_data 表中）
+            r.priority_file_indexes = utils::split_ints(cm.getText("priority_file_indexes"));
             r.created_at = cm.getInt64("created_at");
             r.modified_at = cm.getInt64("modified_at");
         }
@@ -384,10 +393,10 @@ namespace dw {
         constexpr auto sql = R"(
             INSERT INTO file_records (client_id, type, is_remote, save_path, original_root_name, root_name,
                 full_path, file_type, ext, parsed, task_protocol, task_natural_key, status, total_size, total_done,
-                priority, reason, message, created_at, modified_at)
+                priority, reason, message, priority_file_indexes, created_at, modified_at)
             VALUES (:client_id, :type, :is_remote, :save_path, :original_root_name, :root_name,
                 :full_path, :file_type, :ext, :parsed, :task_protocol, :task_natural_key, :status, :total_size, :total_done,
-                :priority, :reason, :message, :created_at, :modified_at);
+                :priority, :reason, :message, :priority_file_indexes, :created_at, :modified_at);
         )";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
@@ -414,6 +423,7 @@ namespace dw {
         bind_int(st, ":priority", r.priority);
         bind_int(st, ":reason", r.reason);
         bind_text(st, ":message", r.message);
+        bind_text(st, ":priority_file_indexes", utils::join_ints(r.priority_file_indexes));
         bind_int64(st, ":created_at", r.created_at);
         bind_int64(st, ":modified_at", r.modified_at);
         sqlite3_step(st);
