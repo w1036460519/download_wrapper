@@ -149,7 +149,16 @@ DW_API void dw_destroy(void) {
         return;
     }
 
-    // 先停止引擎（其线程可能回调 TaskManager，须先于 TaskManager 销毁）
+    // 先停止任务中枢线程：调度/维护循环持有引擎裸指针（set_engines 注入），
+    // 若先销毁引擎，stop 前仍存活的 maintenance_loop 对已析构对象的
+    // sweep()/resume_task() 虚调用会段错误。
+    if (dw::g_downloader->task_manager) {
+        dw::g_downloader->task_manager->stop();
+    }
+
+    // 再停止引擎：其线程 join 前可能回调 TaskManager，此时对象仍存活，
+    // 且 store_ 已关闭（db_ 空置、prepare 直接失败）、事件循环已停止
+    //（post 到 stopped io_context 空转安全），回调均有防护。
     if (dw::g_downloader->http_engine) {
         dw::g_downloader->http_engine->destroy();
         dw::g_downloader->http_engine.reset();
@@ -159,9 +168,8 @@ DW_API void dw_destroy(void) {
         dw::g_downloader->torrent_engine.reset();
     }
 
-    // 再停止并销毁 TaskManager
+    // 最后销毁任务中枢对象（线程均已 join）
     if (dw::g_downloader->task_manager) {
-        dw::g_downloader->task_manager->stop();
         dw::g_downloader->task_manager.reset();
     }
 

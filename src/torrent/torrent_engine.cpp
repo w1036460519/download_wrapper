@@ -1013,9 +1013,10 @@ namespace dw {
         if (const lt::torrent_handle handle = find_handle(info_hash, client_id); handle.is_valid()) {
             try {
                 if (g_session) {
-                    const auto opt = delete_files
-                                         ? lt::session::delete_files
-                                         : lt::session::delete_partfile;
+                    // 不删文件：不带任何 option，仅从 session 移除，
+                    // 保留数据文件与 partfile（断点续传元数据）。
+                    const auto opt = delete_files ? lt::session::delete_files
+                                                  : lt::remove_flags_t{};
                     g_session->remove_torrent(handle, opt);
                 }
             } catch (const std::exception &e) {
