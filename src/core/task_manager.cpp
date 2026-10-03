@@ -806,7 +806,6 @@ namespace dw {
                 fr.task_natural_key = entry_name;
                 fr.full_path = full_path;
                 fr.created_at = now_unix_ms();
-                fr.dirty = true;
                 if (it->is_directory(ec)) {
                     fr.file_type = true;
                     fr.total_size = 0;
@@ -819,8 +818,12 @@ namespace dw {
                         fr.ext = entry_name.substr(ext_pos + 1);
                     }
                 }
+                // 本地文件行仅入库供列表展示：不入内存调度表（tasks_ 只收纳
+                // 下载任务），否则默认 status=DOWNLOADING 会被调度器名额统计
+                // 计入，目录文件数 ≥ max_concurrent 时名额永远占满、真任务
+                // 永不派发；也不置 dirty，避免 maintenance 对新落库行重复
+                // UPDATE 并向 app 推送无意义的进度回调。
                 store_.insert_file_record(fr);
-                register_task(std::move(fr));
                 ++added;
             }
         }
