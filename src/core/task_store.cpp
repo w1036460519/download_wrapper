@@ -268,9 +268,16 @@ namespace dw {
     void TaskStore::save_resume(const std::string &client_id, dw_protocol_t protocol,
                                 const std::string &natural_key,
                                 const uint8_t *data, const size_t size) const {
+        // 仅写入 data/saved_at，不得用 INSERT OR REPLACE：REPLACE 是
+        // 删旧行重插全行，会把 save_resume_source 写入的来源三列
+        // （save_path/magnet_link/torrent_file）抹成 NULL，导致后续
+        // find_handle 重建 handle 时无据可依（任务进不了 session）。
         constexpr auto sql = R"(
-            INSERT OR REPLACE INTO resume_data (client_id, protocol, natural_key, data, saved_at)
-            VALUES (:client_id, :protocol, :natural_key, :data, :saved_at);
+            INSERT INTO resume_data (client_id, protocol, natural_key, data, saved_at)
+            VALUES (:client_id, :protocol, :natural_key, :data, :saved_at)
+            ON CONFLICT(client_id, protocol, natural_key) DO UPDATE SET
+                data = excluded.data,
+                saved_at = excluded.saved_at;
         )";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
