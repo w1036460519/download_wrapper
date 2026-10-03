@@ -175,6 +175,9 @@ namespace dw {
                 task_record.status = DW_TASK_STATUS_QUEUED;
                 task_record.created_at = now_unix_ms();
                 task_record.modified_at = task_record.created_at;
+                // 文件选择持久化：BT 任务以 default_dont_download 添加（初始全部不下载），
+                // 调度派发依赖此字段定型下载范围；空列表语义为全部下载。
+                task_record.priority_file_indexes = params.file_indexes;
                 store_.insert_file_record(task_record);
                 // 新任务必须同步注册进内存调度表：scheduler_loop 只遍历 tasks_，
                 // 漏注册会导致任务对调度器不可见（永远 QUEUED），仅重启后经 start() 加载才恢复。

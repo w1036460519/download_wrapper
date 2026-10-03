@@ -106,7 +106,7 @@ namespace dw {
         lt::torrent_handle find_handle(const std::string &info_hash,
                                        const std::string &client_id = {},
                                        const dw_protocol_t protocol = DW_PROTOCOL_TORRENT) {
-            if (info_hash.empty() || client_id.empty()) {
+            if (info_hash.empty()) {
                 return {};
             }
             if (!g_session || !g_task_manager) {
@@ -133,6 +133,11 @@ namespace dw {
                 }
             }
 
+            // session 内未命中：需从任务记录重建 handle，此路径依赖 client_id
+            if (client_id.empty()) {
+                log_e(info_hash.c_str(), "session 未命中且 client_id 为空，无法重建 handle");
+                return {};
+            }
             const auto [data, magnet_link, torrent_file]
                     = g_task_manager->load_resume_info(client_id, protocol, info_hash);
             lt::add_torrent_params atp;
@@ -958,23 +963,11 @@ namespace dw {
             handle.clear_error();
         }
 
-        if (!priority_file_indexes.empty()) {
-            try {
-                const std::shared_ptr<const lt::torrent_info> ti = handle.torrent_file();
-                if (ti) {
-                    const int n = ti->layout().num_files();
-                    std::vector<lt::download_priority_t> prio(static_cast<size_t>(n), lt::default_priority);
-                    for (const int32_t idx: priority_file_indexes) {
-                        if (idx >= 0 && idx < n) {
-                            prio[static_cast<size_t>(idx)] = lt::top_priority;
-                        }
-                    }
-                    handle.prioritize_files(prio);
-                }
-            } catch (const std::exception &e) {
-                log_e(info_hash.c_str(), "设置文件优先级失败: {}", e.what());
-            }
-        }
+        // 文件选择定型：find_handle/add 均以 default_dont_download 添加（初始全部不下载），
+        // 不显式定型则零下载需求，torrent 会在 checking 后瞬间 finished。
+        // 空列表 = 全部下载；非空 = 仅选中文件下载（与 apply_file_selection 定型语义一致）。
+        // 磁力链首次派发时元数据未就绪，定型失败属预期：PARSED 事件后会再次触发 resume_task。
+        apply_file_selection(info_hash, priority_file_indexes);
 
         try {
             if (const lt::torrent_status st = handle.status(); st.flags & lt::torrent_flags::paused) {
