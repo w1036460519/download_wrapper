@@ -163,6 +163,39 @@ namespace dw {
             );
         )";
         sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
+        // 存量库迁移：远古版本 resume_data 以 infoHash 为主键（缺 client_id 等
+        // 全部新列），针对它的 INSERT/SELECT 均因 "no such column" 静默失败，
+        // 导致任务来源丢失、find_handle 无法重建 handle、任务永远进不了
+        // session。旧表数据格式已不可用，检测到缺列即整表重建；全新库表不
+        // 存在时同样命中本分支，DROP 无害、CREATE 走幂等建表。
+        {
+            sqlite3_stmt *st = nullptr;
+            if (sqlite3_prepare_v2(db_,
+                                   "SELECT COUNT(*) FROM pragma_table_info('resume_data') WHERE name='client_id';",
+                                   -1, &st, nullptr) == SQLITE_OK) {
+                bool legacy = false;
+                if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0) {
+                    legacy = true;
+                }
+                sqlite3_finalize(st);
+                if (legacy) {
+                    sqlite3_exec(db_, "DROP TABLE IF EXISTS resume_data;", nullptr, nullptr, nullptr);
+                    sqlite3_exec(db_,
+                                 R"(CREATE TABLE IF NOT EXISTS resume_data (
+                        client_id   TEXT NOT NULL,
+                        protocol    INTEGER NOT NULL,
+                        natural_key TEXT NOT NULL,
+                        data BLOB,
+                        save_path TEXT,
+                        magnet_link TEXT,
+                        torrent_file TEXT,
+                        saved_at INTEGER,
+                        PRIMARY KEY (client_id, protocol, natural_key)
+                    );)",
+                                 nullptr, nullptr, nullptr);
+                }
+            }
+        }
         // 存量库迁移：补建 priority_file_indexes 列（SQLite 无 ADD COLUMN IF NOT EXISTS，
         // 列已存在时 exec 报错，静默忽略）。
         sqlite3_exec(db_,
