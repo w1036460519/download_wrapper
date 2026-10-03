@@ -397,7 +397,8 @@ namespace dw {
             case EngineEventType::PARSED: {
                 if (!rec->parsed) {
                     rec->root_name = event.root_name;
-                    rec->original_root_name = event.original_name;
+                    // PARSED 事件由 BT 引擎构造，原始名填充在 original_root_name
+                    rec->original_root_name = event.original_root_name;
                     rec->save_path = event.save_path;
                     rec->parsed = true;
                     rec->ext = event.ext;

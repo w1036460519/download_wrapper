@@ -446,7 +446,10 @@ namespace dw {
                     TorrentEngine::post_fail(key, "解析失败");
                 }
             } else {
-                // 无冲突 发送解析完成事件
+                // 无冲突 发送解析完成事件；root_name 必须与实际落盘目录一致
+                //（libtorrent 按 base_name 写盘），否则 DELETED 阶段的
+                // remove_all 兑底路径与真实数据目录脱钩，delete(true) 残留文件。
+                ev.root_name = base_name;
                 TorrentEngine::post_event(std::move(ev));
             }
         }
