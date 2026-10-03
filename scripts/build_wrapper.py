@@ -463,9 +463,16 @@ def strip_binary(filepath: Path, platform_os: str, triplet: str = ""):
 
 
 def merge_universal_dylib(arm64_lib: Path, x64_lib: Path, output: Path):
-    """lipo 合并 macOS universal binary。"""
+    """lipo 合并 macOS universal binary，并统一 install name。
+
+    两个单架构产物的 install name 分别为 @rpath/download-macos-arm64.dylib
+    和 @rpath/download-macos-x64.dylib；合并后宿主只嵌入 universal 一份文件，
+    必须把所有 slice 的 install name 统一重写为 universal 名称，
+    否则运行时动态链接器按旧名称查找会命中旧文件或加载失败。
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
     run(["lipo", "-create", str(arm64_lib), str(x64_lib), "-output", str(output)])
+    run(["install_name_tool", "-id", f"@rpath/{output.name}", str(output)])
 
 
 def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path) -> Path:
