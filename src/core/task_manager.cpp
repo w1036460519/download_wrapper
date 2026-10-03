@@ -433,7 +433,13 @@ namespace dw {
                 rec->download_rate = event.download_rate;
                 rec->upload_rate = event.upload_rate;
                 rec->support_range = event.support_range;
-                rec->status = event.status;
+                // QUEUED 是调度器权威态：self_resume 准入后、scheduler 派发前，
+                // status_loop 周期性的 state_update（对 paused torrent 持续回
+                // PAUSED）不得把已准入任务打回，否则任务永卡暂停、调度器
+                // 不再扫描。派发后状态仍由后续事件正常覆盖。
+                if (rec->status != DW_TASK_STATUS_QUEUED) {
+                    rec->status = event.status;
+                }
                 rec->reason = event.reason;
                 rec->message = event.message;
                 if (!event.etag.empty()) rec->etag = event.etag;
