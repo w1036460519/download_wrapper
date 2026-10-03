@@ -176,6 +176,9 @@ namespace dw {
                 task_record.created_at = now_unix_ms();
                 task_record.modified_at = task_record.created_at;
                 store_.insert_file_record(task_record);
+                // 新任务必须同步注册进内存调度表：scheduler_loop 只遍历 tasks_，
+                // 漏注册会导致任务对调度器不可见（永远 QUEUED），仅重启后经 start() 加载才恢复。
+                register_task(std::move(task_record));
             }
         }
 

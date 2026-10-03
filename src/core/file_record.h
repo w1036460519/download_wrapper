@@ -91,6 +91,10 @@ namespace dw {
         obj["status"] = r.status;
         obj["total_size"] = r.total_size;
         obj["total_done"] = r.total_done;
+        // 运行时速率字段：引擎事件已回填（BT=torrent_status、HTTP=分片速率和），
+        // 进度回调与列表查询依赖此字段展示实时速率，遗漏会导致上层恒取 -1。
+        obj["download_rate"] = r.download_rate;
+        obj["upload_rate"] = r.upload_rate;
         obj["priority"] = r.priority;
         obj["reason"] = r.reason;
         obj["message"] = r.message;
