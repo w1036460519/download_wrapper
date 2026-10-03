@@ -262,7 +262,7 @@ namespace dw {
             return dw_submit_result_t::success();
         }
         const int32_t delete_files = params.delete_files ? 1 : 0;
-        const int32_t protocol = params.protocol;
+        const dw_protocol_t protocol = params.protocol;
         const std::string &client_id = params.client_id;
         const std::string &natural_key = params.natural_key;
         dw_submit_result_t result = dw_submit_result_t::success();
@@ -291,13 +291,7 @@ namespace dw {
         if (delete_files) {
             // 任务不在 session 时 remove_torrent(delete_files) 不会执行，
             // 由这里兑底删除数据目录（与 DELETED 分支一致；重复删除幂等）。
-            std::error_code ec;
-            if (!root_name.empty()) {
-                std::filesystem::remove_all(std::filesystem::path(save_path) / root_name, ec);
-            }
-            if (!original_root_name.empty()) {
-                std::filesystem::remove_all(std::filesystem::path(save_path) / original_root_name, ec);
-            }
+            remove_data_directory(save_path, root_name, original_root_name);
         }
         return result;
     }
@@ -488,13 +482,7 @@ namespace dw {
                 store_.remove(rec->client_id, rec->task_protocol, rec->task_natural_key);
                 log_i(key.c_str(), "任务删除成功");
                 if (event.delete_files) {
-                    std::error_code ec;
-                    if (!root_name.empty()) {
-                        std::filesystem::remove_all(std::filesystem::path(save_path) / root_name, ec);
-                    }
-                    if (!original_root_name.empty()) {
-                        std::filesystem::remove_all(std::filesystem::path(save_path) / original_root_name, ec);
-                    }
+                    remove_data_directory(save_path, root_name, original_root_name);
                     log_i(key.c_str(), "文件删除成功");
                 }
                 rec->is_delete = true;
@@ -882,5 +870,23 @@ namespace dw {
                                                 rec.task_natural_key, 0);
         }
         tasks_.erase(it);
+    }
+
+    void TaskManager::remove_data_directory(const std::string &save_path,
+                                            const std::string &root_name,
+                                            const std::string &original_root_name) {
+        // 删除前规范化并校验目标仍位于 save_path 之内：目录名来自种子元
+        // 数据与账本记录，恶意种子 name 或异常记录可借 ../、绝对路径逃逸
+        // save_path 误删目录外数据。校验不过静默跳过，与整段兑底逻辑的
+        // 容错语义一致（重复删除幂等）。
+        std::error_code ec;
+        const std::filesystem::path base = std::filesystem::path(save_path).lexically_normal();
+        for (const std::string &name: {root_name, original_root_name}) {
+            if (name.empty()) continue;
+            const std::filesystem::path target = (base / name).lexically_normal();
+            const std::filesystem::path rel = target.lexically_relative(base);
+            if (rel.empty() || std::filesystem::path("..") == *rel.begin()) continue;
+            std::filesystem::remove_all(target, ec);
+        }
     }
 } // namespace dw

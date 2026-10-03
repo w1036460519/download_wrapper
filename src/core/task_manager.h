@@ -229,6 +229,11 @@ namespace dw {
         // 注销：清 tasks_，union_id 定位。
         void unregister_task(const std::string &union_id);
 
+        // 兜底删除任务数据目录：self_remove 与 DELETED 分支共用，含路径逃逸防护。
+        static void remove_data_directory(const std::string &save_path,
+                                          const std::string &root_name,
+                                          const std::string &original_root_name);
+
         std::recursive_mutex mtx_;
         // 任务主表：union_id → FileRecord。常驻活跃/排队任务，后续引入淘汰策略。
         std::unordered_map<std::string, FileRecord> tasks_;
