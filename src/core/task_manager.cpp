@@ -566,6 +566,13 @@ namespace dw {
                         if (IDownloadEngine *eng = engine_of(best->task_protocol)) {
                             eng->resume_task(best->task_natural_key, config_.client_id, best->priority_file_indexes);
                             best->force = false;
+                            // 派发即占用调度名额：resume_task 的状态回写经引擎事件异步完成，
+                            // 事件消费线程与本线程争用 mtx_。若此处不先翻离 QUEUED，
+                            // 内层循环会在持锁状态下对同一任务每秒重复派发上万次，
+                            // 同时饿死事件线程（状态永远无法翻转）与 dw_list_tasks（死锁）。
+                            // 后续准确状态仍由 STATUS_UPDATE 事件覆盖。
+                            best->status = DW_TASK_STATUS_DOWNLOADING;
+                            best->dirty = true;
                         }
                     }
                 } else {
