@@ -519,8 +519,13 @@ namespace dw {
                 for (auto &[union_id, task_record]: tasks_) {
                     if (task_record.is_delete && !task_record.dirty) {
                         // 任务被删除或者文件不存在了
-                        unregister_task(union_id);
+                        to_remove.push_back(union_id);
                     }
+                }
+                // unregister_task 内部执行 tasks_.erase，
+                // 必须在遍历结束后统一删除，否则迭代器失效引发段错误。
+                for (const auto &uid: to_remove) {
+                    unregister_task(uid);
                 }
                 if (net_allowed_) {
                     // 调度优先级 force > 优先级 > 时间
