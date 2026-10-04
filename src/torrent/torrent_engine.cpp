@@ -487,6 +487,9 @@ namespace dw {
                         ev.download_rate = static_cast<double>(s.download_payload_rate);
                         ev.upload_rate = static_cast<double>(s.upload_payload_rate);
                         ev.total_upload = s.all_time_upload;
+                        // 调试：打印瞬时速率，确认 libtorrent 报告的 download_payload_rate 是否为 0
+                        log_i(key.c_str(), "STATUS_UPDATE: total_done={}, download_payload_rate={}, upload_payload_rate={}, state={}",
+                              s.total_done, s.download_payload_rate, s.upload_payload_rate, static_cast<int>(s.state));
                         TorrentEngine::post_event(std::move(ev));
                     }
                 }
