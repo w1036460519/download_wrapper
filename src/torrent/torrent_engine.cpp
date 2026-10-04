@@ -740,8 +740,8 @@ namespace dw {
                             } catch (...) {
                             }
                         }
-                        log_i("bt", "任务状态统计: 总数={} 下载中={} 元数据={} 校验={} 校验resume={} 已完成={} 做种={} 暂停={}", total,
-                              downloading, downloading_meta, checking, checking_resume, finished, seeding, paused);
+                        // log_i("bt", "任务状态统计: 总数={} 下载中={} 元数据={} 校验={} 校验resume={} 已完成={} 做种={} 暂停={}", total,
+                              // downloading, downloading_meta, checking, checking_resume, finished, seeding, paused);
                     } catch (const std::exception &e) {
                         log_e("bt", "恢复数据定时请求异常: {}", e.what());
                     }
