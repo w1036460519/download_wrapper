@@ -40,7 +40,12 @@ namespace dw {
     void emit_progress(const char *json) {
         if (!g_downloader || !json) return;
         if (const auto cb = g_downloader->progress_cb.load()) {
-            cb(json);
+            // 堆分配字符串，所有权交给回调消费方（Dart 侧 dw_free 释放）。
+            // NativeCallable.listener 异步投递，回调立即返回，
+            // 不能用局部变量（返回即析构），必须 strdup 保证生命周期。
+            char *heap_json = strdup(json);
+            if (!heap_json) return;
+            cb(heap_json);
         }
     }
 
