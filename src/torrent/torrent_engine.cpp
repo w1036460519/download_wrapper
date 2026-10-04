@@ -487,9 +487,14 @@ namespace dw {
                         ev.download_rate = static_cast<double>(s.download_payload_rate);
                         ev.upload_rate = static_cast<double>(s.upload_payload_rate);
                         ev.total_upload = s.all_time_upload;
-                        // 调试：打印瞬时速率，确认 libtorrent 报告的 download_payload_rate 是否为 0
-                        log_i(key.c_str(), "STATUS_UPDATE: total_done={}, download_payload_rate={}, upload_payload_rate={}, state={}",
-                              s.total_done, s.download_payload_rate, s.upload_payload_rate, static_cast<int>(s.state));
+                        // 调试：打印完整 torrent_status 快照，诊断 download_payload_rate 为 0 的原因
+                        log_i(key.c_str(), "STATUS_UPDATE: total_done={}/{} progress={:.3f} dlr={}, ulr={}, all_time_dl={}, all_time_ul={}, state={}, paused={}, peers={}/{}, connections={}",
+                              s.total_done, s.total_wanted, s.progress,
+                              s.download_payload_rate, s.upload_payload_rate,
+                              s.all_time_download, s.all_time_upload,
+                              static_cast<int>(s.state),
+                              (s.flags & lt::torrent_flags::paused) ? 1 : 0,
+                              s.num_peers, s.num_seeds, s.num_connections);
                         TorrentEngine::post_event(std::move(ev));
                     }
                 }
