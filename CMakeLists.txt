@@ -107,7 +107,10 @@ else()
 endif()
 
 # 平台 & 架构检测 → 产物命名 download-{platform}-{arch}
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND CMAKE_OSX_SYSROOT MATCHES "iphonesimulator")
+# 注意：project() 后 CMAKE_OSX_SYSROOT 已解析为完整路径（含大写 iPhoneSimulator），
+# MATCHES 大小写敏感，需归一小写后再匹配，否则 iOS 模拟器会被误判为 ios 平台
+string(TOLOWER "${CMAKE_OSX_SYSROOT}" DW_SYSROOT_LOWER)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND DW_SYSROOT_LOWER MATCHES "iphonesimulator")
     set(DW_PLATFORM "ios-simulator")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(DW_PLATFORM "macos")

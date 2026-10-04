@@ -475,15 +475,27 @@ def merge_universal_dylib(arm64_lib: Path, x64_lib: Path, output: Path):
     run(["install_name_tool", "-id", f"@rpath/{output.name}", str(output)])
 
 
-def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path) -> Path:
-    """合并 iOS 静态库（自身 + vcpkg 依赖）为自包含胖库。"""
+def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path,
+                          libtorrent_dir: Path | None = None) -> Path:
+    """合并 iOS 静态库（自身 + libtorrent + vcpkg 依赖）为自包含胖库。"""
     dist = workspace / "dist"
     dist.mkdir(parents=True, exist_ok=True)
+
+    # libtorrent 独立于 vcpkg_installed（由 DW_LIBTORRENT_DIR 提供），
+    # 若不并入合并列表，产物链接期会报 libtorrent 符号缺失
+    libtorrent_libs = []
+    if libtorrent_dir and (libtorrent_dir / "lib").exists():
+        libtorrent_libs = [str(f) for f in (libtorrent_dir / "lib").glob("*.a")]
 
     if cfg.get("universal") and cfg.get("simulator"):
         # iOS simulator universal: arm64 + x64 各合并依赖后再 lipo
         arm64_self = find_output(workspace / "build-sim-arm64", "download-ios-simulator-arm64.a")
         x64_self = find_output(workspace / "build-sim-x64", "download-ios-simulator-x64.a")
+        # 自身库缺失属致命错误：libtool 对缺失文件仅告警，会静默产出缺自身符号的库
+        if not arm64_self or not x64_self:
+            raise FileNotFoundError(
+                f"未找到 wrapper 自身静态库: arm64={arm64_self} x64={x64_self}，"
+                "请检查 CMake 产物命名与脚本预期是否一致")
         arm64_deps = find_vcpkg_installed(workspace, "arm64-ios-simulator")
         x64_deps = find_vcpkg_installed(workspace, "x64-ios-simulator")
 
@@ -491,9 +503,9 @@ def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path) -> Path:
         temp_x64 = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "sim-x64.a"
 
         run(["libtool", "-static", "-o", str(temp_arm64), str(arm64_self)] +
-            [str(f) for f in arm64_deps.glob("*.a")])
+            libtorrent_libs + [str(f) for f in arm64_deps.glob("*.a")])
         run(["libtool", "-static", "-o", str(temp_x64), str(x64_self)] +
-            [str(f) for f in x64_deps.glob("*.a")])
+            libtorrent_libs + [str(f) for f in x64_deps.glob("*.a")])
 
         output = dist / cfg["output"]
         run(["lipo", "-create", str(temp_arm64), str(temp_x64), "-output", str(output)])
@@ -501,11 +513,13 @@ def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path) -> Path:
     else:
         # iOS arm64 单架构
         self_lib = find_output(workspace / "build", "download-ios-arm64.a")
+        if not self_lib:
+            raise FileNotFoundError("未找到 wrapper 自身静态库 download-ios-arm64.a")
         deps = find_vcpkg_installed(workspace, "arm64-ios")
 
         output = dist / cfg["output"]
         run(["libtool", "-static", "-o", str(output), str(self_lib)] +
-            [str(f) for f in deps.glob("*.a")])
+            libtorrent_libs + [str(f) for f in deps.glob("*.a")])
         return output
 
 
@@ -587,7 +601,7 @@ def build_ios_simulator_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
     cmake_build(workspace / "build-sim-x64")
 
     # 合并为 universal
-    return merge_ios_static_libs(workspace, cfg, vcpkg_dir)
+    return merge_ios_static_libs(workspace, cfg, vcpkg_dir, libtorrent_dir)
 
 
 def main():
