@@ -444,6 +444,7 @@ namespace dw {
                     log_i(key.c_str(), "已解析完成[{}]", to_json_string(rec));
                 }
                 if (IDownloadEngine *eng = engine_of(rec->task_protocol)) {
+                    log_i(key.c_str(), "解析后派发[proto={}]", static_cast<int>(rec->task_protocol));
                     eng->resume_task(rec->task_natural_key, rec->client_id, rec->priority_file_indexes);
                 }
                 break;
@@ -602,6 +603,7 @@ namespace dw {
                         if (!best) break;
 
                         if (IDownloadEngine *eng = engine_of(best->task_protocol)) {
+                            log_i(best->task_natural_key.c_str(), "调度派发[proto={}]", static_cast<int>(best->task_protocol));
                             eng->resume_task(best->task_natural_key, config_.client_id, best->priority_file_indexes);
                             best->force = false;
                             // 派发即占用调度名额：resume_task 的状态回写经引擎事件异步完成，

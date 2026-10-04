@@ -122,7 +122,7 @@ namespace dw {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "入参为空");
         }
         const char *url = params->url.c_str();
-        log_d(url, "HTTP 添加任务: url={}", url);
+        log_i(url, "HTTP 添加任务: url={}", url);
         const char *err = nullptr;
 
         if (!ensure_running()) {
