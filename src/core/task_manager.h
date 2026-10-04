@@ -77,7 +77,7 @@ namespace dw {
         /// 添加任务（三要素从 params 取，无需单独传递）。
         dw_submit_result_t add(TaskParams &params);
 
-        dw_submit_result_t pause(const TaskParams &params) const;
+        dw_submit_result_t pause(const TaskParams &params);
 
         dw_submit_result_t resume(const TaskParams &params);
 
@@ -176,7 +176,7 @@ namespace dw {
         dw_submit_result_t remote_add(TaskParams &params);
 
         /// 本机任务暂停。
-        dw_submit_result_t self_pause(const TaskParams &params) const;
+        dw_submit_result_t self_pause(const TaskParams &params);
 
         /// 远程任务暂停。
         dw_submit_result_t remote_pause(const TaskParams &params) const;

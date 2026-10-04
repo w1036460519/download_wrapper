@@ -188,7 +188,7 @@ namespace dw {
         return dw_submit_result_t::success();
     }
 
-    dw_submit_result_t TaskManager::pause(const TaskParams &params) const {
+    dw_submit_result_t TaskManager::pause(const TaskParams &params) {
         log_i(params.natural_key.c_str(), "暂停任务[{}]", to_json_string(params));
         if (config_.client_id == params.client_id) {
             return self_pause(params);
@@ -197,9 +197,19 @@ namespace dw {
         }
     }
 
-    dw_submit_result_t TaskManager::self_pause(const TaskParams &params) const {
+    dw_submit_result_t TaskManager::self_pause(const TaskParams &params) {
         if (IDownloadEngine *eng = engine_of(params.protocol)) {
-            return eng->pause_task(params.natural_key, params.client_id);
+            auto result = eng->pause_task(params.natural_key, params.client_id);
+            if (result.code == 0) {
+                // 暂停成功：重置速率并标记脏推送，避免恢复后展示上次的速率
+                std::scoped_lock lock(mtx_);
+                if (FileRecord *rec = load_task_record(params.client_id, params.protocol, params.natural_key)) {
+                    rec->download_rate = 0.0;
+                    rec->upload_rate = 0.0;
+                    rec->dirty = true;
+                }
+            }
+            return result;
         }
         return dw_submit_result_t::failure(DW_REASON_ERROR, "下载引擎不可用");
     }
