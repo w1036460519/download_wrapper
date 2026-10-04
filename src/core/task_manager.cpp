@@ -271,28 +271,19 @@ namespace dw {
         }
         // 引擎 success 涵盖两种情况：任务已提交移出 session，或任务本来就
         // 不在 session（handle 构建失败）。后者不会产生 torrent_removed /
-        // torrent_deleted_alert，DELETED 事件永不投递，记录清理完全落空，
-        // 导致后续 add 同一任务命中"已存在"幂等分支、永远无法重新入列。
-        // 因此这里必须同步清理本地记录，不依赖引擎事件兑底。
-        std::string save_path;
-        std::string root_name;
-        std::string original_root_name;
+        // torrent_deleted_alert，DELETED 事件永不投递。
+        // 改为事件驱动：设 is_delete + dirty，由 maintenance_loop 推送删除标识给前端，
+        // 推送后再从内存与 DB 清除。DELETED 事件（若到达）仅负责文件清理。
         {
             std::scoped_lock lock(mtx_);
             if (FileRecord *tr = load_task_record(client_id, protocol, natural_key)) {
-                save_path = tr->save_path;
-                root_name = tr->root_name;
-                original_root_name = tr->original_root_name;
                 tr->is_delete = true;
-                tr->dirty = false; // 满足调度器清理条件，解除内存登记
+                tr->dirty = true; // 触发 maintenance_loop 推送删除标识
             }
-            store_.remove(client_id, protocol, natural_key);
         }
-        if (delete_files) {
-            // 任务不在 session 时 remove_torrent(delete_files) 不会执行，
-            // 由这里兑底删除数据目录（与 DELETED 分支一致；重复删除幂等）。
-            remove_data_directory(save_path, root_name, original_root_name);
-        }
+        // 文件清理由 DELETED 事件处理（libtorrent remove_torrent(Delete_files) 负责数据文件，
+        // DELETED handler 负责包装目录）。任务不在 session 时 DELETED 不投递，
+        // 但 remove_torrent 也未执行，无文件需清理。
         return result;
     }
 
@@ -476,17 +467,17 @@ namespace dw {
                 break;
             }
             case EngineEventType::DELETED: {
-                const std::string save_path = rec->save_path;
-                const std::string root_name = rec->root_name;
-                const std::string original_root_name = rec->original_root_name;
-                store_.remove(rec->client_id, rec->task_protocol, rec->task_natural_key);
-                log_i(key.c_str(), "任务删除成功");
+                // 文件清理：libtorrent remove_torrent(Delete_files) 负责数据文件，
+                // 这里负责包装目录兜底。记录状态由 self_remove 已设 is_delete+dirty，
+                // maintenance_loop 推送删除标识后统一清除内存与 DB。
+                log_i(key.c_str(), "任务删除完成");
                 if (event.delete_files) {
+                    const std::string save_path = rec->save_path;
+                    const std::string root_name = rec->root_name;
+                    const std::string original_root_name = rec->original_root_name;
                     remove_data_directory(save_path, root_name, original_root_name);
                     log_i(key.c_str(), "文件删除成功");
                 }
-                rec->is_delete = true;
-                rec->dirty = true;
                 break;
             }
             case EngineEventType::FILE_PROGRESS: {
@@ -640,7 +631,10 @@ namespace dw {
                 for (auto &task_record: tasks_ | std::views::values) {
                     if (task_record.dirty) {
                         dirty_records.push_back(task_record);
-                        store_.update_file_record(task_record);
+                        // 删除记录不更新 DB，推送后直接清除
+                        if (!task_record.is_delete) {
+                            store_.update_file_record(task_record);
+                        }
                     }
                 }
             }
@@ -651,12 +645,19 @@ namespace dw {
                 emit_progress(json.c_str());
             }
 
-            // 回调完成后清除 dirty 标志
+            // 回调完成后清除 dirty 标志；已推送的删除记录同时从内存与 DB 清除
             if (!dirty_records.empty()) {
                 std::scoped_lock lock(mtx_);
                 for (const auto &rec: dirty_records) {
                     if (auto it = tasks_.find(rec.union_id()); it != tasks_.end()) {
-                        it->second.dirty = false;
+                        if (rec.is_delete) {
+                            // 删除推送完成：从内存移除
+                            tasks_.erase(it);
+                            // 从 DB 清除（self_remove 未即时删除，留待此处推送后清理）
+                            store_.remove(rec.client_id, rec.task_protocol, rec.task_natural_key);
+                        } else {
+                            it->second.dirty = false;
+                        }
                     }
                 }
             }

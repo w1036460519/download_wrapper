@@ -100,6 +100,7 @@ namespace dw {
         obj["message"] = r.message;
         obj["created_at"] = r.created_at;
         obj["modified_at"] = r.modified_at;
+        obj["is_delete"] = r.is_delete;
         return obj;
     }
 
