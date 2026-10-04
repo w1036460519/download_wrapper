@@ -407,7 +407,7 @@ namespace dw {
                         to_reclaim.push_back(url);
                     }
                 } else if (tCtx->pause_req.load() == 1) {
-                    // 暂停态：PAUSED 帧由 TaskManager 合成，worker 已结束即可回收。
+                    // 暂停态：worker 退出前已推送 PAUSED 帧，此处直接回收即可。
                     to_reclaim.push_back(url);
                 }
             }

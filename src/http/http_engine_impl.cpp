@@ -1149,8 +1149,11 @@ namespace dw {
                     // 探测与下载；续传任务（probing=0）已由 add_task 回灌分片直接续传。
                     if (tCtx->cancel_req.load()) return;
                     if (tCtx->pause_req.load()) {
-                        // 暂停早退（分片下载尚未开始）：worker 线程退出前固化一次续传断点。
+                        // 暂停早退（分片下载尚未开始）：worker 线程退出前固化一次续传断点，
+                        // 并推送 PAUSED 状态事件，使 TaskManager / DB 状态同步更新。
+                        tCtx->status = DW_TASK_STATUS_PAUSED;
                         maybe_emit_resume(tCtx);
+                        push_progress(tCtx, true);
                         return;
                     }
 
@@ -1185,8 +1188,11 @@ namespace dw {
                     tCtx->message = "任务线程异常终止";
                 }
                 // 推模型：终态推入 TaskManager 内存，A 线程下一拍直接感知。
-                // 取消 / 暂停不推（PAUSED 由 TaskManager 合成，DELETE 不关注状态）。
-                if (!tCtx->cancel_req.load() && !tCtx->pause_req.load()) {
+                // 取消不推（DELETE 不关注状态）；暂停推 PAUSED 帧使 TaskManager 感知状态跃迁。
+                if (!tCtx->cancel_req.load()) {
+                    if (tCtx->pause_req.load()) {
+                        tCtx->status = DW_TASK_STATUS_PAUSED;
+                    }
                     push_progress(tCtx, true);
                 }
             }
