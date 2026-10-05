@@ -53,6 +53,15 @@ endif()
 # 暂停期默认 OFF：wrapper 打包不依赖 libwebrtc，先跑通主线功能。
 # 恢复 RTC 对接时改回 ON（或构建时传 -DDW_ENABLE_P2P=ON）并提供有效 DW_LIBWEBRTC_DIR。
 option(DW_ENABLE_P2P "启用 P2P 多端共享模块（libwebrtc）" OFF)
+
+# iOS 强制关闭 P2P：上游 libwebrtc 预编译包的 lib/ 为空（无 iOS 库产物），
+# 且 CI 缓存可能固化旧版 option 默认值 ON（option 不覆盖已有缓存变量），
+# 与传入的 DW_LIBWEBRTC_DIR 组合会在链接段 find_library 时触发 FATAL
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(DW_ENABLE_P2P OFF)
+    message(STATUS "iOS 平台: P2P 模块强制关闭（无 libwebrtc iOS 预编译库）")
+endif()
+
 if(DW_ENABLE_P2P)
     # libwebrtc 二进制解压目录由 CI 或手动指定，需含 include/ + lib/
     if(DEFINED ENV{DW_LIBWEBRTC_DIR} AND NOT DEFINED DW_LIBWEBRTC_DIR)

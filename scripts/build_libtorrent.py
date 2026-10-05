@@ -201,15 +201,26 @@ def build_libtorrent(version: str, plat: str, arch: str, output_dir: Path,
             cmake_args.extend(["-DCMAKE_OSX_ARCHITECTURES=x86_64"])
     
     elif plat == "ios":
-        cmake_args.extend([
-            "-DCMAKE_SYSTEM_NAME=iOS",
-            "-DCMAKE_OSX_DEPLOYMENT_TARGET=16.0",
-        ])
+        # 关键：必须显式指定 OSX_SYSROOT。
+        # CMAKE_SYSTEM_NAME=iOS 默认用 iphoneos SDK；universal 若不指定 sim SDK，
+        # arm64 会以真机平台编译（platform=IOS），与 x86_64 的模拟器平台混在同一份
+        # 产物里，宿主 App 链接时报 "built for 'iOS'" 平台不匹配错误。
         if arch == "arm64":
-            cmake_args.extend(["-DCMAKE_OSX_ARCHITECTURES=arm64"])
+            # 真机：iphoneos SDK
+            cmake_args.extend([
+                "-DCMAKE_SYSTEM_NAME=iOS",
+                "-DCMAKE_OSX_SYSROOT=iphoneos",
+                "-DCMAKE_OSX_ARCHITECTURES=arm64",
+                "-DCMAKE_OSX_DEPLOYMENT_TARGET=16.0",
+            ])
         elif arch == "universal":
-            # iOS Simulator universal
-            cmake_args.extend(["-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"])
+            # iOS 模拟器 universal：双架构都用 iphonesimulator SDK
+            cmake_args.extend([
+                "-DCMAKE_SYSTEM_NAME=iOS",
+                "-DCMAKE_OSX_SYSROOT=iphonesimulator",
+                "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64",
+                "-DCMAKE_OSX_DEPLOYMENT_TARGET=16.0",
+            ])
     
     elif plat == "android":
         ndk = os.environ.get("ANDROID_NDK", os.environ.get("ANDROID_NDK_HOME", ""))

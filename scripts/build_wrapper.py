@@ -379,7 +379,11 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
             cmd.append(f"-DVCPKG_OVERLAY_TRIPLETS={overlay}")
 
     # libwebrtc
-    if libwebrtc_dir:
+    # iOS 平台不传：上游无 iOS 预编译库（包 lib/ 为空），且 iOS 强制 P2P OFF（见 CMakeLists），
+    # 传入空壳包目录会让链接段 find_library 触发 FATAL
+    if cfg.get("os") == "ios":
+        cmd.append("-DDW_ENABLE_P2P=OFF")
+    elif libwebrtc_dir:
         cmd.append(f"-DDW_LIBWEBRTC_DIR={libwebrtc_dir}")
 
     # libtorrent
@@ -475,11 +479,31 @@ def merge_universal_dylib(arm64_lib: Path, x64_lib: Path, output: Path):
     run(["install_name_tool", "-id", f"@rpath/{output.name}", str(output)])
 
 
+def _thin_lib(src: Path, arch: str, temp_dir: Path) -> Path:
+    """按指定架构切出 thin 静态库；thin 输入直接返回原文件。
+
+    libtool -static 接受 fat 输入但不报错，会让合并产物变成 fat，
+    导致后续 lipo -create 合并双架构产物时报 same architectures。
+    因此 fat 库（如 libtorrent universal 包）必须先按架构切 thin。
+    """
+    info = subprocess.run(["lipo", "-info", str(src)],
+                          capture_output=True, encoding='utf-8')
+    stdout = (info.stdout or "") + (info.stderr or "")
+    if "Non-fat" in stdout or info.returncode != 0:
+        # 已是单架构文件，无需切分
+        return src
+    out = temp_dir / f"{src.stem}-{arch}.a"
+    run(["lipo", "-thin", arch, str(src), "-output", str(out)])
+    return out
+
+
 def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path,
                           libtorrent_dir: Path | None = None) -> Path:
     """合并 iOS 静态库（自身 + libtorrent + vcpkg 依赖）为自包含胖库。"""
     dist = workspace / "dist"
     dist.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(os.environ.get("RUNNER_TEMP", dist / "tmp"))
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     # libtorrent 独立于 vcpkg_installed（由 DW_LIBTORRENT_DIR 提供），
     # 若不并入合并列表，产物链接期会报 libtorrent 符号缺失
@@ -499,13 +523,17 @@ def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path,
         arm64_deps = find_vcpkg_installed(workspace, "arm64-ios-simulator")
         x64_deps = find_vcpkg_installed(workspace, "x64-ios-simulator")
 
-        temp_arm64 = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "sim-arm64.a"
-        temp_x64 = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "sim-x64.a"
+        temp_arm64 = temp_dir / "sim-arm64.a"
+        temp_x64 = temp_dir / "sim-x64.a"
+
+        # libtorrent universal 包为 fat 库，须先按架构切 thin（见 _thin_lib 说明）
+        lt_arm64 = [_thin_lib(Path(f), "arm64", temp_dir) for f in libtorrent_libs]
+        lt_x64 = [_thin_lib(Path(f), "x86_64", temp_dir) for f in libtorrent_libs]
 
         run(["libtool", "-static", "-o", str(temp_arm64), str(arm64_self)] +
-            libtorrent_libs + [str(f) for f in arm64_deps.glob("*.a")])
+            lt_arm64 + [str(f) for f in arm64_deps.glob("*.a")])
         run(["libtool", "-static", "-o", str(temp_x64), str(x64_self)] +
-            libtorrent_libs + [str(f) for f in x64_deps.glob("*.a")])
+            lt_x64 + [str(f) for f in x64_deps.glob("*.a")])
 
         output = dist / cfg["output"]
         run(["lipo", "-create", str(temp_arm64), str(temp_x64), "-output", str(output)])
@@ -637,9 +665,14 @@ def main():
     vcpkg_dir = setup_vcpkg(workspace, args.vcpkg_ref, temp_dir)
 
     # 2. libwebrtc（本地目录优先，无效回退 Release 下载）
+    # iOS 无 libwebrtc 预编译库，跳过下载（P2P 强制 OFF，见 CMakeLists）
     print("\n== Step 2: libwebrtc ==")
-    libwebrtc_dir = Path(args.libwebrtc_dir).resolve() if args.libwebrtc_dir else None
-    libwebrtc_dir = ensure_libwebrtc(workspace, libwebrtc_dir, args.platform)
+    if cfg.get("os") == "ios":
+        libwebrtc_dir = None
+        print("iOS 平台: 跳过 libwebrtc 下载（P2P 强制 OFF）")
+    else:
+        libwebrtc_dir = Path(args.libwebrtc_dir).resolve() if args.libwebrtc_dir else None
+        libwebrtc_dir = ensure_libwebrtc(workspace, libwebrtc_dir, args.platform)
 
     # 3. libtorrent（自动检测/编译）
     print("\n== Step 3: libtorrent ==")
@@ -657,7 +690,8 @@ def main():
         build_dir = workspace / "build"
         cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
         cmake_build(build_dir)
-        output = merge_ios_static_libs(workspace, cfg, vcpkg_dir)
+        # 单架构分支同样并入 libtorrent，否则产物缺 BT 符号
+        output = merge_ios_static_libs(workspace, cfg, vcpkg_dir, libtorrent_dir)
     else:
         output = build_single_arch(workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir, args.platform)
 
