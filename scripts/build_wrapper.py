@@ -402,6 +402,7 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
             cmd.extend([
                 "-DCMAKE_SYSTEM_NAME=iOS",
                 "-DCMAKE_OSX_SYSROOT=iphoneos",
+                "-DCMAKE_OSX_ARCHITECTURES=arm64",
             ])
 
     # macOS 部署目标
