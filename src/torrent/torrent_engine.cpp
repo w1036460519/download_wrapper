@@ -701,8 +701,6 @@ namespace dw {
             while (g_running.load()) {
                 if (g_session) {
                     try {
-                        int total = 0, downloading = 0, finished = 0, seeding = 0, paused = 0;
-                        int downloading_meta = 0, checking = 0, checking_resume = 0;
                         for (const auto handles = g_session->get_torrents();
                              const auto &h: handles) {
                             try {
@@ -717,31 +715,9 @@ namespace dw {
                                                        | lt::torrent_handle::if_state_changed
                                                        | lt::torrent_handle::if_metadata_changed);
                                 }
-
-                                // 数量统计
-                                ++total;
-                                if (torrent_status.flags & lt::torrent_flags::paused) ++paused;
-                                else
-                                    switch (torrent_status.state) {
-                                        case lt::torrent_status::downloading: ++downloading;
-                                            break;
-                                        case lt::torrent_status::finished: ++finished;
-                                            break;
-                                        case lt::torrent_status::seeding: ++seeding;
-                                            break;
-                                        case lt::torrent_status::downloading_metadata: ++downloading_meta;
-                                            break;
-                                        case lt::torrent_status::checking_files: ++checking;
-                                            break;
-                                        case lt::torrent_status::checking_resume_data: ++checking_resume;
-                                            break;
-                                        default: break;
-                                    }
                             } catch (...) {
                             }
                         }
-                        // log_i("bt", "任务状态统计: 总数={} 下载中={} 元数据={} 校验={} 校验resume={} 已完成={} 做种={} 暂停={}", total,
-                              // downloading, downloading_meta, checking, checking_resume, finished, seeding, paused);
                     } catch (const std::exception &e) {
                         log_e("bt", "恢复数据定时请求异常: {}", e.what());
                     }
@@ -998,6 +974,7 @@ namespace dw {
             if (const lt::torrent_status st = handle.status(); !(st.flags & lt::torrent_flags::paused)) {
                 handle.unset_flags(lt::torrent_flags::auto_managed);
                 handle.pause();
+                g_session->post_torrent_updates();
             }
         } catch (const std::exception &e) {
             log_e(info_hash.c_str(), "handle 暂停失败: {}", e.what());
@@ -1018,8 +995,9 @@ namespace dw {
                 if (g_session) {
                     // 不删文件：不带任何 option，仅从 session 移除，
                     // 保留数据文件与 partfile（断点续传元数据）。
-                    const auto opt = delete_files ? lt::session::delete_files
-                                                  : lt::remove_flags_t{};
+                    const auto opt = delete_files
+                                         ? lt::session::delete_files
+                                         : lt::remove_flags_t{};
                     g_session->remove_torrent(handle, opt);
                 }
             } catch (const std::exception &e) {
