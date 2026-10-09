@@ -692,7 +692,7 @@ namespace dw {
                     } catch (...) {
                     }
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         }
 
@@ -900,6 +900,7 @@ namespace dw {
         lt::torrent_handle handle;
         try {
             handle = g_session->add_torrent(std::move(atp));
+            g_session->post_torrent_updates();
         } catch (const std::exception &e) {
             log_e("", "任务添加失败: {}", e.what());
             return dw_submit_result_t::failure(DW_REASON_ERROR, "任务添加失败");

@@ -214,7 +214,8 @@ namespace dw {
     /**
      * 内部日志输出。
      *
-     * func / line 由 log_i / log_d / log_e 函数模板自动捕获，直接调用时可为空/0。
+     * func / line 为调用点信息（方法名/行号）：当前临时关闭输出，
+     * log_at 恒传空串/0；恢复时还原 log_at 中的注释代码即可。
      */
     void log_message(dw_log_level_t level,
                      const char *message,
@@ -239,8 +240,11 @@ namespace dw {
     };
 
     /**
-     * 快捷日志公共实现（内部）：级别由参数指定，调用点位置取自 log_site。
+     * 快捷日志公共实现（内部）：级别由参数指定。
      * 使用 std::format 进行类型安全的格式化。
+     *
+     * 调用点输出（方法名/行号）当前临时关闭：不随日志外发，恢复时
+     * 还原下方注释代码即可（log_site 的 source_location 捕获机制保持不变）。
      */
     template<typename... Args>
     void log_at(dw_log_level_t level, log_site site, const char *fmt, const Args &... args) {
@@ -250,9 +254,10 @@ namespace dw {
         } else {
             msg = std::vformat(fmt, std::make_format_args(args...));
         }
-        log_message(level, msg.c_str(), site.trace_id,
-                    site.loc.function_name(),
-                    static_cast<int32_t>(site.loc.line()));
+        // log_message(level, msg.c_str(), site.trace_id,
+        //             site.loc.function_name(),
+        //             static_cast<int32_t>(site.loc.line()));
+        log_message(level, msg.c_str(), site.trace_id, "", 0);
     }
 
     /**

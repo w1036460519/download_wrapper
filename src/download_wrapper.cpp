@@ -71,8 +71,11 @@ namespace dw {
                 default: break;
             }
             const std::string time_str = utils::format_unix_ms(ts);
-            std::fprintf(stderr, "[wrapper][%s][%s] %s:%d %s: %s\n",
-                         lvl_str, time_str.c_str(), func ? func : "?", line, tid, message);
+            // 调用点输出（方法名/行号）临时关闭，恢复时还原下方注释代码。
+            // std::fprintf(stderr, "[wrapper][%s][%s] %s:%d %s: %s\n",
+            //              lvl_str, time_str.c_str(), func ? func : "?", line, tid, message);
+            std::fprintf(stderr, "[wrapper][%s][%s] %s: %s\n",
+                         lvl_str, time_str.c_str(), tid, message);
         }
     }
 } // namespace dw
