@@ -252,174 +252,82 @@ DW_API void dw_set_log_callback(const dw_log_cb cb) {
 /* ------------------------------------------------------------------ */
 
 DW_API char *dw_add_task(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        log_e("", "添加任务失败: 参数非法 d={} init={} params_json={}", d != nullptr, d && d->initialized.load(), params_json);
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
+    log_i("engine", "添加任务 params={}", params_json ? params_json : "null");
 
-    // 解析 JSON 参数
+    // 通用参数校验与解析
     dw::TaskParams params;
-    if (dw::parse_task_params(params_json, params) != 0) {
-        log_e("", "添加任务失败: JSON 解析失败");
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
+    if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        return err;
     }
 
-    const dw_protocol_t protocol = params.protocol;
-    const std::string &client_id = params.client_id;
-
-    if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
-        log_e("", "添加任务失败: 未知协议 protocol={}", static_cast<int>(protocol));
-        return dw::utils::dup_cstr(dw::make_error_response("未知协议"));
-    }
-    if (client_id.empty()) {
-        log_e("", "添加任务失败: client_id 为空");
-        return dw::utils::dup_cstr(dw::make_error_response("client_id 为空"));
-    }
-
-    // 确定 natural_key
-    const std::string task_key = (protocol == DW_PROTOCOL_HTTP) ? params.url : params.info_hash;
-    if (task_key.empty()) {
-        log_e(client_id.c_str(), "添加任务失败: natural_key 为空");
-        return dw::utils::dup_cstr(dw::make_error_response("natural_key 为空"));
-    }
-
-    log_i(task_key.c_str(), "添加任务开始：protocol={} client_id={}", dw::to_string(protocol), client_id);
-
+    auto *d = dw::global_downloader();
     dw::TaskManager *tm = d->task_manager.get();
     if (!tm) {
-        log_e(task_key.c_str(), "添加任务失败：TaskManager 未初始化");
-        return dw::utils::dup_cstr(dw::make_error_response("TaskManager 未初始化"));
+        log_e(params.natural_key.c_str(), "添加任务失败: 管理器未初始化");
+        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
     }
 
-    // save_path 回退链：任务级 > 配置级（TaskManager 持有）> 空（拒绝）
-    const std::string save_path = !params.save_path.empty()
-                                      ? params.save_path
-                                      : tm->save_path();
-    if (save_path.empty()) {
-        log_e(task_key.c_str(), "添加任务失败：save_path 未指定");
-        return dw::utils::dup_cstr(dw::make_error_response("save_path 未指定"));
-    }
-    // 更新参数的 save_path
-    params.save_path = save_path;
-
-    auto out_result = tm->add(params);
-    if (out_result.code != DW_REASON_NONE) {
-        log_e(task_key.c_str(), "添加任务失败: code={}", static_cast<int>(out_result.code));
-        return dw::utils::dup_cstr(
-            dw::make_error_response(out_result.message.empty() ? "添加失败" : out_result.message));
-    }
-
-    log_i(task_key.c_str(), "添加任务完成");
-
-    // BT 任务保存来源（magnet/torrent 用于 resume data 未生成时的兜底恢复）
-    if (protocol == DW_PROTOCOL_TORRENT) {
-        if (!params.magnet_link.empty() || !params.torrent_file.empty()) {
-            tm->save_resume_source(client_id.c_str(), protocol, task_key.c_str(),
-                                   save_path, params.magnet_link, params.torrent_file);
-        }
-    }
-
-    return dw::result_to_json(std::move(out_result));
+    auto result = tm->add(params);
+    log_i(params.natural_key.c_str(), "添加任务完成: {}", boost::json::serialize(to_json(result)));
+    return dw::result_to_json(std::move(result));
 }
 
 DW_API char *dw_pause_task(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        log_e("", "暂停任务失败: 参数非法");
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
+    log_i("engine", "暂停任务 params={}", params_json ? params_json : "null");
 
     dw::TaskParams params;
-    if (dw::parse_task_params(params_json, params) != 0) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (params.client_id.empty() || params.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
+    if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        return err;
     }
 
-    const std::string &nk = params.natural_key;
-    log_i(nk.c_str(), "暂停任务开始: protocol={} client_id={}", dw::to_string(params.protocol), params.client_id);
-
+    const auto *d = dw::global_downloader();
     auto *tm = d->task_manager.get();
     if (!tm) {
-        log_e(nk.c_str(), "暂停任务失败: 路由失败");
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
+        log_e(params.natural_key.c_str(), "暂停任务失败: 管理器未初始化");
+        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
     }
 
     auto result = tm->pause(params);
-    if (result.code != DW_REASON_NONE) {
-        log_e(nk.c_str(), "暂停任务失败: {}", result.message);
-        return dw::utils::dup_cstr(dw::make_error_response(result.message));
-    }
-    log_i(nk.c_str(), "暂停任务完成");
+    log_i(params.natural_key.c_str(), "暂停任务完成: {}", boost::json::serialize(to_json(result)));
     return dw::result_to_json(std::move(result));
 }
 
 DW_API char *dw_resume_task(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        log_e("", "恢复任务失败: 参数非法");
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
+    log_i("engine", "恢复任务 params={}", params_json ? params_json : "null");
 
     dw::TaskParams params;
-    if (dw::parse_task_params(params_json, params) != 0) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (params.client_id.empty() || params.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
+    if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        return err;
     }
 
-    const std::string &nk = params.natural_key;
-    log_i(nk.c_str(), "恢复任务开始: protocol={} client_id={}", dw::to_string(params.protocol), params.client_id);
-
+    const auto *d = dw::global_downloader();
     auto *tm = d->task_manager.get();
     if (!tm) {
-        log_e(nk.c_str(), "恢复任务失败: 路由失败");
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
+        log_e(params.natural_key.c_str(), "恢复任务失败: 管理器未初始化");
+        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
     }
 
     auto result = tm->resume(params);
-    if (result.code != DW_REASON_NONE) {
-        log_e(nk.c_str(), "恢复任务失败: {}", result.message);
-        return dw::utils::dup_cstr(dw::make_error_response(result.message));
-    }
-    log_i(nk.c_str(), "恢复任务完成");
+    log_i(params.natural_key.c_str(), "恢复任务完成: {}", boost::json::serialize(to_json(result)));
     return dw::result_to_json(std::move(result));
 }
 
 DW_API char *dw_delete_task(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        log_e("", "删除任务失败: 参数非法");
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
+    log_i("engine", "删除任务 params={}", params_json ? params_json : "null");
 
     dw::TaskParams params;
-    if (dw::parse_task_params(params_json, params) != 0) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
+    if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        return err;
     }
-    if (params.client_id.empty() || params.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
-    }
-
-    const std::string &nk = params.natural_key;
-    log_i(nk.c_str(), "删除任务开始: protocol={} client_id={} delete_files={}", dw::to_string(params.protocol),
-          params.client_id, params.delete_files);
-
+    const auto *d = dw::global_downloader();
     auto *tm = d->task_manager.get();
     if (!tm) {
-        log_e(nk.c_str(), "删除任务失败: 路由失败");
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
+        log_e(params.natural_key.c_str(), "删除任务失败: 管理器未初始化");
+        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
     }
 
     auto result = tm->remove(params);
-    if (result.code != DW_REASON_NONE) {
-        log_e(nk.c_str(), "删除任务失败: {}", result.message);
-        return dw::utils::dup_cstr(dw::make_error_response(result.message));
-    }
-    log_i(nk.c_str(), "删除任务完成");
+    log_i(params.natural_key.c_str(), "删除任务完成: {}",boost::json::serialize(to_json(result)));
     return dw::result_to_json(std::move(result));
 }
 

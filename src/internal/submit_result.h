@@ -77,7 +77,7 @@ namespace dw {
 
     /// dw_submit_result_t → JSON char*（移动语义接管 files 所有权）
     inline char *result_to_json(dw_submit_result_t &&result) {
-        auto resp = to_json(result);
+        const auto resp = to_json(result);
         return utils::dup_cstr(boost::json::serialize(resp));
     }
 } // namespace dw

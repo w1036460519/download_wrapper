@@ -128,6 +128,10 @@ namespace dw {
                 parsed          INTEGER DEFAULT 0,             -- 元数据已解析标志
                 task_protocol   INTEGER,
                 task_natural_key TEXT,
+                url             TEXT NOT NULL DEFAULT '',  -- 任务元数据：HTTP 源地址
+                info_hash       TEXT NOT NULL DEFAULT '',  -- 任务元数据：BT info hash
+                magnet_link     TEXT NOT NULL DEFAULT '',  -- 任务元数据：BT 磁力链接
+                torrent_file    TEXT NOT NULL DEFAULT '',  -- 任务元数据：BT 种子文件路径
                 status          INTEGER DEFAULT 0,
                 total_size      INTEGER DEFAULT -1,
                 total_done      INTEGER DEFAULT 0,
@@ -201,6 +205,15 @@ namespace dw {
         sqlite3_exec(db_,
                      "ALTER TABLE file_records ADD COLUMN priority_file_indexes TEXT NOT NULL DEFAULT '';",
                      nullptr, nullptr, nullptr);
+        // 存量库迁移：补建任务元数据列（url / info_hash / magnet_link / torrent_file），同上述忽略重复。
+        for (const char *ddl: {
+                 "ALTER TABLE file_records ADD COLUMN url TEXT NOT NULL DEFAULT '';",
+                 "ALTER TABLE file_records ADD COLUMN info_hash TEXT NOT NULL DEFAULT '';",
+                 "ALTER TABLE file_records ADD COLUMN magnet_link TEXT NOT NULL DEFAULT '';",
+                 "ALTER TABLE file_records ADD COLUMN torrent_file TEXT NOT NULL DEFAULT '';",
+             }) {
+            sqlite3_exec(db_, ddl, nullptr, nullptr, nullptr);
+        }
     }
 
     void TaskStore::remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const {
@@ -238,6 +251,7 @@ namespace dw {
         constexpr auto sql = R"(
             UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name,
                 root_name=:root_name, full_path=:full_path, file_type=:file_type, ext=:ext,
+                url=:url, info_hash=:info_hash, magnet_link=:magnet_link, torrent_file=:torrent_file,
                 status=:status, total_size=:total_size, total_done=:total_done,
                 reason=:reason, message=:message, priority_file_indexes=:priority_file_indexes,
                 modified_at=:modified_at
@@ -251,6 +265,10 @@ namespace dw {
         bind_text(st, ":full_path", rec.full_path);
         bind_int(st, ":file_type", rec.file_type ? 1 : 0);
         bind_text_or_null(st, ":ext", rec.ext);
+        bind_text(st, ":url", rec.url);
+        bind_text(st, ":info_hash", rec.info_hash);
+        bind_text(st, ":magnet_link", rec.magnet_link);
+        bind_text(st, ":torrent_file", rec.torrent_file);
         bind_int(st, ":status", rec.status);
         bind_int64(st, ":total_size", rec.total_size);
         bind_int64(st, ":total_done", rec.total_done);
@@ -366,6 +384,10 @@ namespace dw {
             r.parsed = cm.getInt("parsed") != 0;
             r.task_protocol = static_cast<dw_protocol_t>(cm.getInt("task_protocol"));
             r.task_natural_key = cm.getText("task_natural_key");
+            r.url = cm.getText("url");
+            r.info_hash = cm.getText("info_hash");
+            r.magnet_link = cm.getText("magnet_link");
+            r.torrent_file = cm.getText("torrent_file");
             r.status = cm.getInt("status");
             r.total_size = cm.getInt64("total_size");
             r.total_done = cm.getInt64("total_done");
@@ -432,10 +454,14 @@ namespace dw {
         if (r.modified_at == 0) r.modified_at = now;
         constexpr auto sql = R"(
             INSERT INTO file_records (client_id, type, is_remote, save_path, original_root_name, root_name,
-                full_path, file_type, ext, parsed, task_protocol, task_natural_key, status, total_size, total_done,
+                full_path, file_type, ext, parsed, task_protocol, task_natural_key,
+                url, info_hash, magnet_link, torrent_file,
+                status, total_size, total_done,
                 priority, reason, message, priority_file_indexes, created_at, modified_at)
             VALUES (:client_id, :type, :is_remote, :save_path, :original_root_name, :root_name,
-                :full_path, :file_type, :ext, :parsed, :task_protocol, :task_natural_key, :status, :total_size, :total_done,
+                :full_path, :file_type, :ext, :parsed, :task_protocol, :task_natural_key,
+                :url, :info_hash, :magnet_link, :torrent_file,
+                :status, :total_size, :total_done,
                 :priority, :reason, :message, :priority_file_indexes, :created_at, :modified_at);
         )";
         sqlite3_stmt *st = nullptr;
@@ -464,6 +490,10 @@ namespace dw {
         bind_int(st, ":reason", r.reason);
         bind_text(st, ":message", r.message);
         bind_text(st, ":priority_file_indexes", utils::join_ints(r.priority_file_indexes));
+        bind_text(st, ":url", r.url);
+        bind_text(st, ":info_hash", r.info_hash);
+        bind_text(st, ":magnet_link", r.magnet_link);
+        bind_text(st, ":torrent_file", r.torrent_file);
         bind_int64(st, ":created_at", r.created_at);
         bind_int64(st, ":modified_at", r.modified_at);
         sqlite3_step(st);

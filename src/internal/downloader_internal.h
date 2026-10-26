@@ -333,4 +333,47 @@ namespace dw {
         }
         return {};
     }
+
+    /**
+     * 通用任务参数校验与解析。
+     *
+     * 校验流程：
+     * 1. 检查下载器是否已初始化
+     * 2. 检查 params_json 是否为空
+     * 3. 解析 JSON 参数到 TaskParams
+     * 4. 校验协议类型（HTTP/TORRENT）
+     * 5. 校验 client_id 是否为空
+     *
+     * @param params_json 输入的 JSON 参数字符串
+     * @param out_params 输出参数：解析成功时填充 TaskParams
+     * @return nullptr 表示校验成功；非空表示错误响应 JSON（调用方负责释放）
+     */
+    inline char *validate_and_parse_task_params(const char *params_json, TaskParams &out_params) {
+        auto *d = global_downloader();
+        if (!d || !d->initialized.load() || !params_json) {
+            log_e("engine", "参数校验失败: engine={} params_json={}",
+                  !d || !d->initialized.load() ? "未初始化" : "已初始化", params_json);
+            return utils::dup_cstr(make_error_response("参数非法"));
+        }
+
+        if (parse_task_params(params_json, out_params) != 0) {
+            log_e("engine", "参数解析失败: json={}", params_json);
+            return utils::dup_cstr(make_error_response("参数解析失败"));
+        }
+
+        const dw_protocol_t protocol = out_params.protocol;
+        const std::string &client_id = out_params.client_id;
+
+        if (protocol != DW_PROTOCOL_HTTP && protocol != DW_PROTOCOL_TORRENT) {
+            log_e("engine", "未知协议: protocol={}", static_cast<int>(protocol));
+            return utils::dup_cstr(make_error_response("未知协议"));
+        }
+
+        if (client_id.empty()) {
+            log_e("engine", "客户端标识为空");
+            return utils::dup_cstr(make_error_response("客户端标识为空"));
+        }
+
+        return nullptr; // 校验成功
+    }
 } // namespace dw

@@ -32,6 +32,12 @@ namespace dw {
         std::string ext; // 文件后缀（不含点，如 "mp4"）；目录为空
         bool parsed = false; // 元数据已解析（PARSED 事件后为 true）
 
+        // 任务元数据（添加任务时回填，供恢复 / 重试 / 详情展示；按协议各自留空）
+        std::string url; // HTTP 任务源地址；BT 任务为空
+        std::string info_hash; // BT info hash（v1=40 位 / v2=64 位 hex）；HTTP 任务为空
+        std::string magnet_link; // BT 磁力链接；种子文件任务为空
+        std::string torrent_file; // BT 种子文件路径；磁力任务为空
+
         // 任务关联（无关联时 protocol=LOCAL、natural_key 为空）
         dw_protocol_t task_protocol = DW_PROTOCOL_LOCAL;
         std::string task_natural_key; // 关联任务的 natural_key
@@ -86,6 +92,10 @@ namespace dw {
         obj["file_type"] = r.file_type;
         obj["ext"] = r.ext;
         obj["parsed"] = r.parsed;
+        obj["url"] = r.url;
+        obj["info_hash"] = r.info_hash;
+        obj["magnet_link"] = r.magnet_link;
+        obj["torrent_file"] = r.torrent_file;
         obj["task_protocol"] = static_cast<int>(r.task_protocol);
         obj["task_natural_key"] = r.task_natural_key;
         obj["status"] = r.status;

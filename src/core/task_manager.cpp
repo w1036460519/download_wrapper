@@ -132,7 +132,7 @@ namespace dw {
     /* ================================================================== */
 
     dw_submit_result_t TaskManager::add(TaskParams &params) {
-        log_i("manager", "添加任务[{}]", to_json_string(params));
+        log_i(params.natural_key.c_str(), "添加任务[{}]", to_json_string(params));
         if (params.natural_key.empty()) {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "natural_key 为空");
         }
@@ -151,41 +151,56 @@ namespace dw {
         const dw_protocol_t proto = params.protocol;
         const std::string &client_id = params.client_id;
         const std::string &natural_key = params.natural_key;
-        if (params.save_path.empty()) {
-            params.save_path = config_.save_path;
+
+        if (natural_key.empty()) {
+            log_e(natural_key.c_str(), "添加任务失败: 唯一标识不能为空");
+            return dw_submit_result_t::failure(DW_REASON_INVALID_INPUT, "任务参数缺失");
+        }
+
+        params.save_path = config_.save_path;
+
+        IDownloadEngine *eng = engine_of(proto);
+        dw_submit_result_t result = eng->add_task(&params);
+        log_i(natural_key.c_str(), "引擎添加任务:{}", boost::json::serialize(to_json(result)));
+        if (result.code != DW_REASON_NONE) {
+            log_e(natural_key.c_str(), "添加任务失败: code={} message={}", static_cast<int>(result.code), result.message);
+            return result;
         }
 
         {
             std::scoped_lock lock(mtx_);
+            const int64_t now = now_unix_ms();
 
             if (FileRecord *rec = load_task_record(client_id, proto, natural_key)) {
-                // 任务已存在：更新修改时间，重置状态为 QUEUED
-                rec->modified_at = now_unix_ms();
-                rec->status = DW_TASK_STATUS_QUEUED;
+                rec->modified_at = now;
+                rec->status = DW_TASK_STATUS_RESOLVING;
                 rec->dirty = true;
                 store_.touch_file_record(client_id, proto, natural_key);
+                log_i(natural_key.c_str(), "任务已存在");
             } else {
                 FileRecord task_record;
                 task_record.client_id = client_id;
                 task_record.task_protocol = proto;
                 task_record.task_natural_key = natural_key;
                 task_record.save_path = params.save_path;
+                task_record.url = params.url;
+                task_record.info_hash = params.info_hash;
+                task_record.magnet_link = params.magnet_link;
+                task_record.torrent_file = params.torrent_file;
                 task_record.type = (proto == DW_PROTOCOL_TORRENT) ? DW_SOURCE_REMOTE_FILE : DW_SOURCE_TASK_FILE;
                 task_record.is_remote = true;
-                task_record.status = DW_TASK_STATUS_QUEUED;
-                task_record.created_at = now_unix_ms();
-                task_record.modified_at = task_record.created_at;
-                // 文件选择持久化：BT 任务以 default_dont_download 添加（初始全部不下载），
-                // 调度派发依赖此字段定型下载范围；空列表语义为全部下载。
+                task_record.status = DW_TASK_STATUS_RESOLVING;
+                task_record.created_at = now;
+                task_record.modified_at = now;
                 task_record.priority_file_indexes = params.file_indexes;
                 store_.insert_file_record(task_record);
-                // 新任务必须同步注册进内存调度表：scheduler_loop 只遍历 tasks_，
-                // 漏注册会导致任务对调度器不可见（永远 QUEUED），仅重启后经 start() 加载才恢复。
                 register_task(std::move(task_record));
+                log_i(natural_key.c_str(), "添加新任务");
             }
         }
 
-        return dw_submit_result_t::success();
+        log_i(natural_key.c_str(), "添加任务完成");
+        return result;
     }
 
     dw_submit_result_t TaskManager::pause(const TaskParams &params) {
@@ -198,20 +213,18 @@ namespace dw {
     }
 
     dw_submit_result_t TaskManager::self_pause(const TaskParams &params) {
-        if (IDownloadEngine *eng = engine_of(params.protocol)) {
-            auto result = eng->pause_task(params.natural_key, params.client_id);
-            if (result.code == 0) {
-                // 暂停成功：重置速率并标记脏推送，避免恢复后展示上次的速率
-                std::scoped_lock lock(mtx_);
-                if (FileRecord *rec = load_task_record(params.client_id, params.protocol, params.natural_key)) {
-                    rec->download_rate = 0.0;
-                    rec->upload_rate = 0.0;
-                    rec->dirty = true;
-                }
+        IDownloadEngine *eng = engine_of(params.protocol);
+        auto result = eng->pause_task(params.natural_key, params.client_id);
+        if (result.code == DW_REASON_NONE) {
+            std::scoped_lock lock(mtx_);
+            if (FileRecord *rec = load_task_record(params.client_id, params.protocol, params.natural_key)) {
+                rec->download_rate = 0.0;
+                rec->upload_rate = 0.0;
+                rec->status = DW_TASK_STATUS_PAUSED;
+                rec->dirty = true;
             }
-            return result;
         }
-        return dw_submit_result_t::failure(DW_REASON_ERROR, "下载引擎不可用");
+        return result;
     }
 
     dw_submit_result_t TaskManager::remote_pause(const TaskParams & /*params*/) const {
@@ -245,7 +258,6 @@ namespace dw {
             rec->force = params.force;
             rec->status = DW_TASK_STATUS_QUEUED;
             rec->dirty = true;
-            store_.update_file_record(*rec);
         }
         return dw_submit_result_t::success();
     }
@@ -265,10 +277,11 @@ namespace dw {
 
     dw_submit_result_t TaskManager::self_remove(const TaskParams &params) {
         if (params.protocol == DW_PROTOCOL_LOCAL) {
-            FileRecord *tr = load_task_record(params.client_id, DW_PROTOCOL_LOCAL, params.natural_key);
-            if (!tr) return dw_submit_result_t::failure(DW_REASON_ERROR, "任务不存在");
-            tr->is_delete = true;
-            tr->dirty = true;
+            if (FileRecord *tr = load_task_record(params.client_id, DW_PROTOCOL_LOCAL, params.natural_key)) {
+                tr->status = DW_TASK_STATUS_DELETING;
+                tr->is_delete = true;
+                tr->dirty = true;
+            }
             return dw_submit_result_t::success();
         }
         const int32_t delete_files = params.delete_files ? 1 : 0;
@@ -276,24 +289,27 @@ namespace dw {
         const std::string &client_id = params.client_id;
         const std::string &natural_key = params.natural_key;
         dw_submit_result_t result = dw_submit_result_t::success();
-        if (IDownloadEngine *eng = engine_of(protocol)) {
-            result = eng->delete_task(natural_key, client_id, delete_files);
-        }
-        // 引擎 success 涵盖两种情况：任务已提交移出 session，或任务本来就
-        // 不在 session（handle 构建失败）。后者不会产生 torrent_removed /
-        // torrent_deleted_alert，DELETED 事件永不投递。
-        // 改为事件驱动：设 is_delete + dirty，由 maintenance_loop 推送删除标识给前端，
-        // 推送后再从内存与 DB 清除。DELETED 事件（若到达）仅负责文件清理。
         {
             std::scoped_lock lock(mtx_);
             if (FileRecord *tr = load_task_record(client_id, protocol, natural_key)) {
-                tr->is_delete = true;
-                tr->dirty = true; // 触发 maintenance_loop 推送删除标识
+                tr->status = DW_TASK_STATUS_DELETING;
+                tr->dirty = true;
             }
         }
-        // 文件清理由 DELETED 事件处理（libtorrent remove_torrent(Delete_files) 负责数据文件，
-        // DELETED handler 负责包装目录）。任务不在 session 时 DELETED 不投递，
-        // 但 remove_torrent 也未执行，无文件需清理。
+        IDownloadEngine *eng = engine_of(protocol);
+        result = eng->delete_task(natural_key, client_id, delete_files);
+        if (result.code != DW_REASON_NONE) {
+            {
+                std::scoped_lock lock(mtx_);
+                if (FileRecord *tr = load_task_record(client_id, protocol, natural_key)) {
+                    tr->status = DW_TASK_STATUS_FAIL;
+                    tr->is_delete = true;
+                    tr->dirty = true;
+                }
+            }
+        }
+
+
         return result;
     }
 
@@ -436,17 +452,13 @@ namespace dw {
                     rec->full_path = effective_name.empty()
                                          ? event.save_path
                                          : (std::filesystem::path(event.save_path) / effective_name).string();
-                    rec->dirty = true;
-
                     log_i(key.c_str(), "解析完成[{}]", to_json_string(rec));
                 } else {
                     // 已解析
                     log_i(key.c_str(), "已解析完成[{}]", to_json_string(rec));
                 }
-                if (IDownloadEngine *eng = engine_of(rec->task_protocol)) {
-                    log_i(key.c_str(), "解析后派发[proto={}]", static_cast<int>(rec->task_protocol));
-                    eng->resume_task(rec->task_natural_key, rec->client_id, rec->priority_file_indexes);
-                }
+                rec->status = DW_TASK_STATUS_QUEUED;
+                rec->dirty = true;
                 break;
             }
             case EngineEventType::DOWNLOAD_FAILED: {
@@ -463,13 +475,6 @@ namespace dw {
                 rec->download_rate = event.download_rate;
                 rec->upload_rate = event.upload_rate;
                 rec->support_range = event.support_range;
-                // QUEUED 是调度器权威态：self_resume 准入后、scheduler 派发前，
-                // status_loop 周期性的 state_update（对 paused torrent 持续回
-                // PAUSED）不得把已准入任务打回，否则任务永卡暂停、调度器
-                // 不再扫描。派发后状态仍由后续事件正常覆盖。
-                if (rec->status != DW_TASK_STATUS_QUEUED) {
-                    rec->status = event.status;
-                }
                 rec->reason = event.reason;
                 rec->message = event.message;
                 if (!event.etag.empty()) rec->etag = event.etag;
@@ -478,9 +483,6 @@ namespace dw {
                 break;
             }
             case EngineEventType::DELETED: {
-                // 文件清理：libtorrent remove_torrent(Delete_files) 负责数据文件，
-                // 这里负责包装目录兜底。记录状态由 self_remove 已设 is_delete+dirty，
-                // maintenance_loop 推送删除标识后统一清除内存与 DB。
                 log_i(key.c_str(), "任务删除完成");
                 if (event.delete_files) {
                     const std::string save_path = rec->save_path;
@@ -489,6 +491,8 @@ namespace dw {
                     remove_data_directory(save_path, root_name, original_root_name);
                     log_i(key.c_str(), "文件删除成功");
                 }
+                rec->is_delete = true;
+                rec->dirty = true;
                 break;
             }
             case EngineEventType::FILE_PROGRESS: {
@@ -506,6 +510,9 @@ namespace dw {
                 break;
             }
             case EngineEventType::FILE_COMPLETED: {
+                rec->status = DW_TASK_STATUS_COMPLETED;
+                rec->total_done = rec->total_size;
+                rec->dirty = true;
                 store_.mark_file_complete(rec->client_id, rec->task_protocol,
                                           rec->task_natural_key, event.file_index);
                 break;
@@ -603,7 +610,8 @@ namespace dw {
                         if (!best) break;
 
                         if (IDownloadEngine *eng = engine_of(best->task_protocol)) {
-                            log_i(best->task_natural_key.c_str(), "调度派发[proto={}]", static_cast<int>(best->task_protocol));
+                            log_i(best->task_natural_key.c_str(), "调度派发[proto={}]",
+                                  static_cast<int>(best->task_protocol));
                             eng->resume_task(best->task_natural_key, config_.client_id, best->priority_file_indexes);
                             best->force = false;
                             // 派发即占用调度名额：resume_task 的状态回写经引擎事件异步完成，
@@ -891,17 +899,14 @@ namespace dw {
     void TaskManager::remove_data_directory(const std::string &save_path,
                                             const std::string &root_name,
                                             const std::string &original_root_name) {
-        // 删除前规范化并校验目标仍位于 save_path 之内：目录名来自种子元
-        // 数据与账本记录，恶意种子 name 或异常记录可借 ../、绝对路径逃逸
-        // save_path 误删目录外数据。校验不过静默跳过，与整段兑底逻辑的
-        // 容错语义一致（重复删除幂等）。
         std::error_code ec;
         const std::filesystem::path base = std::filesystem::path(save_path).lexically_normal();
         for (const std::string &name: {root_name, original_root_name}) {
             if (name.empty()) continue;
             const std::filesystem::path target = (base / name).lexically_normal();
-            const std::filesystem::path rel = target.lexically_relative(base);
-            if (rel.empty() || std::filesystem::path("..") == *rel.begin()) continue;
+            if (const std::filesystem::path rel = target.lexically_relative(base);
+                rel.empty() || std::filesystem::path("..") == *rel.begin())
+                continue;
             std::filesystem::remove_all(target, ec);
         }
     }
