@@ -12,8 +12,11 @@
 
 #include <cstdint>
 #include <vector>
+#include <mutex>
+#include "core/task.h"
 
 namespace dw {
+class TaskStore;
 
 /**
  * BT/Torrent 下载引擎（IDownloadEngine 实现）。
@@ -29,6 +32,16 @@ public:
 
     TorrentEngine(const TorrentEngine&)            = delete;
     TorrentEngine& operator=(const TorrentEngine&) = delete;
+
+    /// 按 task.info_hash 注册，相同键覆盖原记录，不产生重复任务。
+    static bool register_task(Task task);
+
+    /// 查询内存任务，未找到返回 nullptr。
+    /// 返回指针仅在调用方持有 tasks_mutex() 时可安全使用，禁止无锁保存或修改。
+    static Task *get_task(const std::string &info_hash);
+
+    /// 可重入锁，允许持锁业务调用 register_task/get_task。
+    static std::recursive_mutex &tasks_mutex();
 
     /**
      * 初始化引擎。
@@ -151,6 +164,7 @@ public:
     static void post_error(const std::string &key, const std::string &message);
 
 private:
+    TaskStore *task_store_ = nullptr; // 复用存储连接，保存直接调用存储层。
     bool initialized_ = false;
 };
 

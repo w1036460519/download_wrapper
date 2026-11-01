@@ -22,7 +22,9 @@
 #include "download_wrapper/download_wrapper.h"
 #include "internal/downloader_internal.h"
 #include "task_record.h"
-#include "task_store.h"
+#include "store/task_store.h"
+#include "store/task_bt_resume_store.h"
+#include "sqlite_database.h"
 #include "utils/memory_util.h"
 
 #include <atomic>
@@ -91,7 +93,7 @@ namespace dw {
                                 const std::string &save_path,
                                 const std::string &magnet_link, const std::string &torrent_file);
         /// 一次性加载全部恢复信息（data + magnet + torrent）。
-        TaskStore::ResumeInfo load_resume_info(const std::string &client_id, dw_protocol_t proto,
+        LegacyTaskStore::ResumeInfo load_resume_info(const std::string &client_id, dw_protocol_t proto,
                                                const std::string &natural_key);
 
         /// 按 (client_id, proto, natural_key) 查询任务记录：内存优先，DB 命中时注册入内存。
@@ -166,7 +168,9 @@ namespace dw {
         /// 返回内部互斥锁引用，供调用方持锁期间安全访问 store_。
         std::recursive_mutex &get_mutex() { return mtx_; }
         /// 返回持久化存储层引用（调用方须持 mtx_ 保证线程安全）。
-        TaskStore &get_store() { return store_; }
+        LegacyTaskStore &get_store() { return store_; }
+        TaskStore &get_task_store() { return task_store_; }
+        TaskBtResumeStore &get_bt_resume_store() { return bt_resume_store_; }
 
     private:
         /// 本机任务添加（入队等待调度）。
@@ -241,7 +245,10 @@ namespace dw {
         boost::asio::io_context event_ioc_;
         std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> event_work_guard_;
 
-        TaskStore store_; // 持久化存储层（持有 sqlite3 连接，析构自动关闭）
+        SqliteDatabase database_; // 统一连接生命周期，先于 store 构造、后于 store 析构。
+        TaskStore task_store_{database_.connection()};
+        TaskBtResumeStore bt_resume_store_{database_.connection()};
+        LegacyTaskStore store_{database_.connection()}; // 借用连接，仅负责表和数据操作。
         std::thread worker_; // A 线程：任务调度准入（stop() 显式 join）
         std::thread maintenance_; // B 线程：持久化 + JSON 推送 + sweep
         std::thread event_consumer_; // C 线程：引擎事件阻塞消费（投递即响应）

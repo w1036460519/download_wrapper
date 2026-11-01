@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include "protocol.h"
+#include "task.h"
 
 #include <cstdint>
 #include <string>
@@ -19,63 +19,11 @@
 #include <boost/json.hpp>
 
 namespace dw {
-    struct FileRecord {
-        int64_t id = 0; // 自增主键（0=未落库）
-        std::string client_id; // 客户端标识
-        dw_source_t type = DW_SOURCE_LOCAL_FILE; // 任务类型：0=文件任务 1=HTTP任务 2=BT任务
-        bool is_remote = false; // 远程标识
-        std::string save_path; // 保存路径
-        std::string original_root_name; // 重名/包装前的原始目录/文件名（未重名时与 root_name 相同）
-        std::string root_name; // 根目录/文件名（重名/包装后的最终名称）
-        std::string full_path; // 磁盘根实体全路径（save_path/root_name）；占位空串，PARSED 回填
-        bool file_type = true; // true=目录 false=文件
-        std::string ext; // 文件后缀（不含点，如 "mp4"）；目录为空
-        bool parsed = false; // 元数据已解析（PARSED 事件后为 true）
-
-        // 任务元数据（添加任务时回填，供恢复 / 重试 / 详情展示；按协议各自留空）
-        std::string url; // HTTP 任务源地址；BT 任务为空
-        std::string info_hash; // BT info hash（v1=40 位 / v2=64 位 hex）；HTTP 任务为空
-        std::string magnet_link; // BT 磁力链接；种子文件任务为空
-        std::string torrent_file; // BT 种子文件路径；磁力任务为空
-
-        // 任务关联（无关联时 protocol=LOCAL、natural_key 为空）
-        dw_protocol_t task_protocol = DW_PROTOCOL_LOCAL;
-        std::string task_natural_key; // 关联任务的 natural_key
-
-        // 任务状态持久化（权威列：状态迁移即时写，进度经节流同步）
-        int32_t status = 0; // 任务状态（dw_task_status_t）
-        int64_t total_size = -1; // 总字节
-        int64_t total_done = 0; // 已完成字节
-        int32_t priority = 0; // 队列优先级（越大越优先）
-        int32_t reason = 0; // 错误原因码（dw_reason_t）；仅 ERROR 态有效
-        std::string message; // 错误文本 / 状态描述
-
-        int64_t created_at = 0; // Unix 毫秒
-        int64_t modified_at = 0; // Unix 毫秒
-
-        // ---- 非持久化运行时字段（仅内存态，不入库） ----
-        int32_t support_range = 0; // 服务端 Range 支持：0=不支持，1=支持
-        std::string etag; // 响应 ETag
-        std::string last_modified; // 响应 Last-Modified
-        std::vector<int32_t> file_indexes; // 文件索引列表
-        std::vector<int32_t> priority_file_indexes; // 优先下载文件索引
-        bool force = false; // 强制准入标记（调度器让行后自动清除）
-        bool dirty = false; // 数据已变更待同步（持久化 + 推送 app）
-        bool is_delete = false;
-
-        // 运行态遥测（不持久化）
-        double download_rate = 0.0; // 下载速率（B/s）
-        double upload_rate = 0.0; // 上传速率（B/s）；HTTP 恒为 0
-
-        /// 是否关联了下载任务（非本地文件）。
-        bool has_task() const {
-            return task_protocol != DW_PROTOCOL_LOCAL && !task_natural_key.empty();
-        }
-
-        /// 任务主键 union_id（client_id|protocol|natural_key）
-        std::string union_id() const {
-            return client_id + '|' + to_string(task_protocol) + '|' + task_natural_key;
-        }
+    // 迁移期旧表保留旧关联字段，新 Task 不再携带这些字段。
+    struct FileRecord : Task {
+        dw_source_t type = DW_SOURCE_LOCAL_FILE;
+        std::string task_natural_key;
+        std::vector<int32_t> file_indexes;
     };
 
     /// FileRecord → JSON 对象（日志输出用）

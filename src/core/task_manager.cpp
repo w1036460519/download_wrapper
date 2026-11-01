@@ -73,11 +73,16 @@ namespace dw {
         const std::string story_path = dir + "/leopard_tasks.db";
 
         std::scoped_lock lock(mtx_);
-        if (!store_.open(story_path)) {
+        if (!database_.open(story_path)) {
             log_e("manager", "下载器数据加载失败: {}", story_path);
             return -1;
         }
         store_.init_schema();
+        if (!task_store_.init_schema() || !bt_resume_store_.init_schema()) {
+            log_e("manager", "任务表初始化失败");
+            database_.close();
+            return -1;
+        }
         {
             // 加载进行中的任务（调度器需要感知的活跃任务）
             const std::vector<dw_protocol_t> active_protocols = {
@@ -123,7 +128,7 @@ namespace dw {
         }
 
         std::scoped_lock lock(mtx_);
-        store_.close();
+        database_.close();
         log_i("manager", "下载器已停止");
     }
 
@@ -302,7 +307,7 @@ namespace dw {
             {
                 std::scoped_lock lock(mtx_);
                 if (FileRecord *tr = load_task_record(client_id, protocol, natural_key)) {
-                    tr->status = DW_TASK_STATUS_FAIL;
+                    tr->status = DW_TASK_STATUS_PAUSED;
                     tr->is_delete = true;
                     tr->dirty = true;
                 }
@@ -326,7 +331,7 @@ namespace dw {
         store_.save_resume_source(client_id, proto, natural_key, save_path, magnet_link, torrent_file);
     }
 
-    TaskStore::ResumeInfo TaskManager::load_resume_info(const std::string &client_id, const dw_protocol_t proto,
+    LegacyTaskStore::ResumeInfo TaskManager::load_resume_info(const std::string &client_id, const dw_protocol_t proto,
                                                         const std::string &natural_key) {
         std::scoped_lock lock(mtx_);
         return store_.load_resume_info(client_id, proto, natural_key);
@@ -462,8 +467,7 @@ namespace dw {
                 break;
             }
             case EngineEventType::DOWNLOAD_FAILED: {
-                const bool retryable = (event.reason == DW_REASON_FAIL);
-                rec->status = retryable ? DW_TASK_STATUS_FAIL : DW_TASK_STATUS_ERROR;
+                rec->status = DW_TASK_STATUS_PAUSED;
                 rec->reason = event.reason;
                 rec->message = event.message;
                 rec->dirty = true;
@@ -483,13 +487,11 @@ namespace dw {
                 break;
             }
             case EngineEventType::DELETED: {
-                log_i(key.c_str(), "任务删除完成");
                 if (event.delete_files) {
                     const std::string save_path = rec->save_path;
                     const std::string root_name = rec->root_name;
                     const std::string original_root_name = rec->original_root_name;
                     remove_data_directory(save_path, root_name, original_root_name);
-                    log_i(key.c_str(), "文件删除成功");
                 }
                 rec->is_delete = true;
                 rec->dirty = true;
@@ -669,7 +671,7 @@ namespace dw {
             if (!dirty_records.empty()) {
                 std::scoped_lock lock(mtx_);
                 for (const auto &rec: dirty_records) {
-                    if (auto it = tasks_.find(rec.union_id()); it != tasks_.end()) {
+                    if (auto it = tasks_.find((rec.client_id + '|' + to_string(rec.task_protocol) + '|' + rec.task_natural_key)); it != tasks_.end()) {
                         if (rec.is_delete) {
                             // 删除推送完成：从内存移除
                             tasks_.erase(it);
@@ -794,7 +796,7 @@ namespace dw {
                     tr->dirty = true;
                 } else {
                     // 修改为失败 可重试
-                    tr->status = DW_TASK_STATUS_ERROR;
+                    tr->status = DW_TASK_STATUS_PAUSED;
                     tr->reason = DW_REASON_FAIL;
                     tr->message = "文件不存在";
                     tr->dirty = true;
@@ -876,7 +878,7 @@ namespace dw {
 
     void TaskManager::register_task(FileRecord task_record) {
         // tasks_ 以 union_id 为 key，无冗余索引。
-        tasks_[task_record.union_id()] = std::move(task_record);
+        tasks_[(task_record.client_id + '|' + to_string(task_record.task_protocol) + '|' + task_record.task_natural_key)] = std::move(task_record);
     }
 
     void TaskManager::unregister_task(const std::string &union_id) {

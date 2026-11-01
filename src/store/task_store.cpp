@@ -8,6 +8,7 @@
  */
 
 #include "task_store.h"
+#include "internal/json_util.h"
 
 #include "internal/downloader_internal.h"
 #include "utils/string_util.h"
@@ -79,28 +80,7 @@ namespace dw {
         }
     } // namespace
 
-    TaskStore::~TaskStore() {
-        close();
-    }
-
-    bool TaskStore::open(const std::string &path) {
-        if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK) {
-            db_ = nullptr;
-            return false;
-        }
-        sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-        sqlite3_exec(db_, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
-        return true;
-    }
-
-    void TaskStore::close() {
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-    }
-
-    void TaskStore::init_schema() const {
+    void LegacyTaskStore::init_schema() const {
         constexpr auto sql = R"(
             CREATE TABLE IF NOT EXISTS resume_data (
                 client_id   TEXT NOT NULL,
@@ -216,7 +196,7 @@ namespace dw {
         }
     }
 
-    void TaskStore::remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const {
+    void LegacyTaskStore::remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const {
         // resume_data / file_progress_cache 仍用 protocol + natural_key 列名
         auto del_by_key = [this, &client_id, &protocol, &natural_key](const char *table) {
             sqlite3_stmt *st = nullptr;
@@ -247,7 +227,7 @@ namespace dw {
         }
     }
 
-    void TaskStore::update_file_record(const FileRecord &rec) const {
+    void LegacyTaskStore::update_file_record(const FileRecord &rec) const {
         constexpr auto sql = R"(
             UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name,
                 root_name=:root_name, full_path=:full_path, file_type=:file_type, ext=:ext,
@@ -283,7 +263,7 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    void TaskStore::save_resume(const std::string &client_id, dw_protocol_t protocol,
+    void LegacyTaskStore::save_resume(const std::string &client_id, dw_protocol_t protocol,
                                 const std::string &natural_key,
                                 const uint8_t *data, const size_t size) const {
         // 仅写入 data/saved_at，不得用 INSERT OR REPLACE：REPLACE 是
@@ -308,7 +288,7 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    void TaskStore::save_resume_source(const std::string &client_id, dw_protocol_t protocol,
+    void LegacyTaskStore::save_resume_source(const std::string &client_id, dw_protocol_t protocol,
                                        const std::string &natural_key,
                                        const std::string &save_path,
                                        const std::string &magnet_link,
@@ -336,7 +316,7 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    TaskStore::ResumeInfo TaskStore::load_resume_info(const std::string &client_id, const dw_protocol_t protocol,
+    LegacyTaskStore::ResumeInfo LegacyTaskStore::load_resume_info(const std::string &client_id, const dw_protocol_t protocol,
                                                       const std::string &natural_key) const {
         ResumeInfo info;
         constexpr auto sql =
@@ -401,7 +381,7 @@ namespace dw {
         }
     } // namespace
 
-    bool TaskStore::find_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
+    bool LegacyTaskStore::find_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
                                      const std::string &task_natural_key, FileRecord &out) const {
         constexpr auto sql =
                 "SELECT * FROM file_records WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key LIMIT 1;";
@@ -420,7 +400,7 @@ namespace dw {
         return found;
     }
 
-    bool TaskStore::file_record_exists_by_path(const std::string &full_path) const {
+    bool LegacyTaskStore::file_record_exists_by_path(const std::string &full_path) const {
         constexpr auto sql =
                 "SELECT 1 FROM file_records WHERE full_path=:full_path LIMIT 1;";
         sqlite3_stmt *st = nullptr;
@@ -433,7 +413,7 @@ namespace dw {
         return found;
     }
 
-    void TaskStore::touch_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
+    void LegacyTaskStore::touch_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
                                       const std::string &task_natural_key) const {
         constexpr auto sql =
                 "UPDATE file_records SET modified_at=:modified_at WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;";
@@ -448,7 +428,7 @@ namespace dw {
         }
     }
 
-    void TaskStore::insert_file_record(FileRecord &r) const {
+    void LegacyTaskStore::insert_file_record(FileRecord &r) const {
         const int64_t now = now_unix_ms();
         if (r.created_at == 0) r.created_at = now;
         if (r.modified_at == 0) r.modified_at = now;
@@ -476,7 +456,7 @@ namespace dw {
         bind_int(st, ":file_type", r.file_type ? 1 : 0);
         bind_text_or_null(st, ":ext", r.ext);
         bind_int(st, ":parsed", r.parsed ? 1 : 0);
-        if (r.has_task()) {
+        if (r.task_protocol != DW_PROTOCOL_LOCAL && !r.task_natural_key.empty()) {
             bind_int(st, ":task_protocol", static_cast<int>(r.task_protocol));
             bind_text(st, ":task_natural_key", r.task_natural_key);
         } else {
@@ -501,7 +481,7 @@ namespace dw {
         r.id = sqlite3_last_insert_rowid(db_);
     }
 
-    std::vector<FileRecord> TaskStore::load_file_records() const {
+    std::vector<FileRecord> LegacyTaskStore::load_file_records() const {
         std::vector<FileRecord> out;
         constexpr auto sql = "SELECT * FROM file_records ORDER BY modified_at DESC;";
         sqlite3_stmt *st = nullptr;
@@ -515,7 +495,7 @@ namespace dw {
         return out;
     }
 
-    std::vector<FileRecord> TaskStore::load_file_records(const std::string &client_id) const {
+    std::vector<FileRecord> LegacyTaskStore::load_file_records(const std::string &client_id) const {
         std::vector<FileRecord> out;
         constexpr auto sql =
                 "SELECT * FROM file_records WHERE client_id=:client_id ORDER BY modified_at DESC;";
@@ -531,7 +511,7 @@ namespace dw {
         return out;
     }
 
-    std::vector<FileRecord> TaskStore::load_file_records(const std::string &client_id,
+    std::vector<FileRecord> LegacyTaskStore::load_file_records(const std::string &client_id,
                                                          const std::vector<dw_protocol_t> &protocols,
                                                          const std::vector<dw_task_status_t> &statuses) const {
         std::vector<FileRecord> out;
@@ -568,7 +548,7 @@ namespace dw {
         return out;
     }
 
-    void TaskStore::delete_file_record_by_path(const std::string &full_path) const {
+    void LegacyTaskStore::delete_file_record_by_path(const std::string &full_path) const {
         constexpr auto sql =
                 "DELETE FROM file_records WHERE full_path=:full_path;";
         sqlite3_stmt *st = nullptr;
@@ -579,7 +559,7 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    void TaskStore::update_file_record_status_by_name(const std::string &save_path, const std::string &root_name,
+    void LegacyTaskStore::update_file_record_status_by_name(const std::string &save_path, const std::string &root_name,
                                                       const int32_t status) const {
         constexpr auto sql =
                 "UPDATE file_records SET status=:status, modified_at=:modified_at WHERE save_path=:save_path AND root_name=:root_name;";
@@ -596,7 +576,7 @@ namespace dw {
 
     // ---- 播放进度（独立表 play_progress，以完整路径为键）----
 
-    void TaskStore::set_play_position(const std::string &full_path, const int64_t position_ms) const {
+    void LegacyTaskStore::set_play_position(const std::string &full_path, const int64_t position_ms) const {
         if (full_path.empty()) return;
         constexpr auto sql = R"(
             INSERT INTO play_progress (full_path, position_ms, updated_at)
@@ -612,7 +592,7 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    int64_t TaskStore::get_play_position(const std::string &full_path) const {
+    int64_t LegacyTaskStore::get_play_position(const std::string &full_path) const {
         if (full_path.empty()) return 0;
         int64_t position_ms = 0;
         constexpr auto sql = "SELECT position_ms FROM play_progress WHERE full_path=:full_path;";
@@ -629,7 +609,7 @@ namespace dw {
 
     // ---- 文件下载进度缓存 ----
 
-    void TaskStore::replace_file_progress(
+    void LegacyTaskStore::replace_file_progress(
         const std::string &client_id, const dw_protocol_t protocol, const std::string &natural_key,
         const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t> > > &file_ranges) const {
         if (file_ranges.empty()) return;
@@ -669,7 +649,7 @@ namespace dw {
         sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
     }
 
-    int64_t TaskStore::save_file_progress(const std::string &client_id, const dw_protocol_t protocol,
+    int64_t LegacyTaskStore::save_file_progress(const std::string &client_id, const dw_protocol_t protocol,
                                           const std::string &natural_key, const int32_t file_index,
                                           const std::string &full_path,
                                           const int64_t size, const int64_t downloaded_bytes,
@@ -697,7 +677,7 @@ namespace dw {
         return downloaded_bytes;
     }
 
-    void TaskStore::delete_file_progress_by_file(const std::string &client_id, const dw_protocol_t protocol,
+    void LegacyTaskStore::delete_file_progress_by_file(const std::string &client_id, const dw_protocol_t protocol,
                                                  const std::string &natural_key, const int32_t file_index) const {
         constexpr auto sql =
                 "DELETE FROM file_progress_cache WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key AND file_index=:file_index;";
@@ -712,7 +692,7 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    void TaskStore::mark_file_complete(const std::string &client_id, const dw_protocol_t protocol,
+    void LegacyTaskStore::mark_file_complete(const std::string &client_id, const dw_protocol_t protocol,
                                        const std::string &natural_key, const int32_t file_index) const {
         // 更新 downloaded_bytes = size，segments = [[0, size-1]]
         constexpr auto sql = R"(
@@ -734,7 +714,7 @@ namespace dw {
         sqlite3_finalize(st);
     }
 
-    int64_t TaskStore::sum_file_progress_by_file(const std::string &client_id, const dw_protocol_t protocol,
+    int64_t LegacyTaskStore::sum_file_progress_by_file(const std::string &client_id, const dw_protocol_t protocol,
                                                  const std::string &natural_key, const int32_t file_index) const {
         constexpr auto sql =
                 "SELECT segments FROM file_progress_cache WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key AND file_index=:file_index;";
@@ -769,9 +749,9 @@ namespace dw {
         return total;
     }
 
-    std::vector<FileProgressInfo> TaskStore::load_file_progress(const std::string &client_id,
-                                                                  const dw_protocol_t protocol,
-                                                                  const std::string &natural_key) const {
+    std::vector<FileProgressInfo> LegacyTaskStore::load_file_progress(const std::string &client_id,
+                                                                const dw_protocol_t protocol,
+                                                                const std::string &natural_key) const {
         std::vector<FileProgressInfo> out;
         constexpr auto sql =
                 "SELECT file_index, full_path, size, downloaded_bytes, segments FROM file_progress_cache "
@@ -814,9 +794,9 @@ namespace dw {
         return out;
     }
 
-    std::unordered_map<std::string, std::pair<int64_t, std::string>>
-    TaskStore::load_file_progress_by_paths(const std::vector<std::string> &paths) const {
-        std::unordered_map<std::string, std::pair<int64_t, std::string>> result;
+    std::unordered_map<std::string, std::pair<int64_t, std::string> >
+    LegacyTaskStore::load_file_progress_by_paths(const std::vector<std::string> &paths) const {
+        std::unordered_map<std::string, std::pair<int64_t, std::string> > result;
         if (paths.empty() || !db_) return result;
         // 构建 IN 子句
         std::string placeholders;
