@@ -142,9 +142,21 @@ def run_capture(cmd, **kwargs):
 
 # ── Step 1: vcpkg ──
 
-def setup_vcpkg(workspace: Path, vcpkg_ref: str, temp_dir: Path) -> Path:
+def setup_vcpkg(workspace: Path, vcpkg_ref: str, temp_dir: Path,
+                local_dir: Path | None = None) -> Path:
     """克隆 vcpkg 并 bootstrap，返回 vcpkg 根目录。
     vcpkg_ref 为空或 'latest' 时跟踪 master 最新。"""
+    if local_dir is not None:
+        vcpkg_dir = local_dir.expanduser().resolve()
+        toolchain = vcpkg_dir / "scripts" / "buildsystems" / "vcpkg.cmake"
+        executable = vcpkg_dir / ("vcpkg.exe" if platform.system() == "Windows" else "vcpkg")
+        if not toolchain.is_file() or not executable.is_file():
+            raise RuntimeError(
+                f"本地 vcpkg 无效或未 bootstrap: {vcpkg_dir}，需要 vcpkg 可执行文件和 scripts/buildsystems/vcpkg.cmake")
+        print(f"使用本地 vcpkg: {vcpkg_dir}（不克隆、不切换版本、不执行 bootstrap；忽略 --vcpkg-ref）")
+        os.environ["VCPKG_ROOT"] = str(vcpkg_dir)
+        return vcpkg_dir
+
     vcpkg_dir = temp_dir / "vcpkg"
     if vcpkg_dir.exists():
         shutil.rmtree(vcpkg_dir)
@@ -639,6 +651,8 @@ def main():
                         help="目标平台")
     parser.add_argument("--vcpkg-ref", default=os.environ.get("VCPKG_REF", "latest"),
                         help="vcpkg 版本 tag")
+    parser.add_argument("--vcpkg-dir",
+                        help="复用已 bootstrap 的本地 vcpkg；不克隆或切换版本，忽略 --vcpkg-ref")
     parser.add_argument("--workspace", default=os.getcwd(),
                         help="项目根目录")
     parser.add_argument("--temp-dir",
@@ -663,7 +677,9 @@ def main():
 
     # 1. vcpkg
     print("\n== Step 1: vcpkg ==")
-    vcpkg_dir = setup_vcpkg(workspace, args.vcpkg_ref, temp_dir)
+    vcpkg_dir = setup_vcpkg(
+        workspace, args.vcpkg_ref, temp_dir,
+        Path(args.vcpkg_dir) if args.vcpkg_dir else None)
 
     # 2. libwebrtc（本地目录优先，无效回退 Release 下载）
     # iOS 无 libwebrtc 预编译库，跳过下载（P2P 强制 OFF，见 CMakeLists）

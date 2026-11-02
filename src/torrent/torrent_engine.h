@@ -36,7 +36,7 @@ public:
     /// 按 task.info_hash 注册，相同键覆盖原记录，不产生重复任务。
     static bool register_task(Task task);
 
-    /// 查询内存任务，未找到返回 nullptr。
+    /// 优先查询内存；未命中时从数据库加载并注册，均未找到或加载失败返回 nullptr。
     /// 返回指针仅在调用方持有 tasks_mutex() 时可安全使用，禁止无锁保存或修改。
     static Task *get_task(const std::string &info_hash);
 
@@ -64,14 +64,12 @@ public:
      * 双行为：handle 存在则直接恢复下载；handle 不存在则经三要素自取 resume_data 重建。
      */
     void resume_task(const std::string &info_hash,
-                     const std::string &client_id,
                      const std::vector<int32_t> &priority_file_indexes) override;
 
     /**
      * 暂停单个 BT 下载任务。
      */
-    dw_submit_result_t pause_task(const std::string &info_hash,
-                                  const std::string &client_id) override;
+    dw_submit_result_t pause_task(const std::string &info_hash) override;
 
     /**
      * 删除单个 BT 下载任务（事件驱动模型）：
@@ -80,14 +78,7 @@ public:
      *   - handle 无效 → 按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
      */
     dw_submit_result_t delete_task(const std::string &info_hash,
-                                   const std::string &client_id,
                                    int32_t delete_files) override;
-
-    /**
-     * 查询任务运行时资源是否已释放：session 完成移除（find_handle 失效）即视为
-     * 存储句柄已关闭；引擎未初始化 / 未持有该任务同样视为已释放。
-     */
-    bool task_released(const std::string &task_id) override;
 
     /**
      * 解析磁力链接获取 info_hash。

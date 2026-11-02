@@ -15,6 +15,8 @@ namespace dw {
         int64_t id = 0; // 自增主键（0=未落库）
         std::string client_id; // 客户端标识
         bool is_remote = false; // 远程标识
+        std::string name; // 任务名称
+        std::string wrapper_name; // 包装名称
         std::string save_path; // 保存路径
         std::string original_root_name; // 重名/包装前的原始目录/文件名（未重名时与 root_name 相同）
         std::string root_name; // 根目录/文件名（重名/包装后的最终名称）
@@ -63,6 +65,8 @@ namespace dw {
         obj["id"] = r.id;
         obj["client_id"] = r.client_id;
         obj["is_remote"] = r.is_remote;
+        obj["name"] = r.name;
+        obj["wrapper_name"] = r.wrapper_name;
         obj["save_path"] = r.save_path;
         obj["original_root_name"] = r.original_root_name;
         obj["root_name"] = r.root_name;
