@@ -59,6 +59,7 @@ namespace dw {
         obj["created_at"] = r.created_at;
         obj["modified_at"] = r.modified_at;
         obj["is_delete"] = r.is_delete;
+        obj["is_read"] = r.is_read;
         return obj;
     }
 

@@ -4,6 +4,12 @@
 #include <string>
 
 namespace dw {
+    inline bool ensure_sqlite_column(sqlite3 *db, const char *table, const char *column, const char *migration) {
+        return sqlite3_table_column_metadata(db, nullptr, table, column, nullptr, nullptr, nullptr, nullptr, nullptr)
+                   == SQLITE_OK
+            || sqlite3_exec(db, migration, nullptr, nullptr, nullptr) == SQLITE_OK;
+    }
+
     /// 统一管理 SQLite 连接，表结构和业务 SQL 交给各 store。
     class SqliteDatabase {
     public:

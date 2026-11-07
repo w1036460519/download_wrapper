@@ -6,8 +6,7 @@
  *   - 每个任务一个 task thread：单线程 curl_multi 事件循环驱动本任务所有分片；
  *     探测即下载——首个连接（探测窗口 Range: 0-n）就是 part 0 的正式下载流，
  *     首笔 body 到达时定名建文件切分片，其余分片动态挂入同一 multi；
- *   - 进度由 worker 线程经 push_progress 推入 TaskManager 内存（按门槛节流），
- *     A 线程下一拍直接从 TaskRuntime 字段采集；resume 由 worker 按推进门槛自推；
+ *   - worker 按下载进度保存断点续传数据；
  *   - 回调中共享字段用 mutex / atomic 保护。
  */
 
@@ -40,7 +39,7 @@ namespace dw {
         std::unordered_map<std::string, std::unique_ptr<dl_task_ctx> > g_tasks;
         std::atomic<bool> g_exit_flag{false};
         std::atomic<bool> g_running{false};
-        class TaskManager* g_task_manager = nullptr; // 事件投递目标
+        class TaskManager* g_task_manager = nullptr;
 
         namespace internal {
             using dw::utils::format_unix_ms;
@@ -161,43 +160,8 @@ namespace dw {
             }
 
             /* =====================================================================
-             *                     Part 2: 进度推送 + 回调
+             *                     Part 2: 分片进度回调
              * ===================================================================== */
-
-            void fill_progress(dl_task_ctx *tCtx, dw_progress_t *task_progress) {
-                *task_progress = {};
-                task_progress->url = tCtx->url.c_str(); // HTTP 识别键与展示（info_hash 保持空）
-                task_progress->protocol = DW_PROTOCOL_HTTP;
-                task_progress->name = tCtx->filename.c_str();
-                task_progress->output_path = tCtx->output_path.c_str();
-                task_progress->total_size = tCtx->total_size;
-
-                int64_t total_downloaded = 0;
-                double total_speed = 0.0;
-                {
-                    std::lock_guard<std::mutex> lk(tCtx->speed_mtx);
-                    for (const auto &part: tCtx->parts) {
-                        total_downloaded += part.done;
-                        total_speed += part.download_rate;
-                    }
-                }
-
-                task_progress->total_done = total_downloaded;
-                task_progress->remaining = (tCtx->total_size > 0) ? (tCtx->total_size - total_downloaded) : -1;
-                task_progress->progress = (tCtx->total_size > 0)
-                                              ? static_cast<double>(total_downloaded) / static_cast<double>(tCtx->
-                                                    total_size)
-                                              : -1.0;
-                task_progress->download_rate = total_speed;
-                // remaining / eta 由 wrapper 层现算（STATUS_UPDATE 事件不承载 eta），此处不再计算 eta。
-                task_progress->task_status = tCtx->status;
-                task_progress->support_range = tCtx->support_range;
-                task_progress->etag = tCtx->etag.c_str();
-                task_progress->last_modified = tCtx->last_modified.c_str();
-                task_progress->saved_at_unix_ms = now_unix_ms();
-                task_progress->reason = tCtx->reason;
-                task_progress->message = tCtx->message.c_str();
-            }
 
             /**
              * 分片进度回调（CURLOPT_XFERINFOFUNCTION）：采样分片瞬时速度并做 EMA 平滑，
@@ -354,9 +318,6 @@ namespace dw {
                 }
             }
 
-            // 前向声明（定义在 Part 4b: 进度推送，write_cb 内调用）
-            void push_progress(dl_task_ctx *tCtx, bool force);
-
             /**
              * 响应体回调（CURLOPT_WRITEFUNCTION）：探测连接首笔数据触发 finalize_probing
              * 定名建文件切分片，随后将本笔数据定点写入分片自身区间并推进 done。
@@ -386,10 +347,8 @@ namespace dw {
                     if (tCtx->status == DW_TASK_STATUS_ERROR) {
                         // 失败细节（建目录/建文件/预分配）已由 finalize_probing 记录 ERROR
                         log_d(tCtx->url.c_str(), "[part {}] write_cb abort: finalize_probing failed", pCtx->index);
-                        push_progress(tCtx, true); // 首帧推送（ERROR 终态）
                         return 0;
                     }
-                    push_progress(tCtx, true); // 首帧推送（元数据就绪：name / total_size / support_range / etag）
                 }
 
                 auto &part = tCtx->parts[pCtx->index];
@@ -842,7 +801,6 @@ namespace dw {
                 if (!tCtx || !g_task_manager) return;
                 const std::string blob = serialize_resume(tCtx);
                 if (blob.empty()) return;
-                // 直接落库，不经 TaskManager 事件通道。
                 g_task_manager->get_store().save_resume(
                     tCtx->client_id, DW_PROTOCOL_HTTP, tCtx->url,
                     reinterpret_cast<const uint8_t *>(blob.data()), blob.size());
@@ -861,44 +819,6 @@ namespace dw {
                     tCtx->last_emit_done = total_done;
                 }
                 emit_resume(tCtx);
-            }
-
-            // 推送进度到 TaskManager 内存：worker 线程调用，持 TaskManager mtx_ 极短赋值。
-            // force=true 时无门槛立即推（首帧 / 终态）；否则仅在总下载推进超过
-            // max(64KB, total_size/100) 时推入，控制推送频率。
-            void push_progress(dl_task_ctx *tCtx, bool force = false) {
-                if (!tCtx) return;
-                dw_progress_t snap;
-                fill_progress(tCtx, &snap);
-                if (!force) {
-                    const int64_t threshold = (tCtx->total_size > 0)
-                        ? std::max(static_cast<int64_t>(65536), tCtx->total_size / 100)
-                        : 65536;
-                    if (snap.total_done - tCtx->last_push_done < threshold) return;
-                }
-                tCtx->last_push_done = snap.total_done;
-                EngineEvent ev;
-                ev.type = EngineEventType::STATUS_UPDATE;
-                ev.engine_key = tCtx->url;
-                ev.protocol = DW_PROTOCOL_HTTP;
-                ev.total_size = snap.total_size;
-                ev.total_done = snap.total_done;
-                ev.progress = snap.progress;
-                ev.download_rate = snap.download_rate;
-                ev.total_upload = 0; // HTTP 协议无上传量
-                ev.name = tCtx->filename;
-                ev.support_range = snap.support_range;
-                ev.etag = tCtx->etag;
-                ev.last_modified = tCtx->last_modified;
-                ev.reason = snap.reason;
-                ev.message = tCtx->message;
-                if (g_task_manager) {
-                    g_task_manager->on_engine_event(std::move(ev));
-                }
-                // 终态时记录推送时间戳（sweep 据此延迟回收）
-                if (snap.task_status == DW_TASK_STATUS_COMPLETED || snap.task_status == DW_TASK_STATUS_ERROR) {
-                    tCtx->terminal_pushed_at_ms.store(now_unix_ms());
-                }
             }
 
             /* =====================================================================
@@ -1114,8 +1034,6 @@ namespace dw {
 
                         // worker 线程节流上报 resume：一个 poll 周期至多一次，仅在总已下载推进时真正 emit。
                         maybe_emit_resume(tCtx);
-                        // 推入进度到 TaskManager 内存（按门槛节流）。
-                        push_progress(tCtx);
                     }
                 } catch (const std::exception &e) {
                     log_e(tCtx->url.c_str(), "run_parts_multi exception: {}", e.what());
@@ -1136,11 +1054,12 @@ namespace dw {
 
 
             void task_thread_func(dl_task_ctx *tCtx) {
-                // 线程退出即置位（在所有终态推送之后），确保 sweep 只在推送完成后回收上下文，规避 use-after-free
+                // 退出前记录时间并置位，供 sweep 判断何时可以回收上下文。
                 struct DoneGuard {
                     dl_task_ctx *t;
 
                     ~DoneGuard() {
+                        t->finished_at_ms = now_unix_ms();
                         t->thread_done.store(1);
                     }
                 } done_guard{tCtx};
@@ -1149,11 +1068,9 @@ namespace dw {
                     // 探测与下载；续传任务（probing=0）已由 add_task 回灌分片直接续传。
                     if (tCtx->cancel_req.load()) return;
                     if (tCtx->pause_req.load()) {
-                        // 暂停早退（分片下载尚未开始）：worker 线程退出前固化一次续传断点，
-                        // 并推送 PAUSED 状态事件，使 TaskManager / DB 状态同步更新。
+                        // 分片下载尚未开始，退出前保存续传断点。
                         tCtx->status = DW_TASK_STATUS_PAUSED;
                         maybe_emit_resume(tCtx);
-                        push_progress(tCtx, true);
                         return;
                     }
 
@@ -1187,13 +1104,8 @@ namespace dw {
                     tCtx->reason = DW_REASON_ERROR;
                     tCtx->message = "任务线程异常终止";
                 }
-                // 推模型：终态推入 TaskManager 内存，A 线程下一拍直接感知。
-                // 取消不推（DELETE 不关注状态）；暂停推 PAUSED 帧使 TaskManager 感知状态跃迁。
-                if (!tCtx->cancel_req.load()) {
-                    if (tCtx->pause_req.load()) {
-                        tCtx->status = DW_TASK_STATUS_PAUSED;
-                    }
-                    push_progress(tCtx, true);
+                if (!tCtx->cancel_req.load() && tCtx->pause_req.load()) {
+                    tCtx->status = DW_TASK_STATUS_PAUSED;
                 }
             }
 

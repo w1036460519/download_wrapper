@@ -5,7 +5,9 @@
 #pragma once
 
 #include "protocol.h"
+#include "task_file.h"
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 #include <boost/json.hpp>
@@ -13,6 +15,7 @@
 namespace dw {
     struct Task {
         int64_t id = 0; // 自增主键（0=未落库）
+        std::string task_id; // 唯一任务标识，HTTP 为 URL，BT 为 info_hash。
         std::string client_id; // 客户端标识
         bool is_remote = false; // 远程标识
         std::string name; // 任务名称
@@ -39,21 +42,29 @@ namespace dw {
         int64_t total_size = -1; // 总字节
         int64_t total_done = 0; // 已完成字节
         int32_t priority = 0; // 队列优先级（越大越优先）
-        int32_t reason = 0; // 错误原因码（dw_reason_t）；仅 ERROR 态有效
+        int32_t reason = 0; // 任务错误原因，供旧进度接口读取。
         std::string message; // 错误文本 / 状态描述
 
         int64_t created_at = 0; // Unix 毫秒
         int64_t modified_at = 0; // Unix 毫秒
+        bool is_delete = false; // 软删除标记
+        bool is_read = false; // 已读标记
 
         // ---- 非持久化运行时字段（仅内存态，不入库） ----
+        std::vector<TaskFile> files; // 按 file_index 升序保存，同一索引只保留一条记录。
         int32_t support_range = 0; // 服务端 Range 支持：0=不支持，1=支持
         std::string etag; // 响应 ETag
         std::string last_modified; // 响应 Last-Modified
         std::vector<int32_t> select_file_indexes; // 文件索引列表
-        std::vector<int32_t> priority_file_indexes; // 优先下载文件索引
+        std::map<int32_t, int32_t> priority_file_indexes; // 文件索引 -> 下载优先级
         bool force = false; // 强制准入标记（调度器让行后自动清除）
         bool dirty = false; // 数据已变更待同步（持久化 + 推送 app）
-        bool is_delete = false;
+
+        // session 删除标识 true:已从session中删除
+        bool need_delete_session = false;
+        // file 删除标识 true:任务文件删除
+        bool need_delete_file = false;
+
 
         // 运行态遥测（不持久化）
         double download_rate = 0.0; // 下载速率（B/s）
@@ -63,6 +74,7 @@ namespace dw {
     inline boost::json::object to_json(const Task &r) {
         boost::json::object obj;
         obj["id"] = r.id;
+        obj["task_id"] = r.task_id;
         obj["client_id"] = r.client_id;
         obj["is_remote"] = r.is_remote;
         obj["name"] = r.name;
@@ -92,6 +104,7 @@ namespace dw {
         obj["created_at"] = r.created_at;
         obj["modified_at"] = r.modified_at;
         obj["is_delete"] = r.is_delete;
+        obj["is_read"] = r.is_read;
         obj["support_range"] = r.support_range;
         obj["etag"] = r.etag;
         obj["last_modified"] = r.last_modified;
@@ -101,7 +114,7 @@ namespace dw {
         for (const auto index : r.select_file_indexes) selected.push_back(index);
         obj["select_file_indexes"] = std::move(selected);
         boost::json::array priority_indexes;
-        for (const auto index : r.priority_file_indexes) priority_indexes.push_back(index);
+        for (const auto &[index, priority] : r.priority_file_indexes) priority_indexes.push_back(index);
         obj["priority_file_indexes"] = std::move(priority_indexes);
         return obj;
     }

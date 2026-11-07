@@ -188,7 +188,6 @@ typedef struct dw_file_info {
  * 文件内已下载字节区间（已合并连续段）。
  *
  * end 采用"含"约定，与 HTTP 分片区间语义一致（不引入第二套区间语义）。
- * 由 dw_get_file_ranges 分配数组，dw_byte_range_free 统一释放。
  */
 typedef struct dw_byte_range {
     int64_t start; /**< 文件内起始字节（含）。 */
@@ -351,7 +350,7 @@ typedef struct dw_config {
 
     /* ===== 追加字段（置于末尾以保持既有字段偏移的 ABI 兼容） ===== */
 
-    double seed_ratio_limit; /**< BT 做种分享率上限：total_upload/total_done 达到该值后释放做种上下文；0=库内默认 3.0（即下载:上传=1:3），<0=永久做种。 */
+    double seed_ratio_limit; /**< BT 做种分享率上限：all_time_upload/total_done 达标后移除句柄；0=3.0，<0=永久做种。 */
     const char *client_id;
     /**< 客户端唯一标识（UUIDv4，App 启动时从 SharedPreferences 读出后传入）。库内以此为 session 级别 clientId 隔离多客户端任务；本字段必填。 */
     const char **trackers; /**< BT 默认 tracker URL 数组（可为 NULL）：添加/恢复任务时由库统一注入；热更新不生效，需重启。 */
@@ -510,7 +509,8 @@ DW_API char *dw_pause_task(const char *params_json);
 /**
  * 恢复（继续）单个任务。
  *
- * JSON schema 同 dw_pause_task。
+ * JSON schema 同 dw_pause_task。BT 可选填 file_priorities，例如 {"0":4,"2":7}。
+ * 键为文件索引，值为 0 到 7 的下载优先级。
  *
  * @param params_json  JSON 参数字符串，不可为 NULL。
  * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
@@ -559,65 +559,6 @@ DW_API char *dw_parse_magnet(const char *params_json);
  */
 DW_API char *dw_parse_torrent_file(const char *params_json);
 
-/**
- * 通过任务键获取磁力链接。
- *
- * 任务必须已存在于 session 中；库内按 natural_key（info_hash）回读后调引擎。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "..."}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"magnet_link": "..."}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_info_hash_to_magnet(const char *params_json);
-
-/* ================================================================== */
-/*                        边下边播（区间 / 提优 / 进度）              */
-/* ================================================================== */
-
-/**
- * 查询单文件当前已下载字节区间（已合并连续段）。
- *
- * 优先读 wrapper 内存缓存（B 线程周期从引擎拉取更新），缓存未命中时：
- *   - 下载中任务（DOWNLOADING/RESOLVING）：返回空 + 状态码 1（代理应等待）；
- *   - 非下载中任务：回退 DB 快照（静态数据，不会增长）。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "...", "file_index": 0}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"ranges": [[start, end], ...]}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_get_file_ranges(const char *params_json);
-
-/**
- * 查询任务指定文件的物理路径与总大小（边下边播代理用）。
- *
- * HTTP 按任务记录推导（save_path/content_root/name，wrapper 目录模型）；
- * BT 经引擎 handle 实时查询（rename_file 后自动跟随新路径，离线返回失败）。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "...", "file_index": 0}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"path": "...", "size": 12345}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_get_task_file_info(const char *params_json);
-
-/**
- * 写入文件播放进度（毫秒），按物理路径落 play_progress 表。由 App 侧防抖调用。
- *
- * 与下载协议无关，wrapper 只存不解释播放语义。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "...", "file_index": 0, "position_ms": 12345}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- */
-DW_API char *dw_set_play_position(const char *params_json);
-
-/**
- * 读取已保存的文件播放进度（毫秒）。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "...", "file_index": 0}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- *                     响应格式：{"code": 0, "data": {"position_ms": 12345}} 或 {"code": -1, "message": "..."}
- */
-DW_API char *dw_get_play_position(const char *params_json);
-
 /* ================================================================== */
 /*                        任务快照与队列                              */
 /* ================================================================== */
@@ -633,16 +574,6 @@ DW_API char *dw_get_play_position(const char *params_json);
  *                     响应格式：{"code": 0, "data": {"tasks": [...]}} 或 {"code": -1, "message": "..."}
  */
 DW_API char *dw_list_tasks(const char *params_json);
-
-/**
- * 设置任务队列优先级（越大越优先）。
- *
- * 立即持久化并触发一次队列调度；对下载中任务仅更新优先级、不中断。
- *
- * @param params_json  JSON 字符串：{"client_id": "...", "natural_key": "...", "priority_file_indexes": [0, 1]}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放），失败返回 NULL。
- */
-DW_API char *dw_set_task_priority(const char *params_json);
 
 /* ================================================================== */
 /*                        任务文件查询                                */
@@ -686,7 +617,7 @@ DW_API void dw_task_list_free(dw_task_snapshot_t *tasks, int32_t count);
 /**
  * 通用内存释放。
  *
- * 用于释放由本库返回的堆分配内存（如 dw_info_hash_to_magnet 等返回的字符串）。
+ * 用于释放由本库返回的堆分配内存（如 dw_parse_magnet 返回的字符串）。
  *
  * @param ptr  待释放的内存指针，NULL 时无操作。
  */

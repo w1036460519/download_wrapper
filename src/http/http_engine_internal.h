@@ -297,13 +297,12 @@ struct dl_task_ctx {
 
     std::atomic<int> pause_req{0};
     std::atomic<int> cancel_req{0};
-    std::atomic<int> delete_req{0}; // 删除请求：与 cancel_req 一并置位，sweep 回收 ctx（关句柄）后据此删除落盘文件
+    std::atomic<int> delete_req{0}; // 删除请求，与 cancel_req 一并置位
     std::atomic<int> thread_done{0}; // 任务线程是否已结束；sweep 据此安全回收
-    std::atomic<int64_t> terminal_pushed_at_ms{0}; // 终态推入 TaskManager 的时间戳（ms）；sweep 据此延迟回收（保证 A 线程至少一拍观测到终态）
+    int64_t finished_at_ms = 0; // 工作线程退出时间，thread_done 置位后可读
     int probing = 1;
     int is_resume = 0; // 恢复任务标志：携续传存档启动即置 1（不论存档是否有效）；finalize_probing 据此沿用历史凭证名（不再判重），首次下载走优先级链判重定名
     int64_t last_emit_done = -1; // 上次 emit resume_data 时的总已下载字节（续传上报去重基准：仅总量推进时才 emit）。
-    int64_t last_push_done = -1; // 上次投递 STATUS_UPDATE 事件时的总已下载字节（进度推送去重：仅推进超过门槛才投递）
     std::mutex speed_mtx;
     std::thread task_thread; // 任务线程：sweep / 终态回收显式 join
 };
@@ -317,7 +316,7 @@ namespace dw {
         extern std::unordered_map<std::string, std::unique_ptr<dl_task_ctx> > g_tasks;
         extern std::atomic<bool> g_exit_flag;
         extern std::atomic<bool> g_running;
-        extern TaskManager* g_task_manager; // 事件投递目标
+        extern TaskManager* g_task_manager;
     }
 } /* namespace dw::http_engine */
 
@@ -325,9 +324,6 @@ namespace dw {
 namespace dw {
     namespace http_engine {
         namespace internal {
-            /** 将任务上下文填充到 dw_progress_t（不持锁，调用方需按需加锁）。 */
-            void fill_progress(dl_task_ctx *tCtx, dw_progress_t *task_progress);
-
             /** libcurl header 回调 */
             size_t header_cb(const char *buffer, size_t size, size_t n_items, void *userdata);
 

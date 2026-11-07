@@ -1,38 +1,62 @@
 #pragma once
 
-#include "download_wrapper/download_wrapper.h"
 #include <boost/json.hpp>
-#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace dw {
-    // 仅内存保存，供 App 查询；不写入数据库。
+    // 任务文件信息
     struct TaskFile {
+        // 任务内的文件索引。
         int32_t file_index = -1;
+        // 文件名
         std::string name;
+        // 任务内的相对路径。
         std::string path;
+        // 文件完整路径，由 save_path / wrapper_name（非空时）/ path 按平台路径分隔符拼接。
+        std::string full_path;
+        // 文件总大小，单位：字节（B）
         int64_t total_size = 0;
+        // 已下载字节数，范围 [0, total_size]
         int64_t total_done = 0;
-        // 文件内字节区间 [start, end]，首尾均包含；有序且不重叠。
-        std::vector<dw_byte_range_t> segments;
-        std::string extension; // 不带点，例如 mp4
-        int32_t prioritize = 4; // download_priority_t 的值：0、1、4、7
-        std::string info_hash;
+        // 文件下载进度，范围 [0.0, 1.0]
+        double progress = 0.0;
+        // 已下载文件区间
+        std::vector<std::pair<int64_t, int64_t> > segments;
+        // 文件扩展名
+        std::string extension;
+        // 下载优先级：0=不下载，1=低，4=默认，7=高；沿用 libtorrent download_priority_t
+        int32_t prioritize = 4;
+        // 所属任务标识：BT 为 info_hash，HTTP 为 URL。
+        std::string task_id;
+        bool is_delete = false;
+        bool is_read = false;
+
+        // ---- 非持久化运行时字段 ----
+        // 内存中的数据发生变化
+        bool dirty = false;
     };
 
     inline boost::json::object to_json(const TaskFile &file) {
         boost::json::array segments;
-        for (const auto &segment : file.segments) {
-            segments.push_back(boost::json::array{segment.start, segment.end});
+        for (const auto &[start, end]: file.segments) {
+            segments.push_back(boost::json::array{start, end});
         }
         return {
-            {"file_index", file.file_index}, {"name", file.name},
-            {"path", file.path}, {"total_size", file.total_size},
-            {"total_done", file.total_done}, {"segments", std::move(segments)},
-            {"extension", file.extension}, {"prioritize", file.prioritize},
-            {"info_hash", file.info_hash}
+            {"file_index", file.file_index},
+            {"name", file.name},
+            {"path", file.path},
+            {"full_path", file.full_path},
+            {"total_size", file.total_size},
+            {"total_done", file.total_done},
+            {"progress", file.progress},
+            {"segments", std::move(segments)},
+            {"extension", file.extension},
+            {"prioritize", file.prioritize},
+            {"task_id", file.task_id},
+            {"is_delete", file.is_delete},
+            {"is_read", file.is_read}
         };
     }
 

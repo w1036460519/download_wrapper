@@ -8,7 +8,6 @@
 #include "download_wrapper/download_wrapper.h"
 #include "core/task_record.h"
 #include "internal/file_info.h"
-#include "internal/engine_event.h"
 #include "internal/json_util.h"
 #include "internal/config.h"
 #include "internal/task_identity.h"
@@ -25,7 +24,6 @@
 #include <string>
 #include <vector>
 
-#include <boost/asio.hpp>
 #include <boost/json.hpp>
 
 namespace dw {
@@ -84,51 +82,6 @@ namespace dw {
         obj["status"] = f.status;
         obj["offset"] = f.offset;
         obj["downloaded_bytes"] = f.downloaded_bytes;
-        return boost::json::serialize(obj);
-    }
-
-    // ---- EngineEvent 序列化（重载，类 std::to_string 约定）----
-
-    inline std::string to_string(const EngineEvent &e) {
-        boost::json::object obj;
-        obj["type"] = to_string(e.type);
-        obj["key"] = e.engine_key;
-        obj["protocol"] = to_string(e.protocol);
-        obj["client_id"] = e.client_id;
-        obj["name"] = e.name;
-        obj["save_path"] = e.save_path;
-        // 文件列表：序列化每个文件信息
-        boost::json::array files_arr;
-        for (const auto &f: e.files) {
-            files_arr.push_back(boost::json::parse(to_string(f)));
-        }
-        obj["files"] = std::move(files_arr);
-        obj["reason"] = to_string(e.reason);
-        obj["message"] = e.message;
-        obj["total_size"] = e.total_size;
-        obj["total_done"] = e.total_done;
-        obj["progress"] = e.progress;
-        obj["dl_rate"] = e.download_rate;
-        obj["ul_rate"] = e.upload_rate;
-        obj["total_upload"] = e.total_upload;
-        obj["support_range"] = e.support_range;
-        obj["etag"] = e.etag;
-        obj["last_modified"] = e.last_modified;
-        obj["resume_size"] = e.resume_data.size();
-        // FILE_PROGRESS 字段
-        obj["file_index"] = e.file_index;
-        obj["file_path"] = e.file_path;
-        obj["full_path"] = e.full_path;
-        obj["file_size"] = e.size;
-        // 区间集合序列化
-        boost::json::array segments_arr;
-        for (const auto &[start, end]: e.segments) {
-            boost::json::array interval;
-            interval.push_back(start);
-            interval.push_back(end);
-            segments_arr.push_back(std::move(interval));
-        }
-        obj["segments"] = std::move(segments_arr);
         return boost::json::serialize(obj);
     }
 

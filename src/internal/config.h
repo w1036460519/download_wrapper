@@ -110,8 +110,8 @@ namespace dw {
         json_util::extract(obj, "max_concurrent", c.max_concurrent_downloads);
         json_util::extract(obj, "dl_rate_limit", c.download_rate_limit);
         json_util::extract(obj, "ul_rate_limit", c.upload_rate_limit);
-        if (auto *v = obj.if_contains("seed_ratio"); v && v->is_double()) {
-            c.seed_ratio_limit = v->as_double();
+        if (const auto *v = obj.if_contains("seed_ratio"); v && v->is_number()) {
+            c.seed_ratio_limit = v->to_number<double>();
         }
         if (auto *v = obj.if_contains("log_level"); v && v->is_int64()) {
             c.log_level = static_cast<dw_log_level_t>(v->as_int64());

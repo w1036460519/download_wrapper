@@ -19,11 +19,10 @@
 #include <filesystem>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace dw {
     using utils::now_unix_ms;
-    using utils::join_ints;
-    using utils::split_ints;
 
     namespace {
         /// SQLite text 列安全读取（NULL 返回空串）。
@@ -80,7 +79,47 @@ namespace dw {
         }
     } // namespace
 
-    void LegacyTaskStore::init_schema() const {
+    Task TaskStore::read_task(sqlite3_stmt *statement) {
+        const col_map columns(statement);
+        Task task;
+        task.id = columns.getInt64("id");
+        task.task_id = columns.getText("task_id");
+        task.client_id = columns.getText("client_id");
+        task.is_remote = columns.getInt("is_remote") != 0;
+        task.save_path = columns.getText("save_path");
+        task.original_root_name = columns.getText("original_root_name");
+        task.root_name = columns.getText("root_name");
+        task.full_path = columns.getText("full_path");
+        task.file_type = columns.getInt("file_type") != 0;
+        task.ext = columns.getText("ext");
+        task.parsed = columns.getInt("parsed") != 0;
+        task.url = columns.getText("url");
+        task.info_hash = columns.getText("info_hash");
+        task.magnet_link = columns.getText("magnet_link");
+        task.torrent_file = columns.getText("torrent_file");
+        task.task_protocol = static_cast<dw_protocol_t>(columns.getInt("protocol"));
+        task.status = columns.getInt("status");
+        task.total_size = columns.getInt64("total_size");
+        task.total_done = columns.getInt64("total_done");
+        task.priority = columns.getInt("priority");
+        task.reason = columns.getInt("reason");
+        task.message = columns.getText("message");
+        task.created_at = columns.getInt64("created_at");
+        task.modified_at = columns.getInt64("modified_at");
+        task.support_range = columns.getInt("support_range");
+        task.etag = columns.getText("etag");
+        task.last_modified = columns.getText("last_modified");
+        task.force = columns.getInt("force") != 0;
+        task.dirty = columns.getInt("dirty") != 0;
+        task.is_delete = columns.getInt("is_delete") != 0;
+        task.download_rate = columns.getDouble("download_rate");
+        task.upload_rate = columns.getDouble("upload_rate");
+        task.select_file_indexes = utils::split_ints(columns.getText("select_file_indexes"));
+        task.is_read = columns.getInt("is_read") != 0;
+        return task;
+    }
+
+    bool LegacyTaskStore::init_schema() const {
         constexpr auto sql = R"(
             CREATE TABLE IF NOT EXISTS resume_data (
                 client_id   TEXT NOT NULL,
@@ -118,9 +157,10 @@ namespace dw {
                 priority        INTEGER DEFAULT 0,
                 reason          INTEGER DEFAULT 0,
                 message         TEXT NOT NULL DEFAULT '',
-                priority_file_indexes TEXT NOT NULL DEFAULT '',  -- 优先下载文件索引，逗号分隔；空=全部下载
                 created_at      INTEGER,
-                modified_at     INTEGER
+                modified_at     INTEGER,
+                is_delete       INTEGER NOT NULL DEFAULT 0,
+                is_read         INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_file_records_task ON file_records(client_id, task_protocol, task_natural_key);
             CREATE INDEX IF NOT EXISTS idx_file_records_path ON file_records(full_path);
@@ -146,7 +186,7 @@ namespace dw {
                 updated_at   INTEGER
             );
         )";
-        sqlite3_exec(db_, sql, nullptr, nullptr, nullptr);
+        if (!db_ || sqlite3_exec(db_, sql, nullptr, nullptr, nullptr) != SQLITE_OK) return false;
         // 存量库迁移：远古版本 resume_data 以 infoHash 为主键（缺 client_id 等
         // 全部新列），针对它的 INSERT/SELECT 均因 "no such column" 静默失败，
         // 导致任务来源丢失、find_handle 无法重建 handle、任务永远进不了
@@ -180,12 +220,7 @@ namespace dw {
                 }
             }
         }
-        // 存量库迁移：补建 priority_file_indexes 列（SQLite 无 ADD COLUMN IF NOT EXISTS，
-        // 列已存在时 exec 报错，静默忽略）。
-        sqlite3_exec(db_,
-                     "ALTER TABLE file_records ADD COLUMN priority_file_indexes TEXT NOT NULL DEFAULT '';",
-                     nullptr, nullptr, nullptr);
-        // 存量库迁移：补建任务元数据列（url / info_hash / magnet_link / torrent_file），同上述忽略重复。
+        // 补建旧库缺少的任务元数据列。
         for (const char *ddl: {
                  "ALTER TABLE file_records ADD COLUMN url TEXT NOT NULL DEFAULT '';",
                  "ALTER TABLE file_records ADD COLUMN info_hash TEXT NOT NULL DEFAULT '';",
@@ -194,6 +229,10 @@ namespace dw {
              }) {
             sqlite3_exec(db_, ddl, nullptr, nullptr, nullptr);
         }
+        return ensure_sqlite_column(db_, "file_records", "is_delete",
+                   "ALTER TABLE file_records ADD COLUMN is_delete INTEGER NOT NULL DEFAULT 0")
+            && ensure_sqlite_column(db_, "file_records", "is_read",
+                   "ALTER TABLE file_records ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0");
     }
 
     void LegacyTaskStore::remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const {
@@ -216,7 +255,7 @@ namespace dw {
         {
             sqlite3_stmt *st = nullptr;
             constexpr auto sql =
-                    "DELETE FROM file_records WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;";
+                    "UPDATE file_records SET is_delete=1 WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;";
             if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
                 bind_text(st, ":client_id", client_id);
                 bind_int(st, ":task_protocol", static_cast<int>(protocol));
@@ -227,15 +266,15 @@ namespace dw {
         }
     }
 
-    void LegacyTaskStore::update_file_record(const FileRecord &rec) const {
+    void LegacyTaskStore::update_file_record(const Task &rec) const {
         constexpr auto sql = R"(
             UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name,
                 root_name=:root_name, full_path=:full_path, file_type=:file_type, ext=:ext,
                 url=:url, info_hash=:info_hash, magnet_link=:magnet_link, torrent_file=:torrent_file,
                 status=:status, total_size=:total_size, total_done=:total_done,
-                reason=:reason, message=:message, priority_file_indexes=:priority_file_indexes,
-                modified_at=:modified_at
-            WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
+                reason=:reason, message=:message,
+                is_read=:is_read, modified_at=:modified_at
+            WHERE is_delete=0 AND client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
         )";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
@@ -254,11 +293,11 @@ namespace dw {
         bind_int64(st, ":total_done", rec.total_done);
         bind_int(st, ":reason", rec.reason);
         bind_text(st, ":message", rec.message);
-        bind_text(st, ":priority_file_indexes", utils::join_ints(rec.priority_file_indexes));
+        bind_int(st, ":is_read", rec.is_read);
         bind_int64(st, ":modified_at", now_unix_ms());
         bind_text(st, ":client_id", rec.client_id);
         bind_int(st, ":task_protocol", static_cast<int>(rec.task_protocol));
-        bind_text(st, ":task_natural_key", rec.task_natural_key);
+        bind_text(st, ":task_natural_key", rec.task_id);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
@@ -266,10 +305,7 @@ namespace dw {
     void LegacyTaskStore::save_resume(const std::string &client_id, dw_protocol_t protocol,
                                 const std::string &natural_key,
                                 const uint8_t *data, const size_t size) const {
-        // 仅写入 data/saved_at，不得用 INSERT OR REPLACE：REPLACE 是
-        // 删旧行重插全行，会把 save_resume_source 写入的来源三列
-        // （save_path/magnet_link/torrent_file）抹成 NULL，导致后续
-        // find_handle 重建 handle 时无据可依（任务进不了 session）。
+        // 只更新续传数据和保存时间，保留旧记录中的来源字段。
         constexpr auto sql = R"(
             INSERT INTO resume_data (client_id, protocol, natural_key, data, saved_at)
             VALUES (:client_id, :protocol, :natural_key, :data, :saved_at)
@@ -283,34 +319,6 @@ namespace dw {
         bind_int(st, ":protocol", static_cast<int>(protocol));
         bind_text(st, ":natural_key", natural_key);
         bind_blob(st, ":data", data, static_cast<int>(size));
-        bind_int64(st, ":saved_at", now_unix_ms());
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void LegacyTaskStore::save_resume_source(const std::string &client_id, dw_protocol_t protocol,
-                                       const std::string &natural_key,
-                                       const std::string &save_path,
-                                       const std::string &magnet_link,
-                                       const std::string &torrent_file) const {
-        // 仅写入来源字段（save_path / magnet_link / torrent_file），不影响 data 列；
-        // 使用 INSERT ... ON CONFLICT DO UPDATE 保留已有 data。
-        constexpr auto sql = R"(
-            INSERT INTO resume_data (client_id, protocol, natural_key, save_path, magnet_link, torrent_file, saved_at)
-            VALUES (:client_id, :protocol, :natural_key, :save_path, :magnet_link, :torrent_file, :saved_at)
-            ON CONFLICT(client_id, protocol, natural_key) DO UPDATE SET
-                save_path = excluded.save_path,
-                magnet_link = excluded.magnet_link,
-                torrent_file = excluded.torrent_file;
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        bind_text(st, ":save_path", save_path);
-        bind_text(st, ":magnet_link", magnet_link);
-        bind_text(st, ":torrent_file", torrent_file);
         bind_int64(st, ":saved_at", now_unix_ms());
         sqlite3_step(st);
         sqlite3_finalize(st);
@@ -364,6 +372,7 @@ namespace dw {
             r.parsed = cm.getInt("parsed") != 0;
             r.task_protocol = static_cast<dw_protocol_t>(cm.getInt("task_protocol"));
             r.task_natural_key = cm.getText("task_natural_key");
+            r.task_id = r.task_natural_key;
             r.url = cm.getText("url");
             r.info_hash = cm.getText("info_hash");
             r.magnet_link = cm.getText("magnet_link");
@@ -375,16 +384,17 @@ namespace dw {
             r.reason = cm.getInt("reason");
             r.message = cm.getText("message");
             // support_range/etag/last_modified 不再从 file_records 读取（已在 resume_data 表中）
-            r.priority_file_indexes = utils::split_ints(cm.getText("priority_file_indexes"));
             r.created_at = cm.getInt64("created_at");
             r.modified_at = cm.getInt64("modified_at");
+            r.is_delete = cm.getInt("is_delete") != 0;
+            r.is_read = cm.getInt("is_read") != 0;
         }
     } // namespace
 
     bool LegacyTaskStore::find_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
                                      const std::string &task_natural_key, FileRecord &out) const {
         constexpr auto sql =
-                "SELECT * FROM file_records WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key LIMIT 1;";
+                "SELECT * FROM file_records WHERE is_delete=0 AND client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key LIMIT 1;";
         sqlite3_stmt *st = nullptr;
         bool found = false;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
@@ -402,7 +412,7 @@ namespace dw {
 
     bool LegacyTaskStore::file_record_exists_by_path(const std::string &full_path) const {
         constexpr auto sql =
-                "SELECT 1 FROM file_records WHERE full_path=:full_path LIMIT 1;";
+                "SELECT 1 FROM file_records WHERE is_delete=0 AND full_path=:full_path LIMIT 1;";
         sqlite3_stmt *st = nullptr;
         bool found = false;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
@@ -437,12 +447,12 @@ namespace dw {
                 full_path, file_type, ext, parsed, task_protocol, task_natural_key,
                 url, info_hash, magnet_link, torrent_file,
                 status, total_size, total_done,
-                priority, reason, message, priority_file_indexes, created_at, modified_at)
+                priority, reason, message, created_at, modified_at, is_delete, is_read)
             VALUES (:client_id, :type, :is_remote, :save_path, :original_root_name, :root_name,
                 :full_path, :file_type, :ext, :parsed, :task_protocol, :task_natural_key,
                 :url, :info_hash, :magnet_link, :torrent_file,
                 :status, :total_size, :total_done,
-                :priority, :reason, :message, :priority_file_indexes, :created_at, :modified_at);
+                :priority, :reason, :message, :created_at, :modified_at, :is_delete, :is_read);
         )";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
@@ -469,13 +479,14 @@ namespace dw {
         bind_int(st, ":priority", r.priority);
         bind_int(st, ":reason", r.reason);
         bind_text(st, ":message", r.message);
-        bind_text(st, ":priority_file_indexes", utils::join_ints(r.priority_file_indexes));
         bind_text(st, ":url", r.url);
         bind_text(st, ":info_hash", r.info_hash);
         bind_text(st, ":magnet_link", r.magnet_link);
         bind_text(st, ":torrent_file", r.torrent_file);
         bind_int64(st, ":created_at", r.created_at);
         bind_int64(st, ":modified_at", r.modified_at);
+        bind_int(st, ":is_delete", r.is_delete);
+        bind_int(st, ":is_read", r.is_read);
         sqlite3_step(st);
         sqlite3_finalize(st);
         r.id = sqlite3_last_insert_rowid(db_);
@@ -483,7 +494,7 @@ namespace dw {
 
     std::vector<FileRecord> LegacyTaskStore::load_file_records() const {
         std::vector<FileRecord> out;
-        constexpr auto sql = "SELECT * FROM file_records ORDER BY modified_at DESC;";
+        constexpr auto sql = "SELECT * FROM file_records WHERE is_delete=0 ORDER BY modified_at DESC;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
         while (sqlite3_step(st) == SQLITE_ROW) {
@@ -498,7 +509,7 @@ namespace dw {
     std::vector<FileRecord> LegacyTaskStore::load_file_records(const std::string &client_id) const {
         std::vector<FileRecord> out;
         constexpr auto sql =
-                "SELECT * FROM file_records WHERE client_id=:client_id ORDER BY modified_at DESC;";
+                "SELECT * FROM file_records WHERE is_delete=0 AND client_id=:client_id ORDER BY modified_at DESC;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
         bind_text(st, ":client_id", client_id);
@@ -527,7 +538,7 @@ namespace dw {
             status_placeholders += "?";
         }
         const std::string sql =
-                "SELECT * FROM file_records WHERE client_id=? AND protocol IN (" + proto_placeholders +
+                "SELECT * FROM file_records WHERE is_delete=0 AND client_id=? AND task_protocol IN (" + proto_placeholders +
                 ") AND status IN (" + status_placeholders + ") ORDER BY modified_at DESC;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return out;
@@ -550,7 +561,7 @@ namespace dw {
 
     void LegacyTaskStore::delete_file_record_by_path(const std::string &full_path) const {
         constexpr auto sql =
-                "DELETE FROM file_records WHERE full_path=:full_path;";
+                "UPDATE file_records SET is_delete=1 WHERE full_path=:full_path;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
             return;
@@ -562,7 +573,7 @@ namespace dw {
     void LegacyTaskStore::update_file_record_status_by_name(const std::string &save_path, const std::string &root_name,
                                                       const int32_t status) const {
         constexpr auto sql =
-                "UPDATE file_records SET status=:status, modified_at=:modified_at WHERE save_path=:save_path AND root_name=:root_name;";
+                "UPDATE file_records SET status=:status, modified_at=:modified_at WHERE is_delete=0 AND save_path=:save_path AND root_name=:root_name;";
         sqlite3_stmt *st = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
             return;

@@ -6,7 +6,7 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
-#include "internal/file_info.h"
+#include "core/task_file.h"
 #include "utils/string_util.h"
 
 #include <cstdint>
@@ -23,7 +23,7 @@ namespace dw {
         dw_reason_t code = DW_REASON_NONE;
         std::string message;
         std::string info_hash;
-        std::vector<FileInfo> files;
+        std::vector<TaskFile> files;
         int32_t affected_count = 0; // 本次操作影响的记录数量（新增/失效/删除等）
 
         dw_submit_result_t() = default;
@@ -32,7 +32,7 @@ namespace dw {
         static dw_submit_result_t success() { return {}; }
 
         /// 构造失败结果
-        static dw_submit_result_t failure(dw_reason_t reason, std::string msg = {}) {
+        static dw_submit_result_t failure(const dw_reason_t reason = DW_REASON_ERROR, std::string msg = {}) {
             dw_submit_result_t r;
             r.code = reason;
             r.message = std::move(msg);
@@ -53,16 +53,7 @@ namespace dw {
             if (!result.files.empty()) {
                 boost::json::array files_arr;
                 for (const auto &fi: result.files) {
-                    boost::json::object f;
-                    f["index"] = fi.index;
-                    f["name"] = fi.name;
-                    f["full_path"] = fi.full_path;
-                    f["size"] = fi.size;
-                    f["ext"] = fi.ext;
-                    f["status"] = fi.status;
-                    f["offset"] = fi.offset;
-                    f["downloaded_bytes"] = fi.downloaded_bytes;
-                    files_arr.push_back(std::move(f));
+                    files_arr.push_back(to_json(fi));
                 }
                 data["files"] = std::move(files_arr);
             }

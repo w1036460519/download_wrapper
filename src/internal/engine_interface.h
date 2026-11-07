@@ -4,8 +4,6 @@
  *
  * 设计要点：
  *   - 纯虚方法为各引擎必须实现的任务生命周期能力；
- *   - 进度推送由引擎经 task_manager_->on_engine_event 投递事件（事件驱动），
- *     B 线程消费后写入 TaskRuntime 内存，A 线程下一拍直接从 TaskRuntime 字段采集；
  *   - post_updates 为带默认空实现的节拍钩子：Torrent 引擎覆写（触发
  *     post_torrent_updates 刷新 + 续传检查点），HTTP 引擎无需实现；
  *   - 协议专属能力（如 BT 的文件列表 / 优先级 / 磁力解析）留在具体引擎类，
@@ -23,89 +21,56 @@
 #include <vector>
 
 namespace dw {
+    class TaskManager; // 前向声明
 
-class TaskManager; // 前向声明
+    /**
+     * 下载引擎抽象接口（HttpEngine / TorrentEngine 实现）。
+     */
+    class IDownloadEngine {
+    public:
+        explicit IDownloadEngine(TaskManager *task_manager) : task_manager_(task_manager) {
+        }
 
-/**
- * 下载引擎抽象接口（HttpEngine / TorrentEngine 实现）。
- */
-class IDownloadEngine {
-public:
-    explicit IDownloadEngine(TaskManager *task_manager) : task_manager_(task_manager) {}
-    virtual ~IDownloadEngine() = default;
+        virtual ~IDownloadEngine() = default;
 
-    /// 初始化引擎。@return 0=成功，-1=失败。
-    virtual int32_t init() = 0;
+        /// 初始化引擎。@return 0=成功，-1=失败。
+        virtual int32_t init() = 0;
 
-    /// 销毁引擎，释放所有资源。
-    virtual void destroy() = 0;
+        /// 销毁引擎，释放所有资源。
+        virtual void destroy() = 0;
 
-    /// 添加单个下载任务。
-    virtual dw_submit_result_t add_task(const TaskParams *params) = 0;
+        /// 添加单个下载任务。
+        virtual dw_submit_result_t add_task(const TaskParams *params) = 0;
 
-    /// 恢复单个下载任务（调度器准入时调用；内部接口，字符串直接传 std::string）。
-    /// 双行为：handle/ctx 存在则直接恢复；不存在则引擎内部经三要素自取 resume_data 重建。
-    /// 重建失败时经事件投递 DOWNLOAD_FAILED，无需返回值。
-    /// natural_key：任务唯一键（HTTP=url，BT=info_hash）。
-    virtual void resume_task(const std::string &natural_key,
-                             const std::string &client_id,
-                             const std::vector<int32_t> &priority_file_indexes) = 0;
+        /// 提交恢复请求，更新任务状态并等待调度。
+        virtual dw_submit_result_t resume_task(const TaskParams *params) = 0;
 
-    /// 暂停单个下载任务（id 为引擎键：HTTP=url，BT=info_hash）。
-    /// client_id 用于 BT 侧 handle 不在 session 时经恢复数据重建句柄；HTTP 不使用。
-    virtual dw_submit_result_t pause_task(const std::string &id,
-                                          const std::string &client_id) = 0;
+        /// 调度器准入后实际恢复下载。
+        virtual dw_submit_result_t do_resume(const TaskParams *params) = 0;
 
-    /// 删除单个下载任务（事件驱动模型）：
-    ///   - handle 有效 → remove_torrent(delete_files)，后续由 torrent_removed_alert /
-    ///     torrent_deleted_alert 触发 DELETED 事件；
-    ///   - handle 无效 → 按 delete_files 标识决定是否删文件，直接发 DELETED 事件。
-    /// wrapper 收到 DELETED 事件后回收资源、清理数据。
-    virtual dw_submit_result_t delete_task(const std::string &id,
-                                           const std::string &client_id,
-                                           int32_t delete_files) = 0;
+        /// 暂停单个下载任务。
+        virtual dw_submit_result_t pause_task(const TaskParams *params) = 0;
 
-    /// 查询任务运行时资源是否已全部释放（线程已 join、文件/存储句柄已关闭）。
-    /// 引擎未持有该任务（从未添加 / 已回收）同样视为已释放。
-    /// TaskManager 删除流程据此判断何时可安全删除落盘文件（Windows 句柄
-    /// 打开期间禁止删除）。
-    virtual bool task_released(const std::string &id) = 0;
+        /// 提交单个下载任务的删除请求。
+        virtual dw_submit_result_t delete_task(const TaskParams *params) = 0;
 
-    /// 查询文件已下载字节区间（边下边播）。HTTP 单文件模型忽略 file_index。
-    virtual std::vector<dw_byte_range_t> get_file_ranges(const std::string &id,
-                                                         int32_t     file_index) = 0;
+        /// 周期性维护：回收终态任务的运行时上下文。由上层调度循环定时调用。
+        virtual void sweep() = 0;
 
-    /// 周期性维护：回收终态任务的运行时上下文。由上层调度循环定时调用。
-    virtual void sweep() = 0;
+        // ---- 可选钩子（默认空实现，Torrent 覆写） ----
 
-    // ---- 可选钩子（默认空实现，Torrent 覆写） ----
+        /// 节拍入口（A 线程调用）：BT 覆写（触发 post_torrent_updates 刷新 + 续传检查点），
+        /// HTTP 引擎使用默认实现。
+        virtual void post_updates() {
+        }
 
-    /// 节拍入口（A 线程调用）：BT 覆写（触发 post_torrent_updates 刷新 + 续传检查点），
-    /// HTTP 引擎由 worker 自推进度，无需实现。
-    virtual void post_updates() {}
+        /// 文件列表实时查询（BT 覆写）：返回全量文件清单（pad 已过滤），含选中状态。
+        virtual dw_submit_result_t get_file_list(const std::string &/*client_id*/,
+                                                 const std::string &/*natural_key*/) {
+            return dw_submit_result_t::failure(DW_REASON_ERROR, "不支持");
+        }
 
-    /// 应用文件选择意图（RESOLVING 就绪出口调用）：显式定型全量文件优先级并解除待选保护。
-    /// file_indexes 为空表示下载全部。HTTP 单文件无选择语义，默认成功。
-    /// @return 0=成功，-1=失败（任务不存在 / 元数据未就绪）。
-    virtual int32_t apply_file_selection(const std::string &/*id*/,
-                                         const std::vector<int32_t> &/*file_indexes*/) { return 0; }
-
-    /// 文件路径实时查询（BT 覆写）：按 libtorrent 文件序号解析物理路径与大小。
-    /// 依赖 handle 在线（任务在 session 中）；离线（未恢复/已删除/元数据未就绪）
-    /// 返回 false。HTTP 单文件不实现，由 TaskManager 从任务记录推导。
-    virtual bool get_file_path(const std::string &/*id*/, int32_t /*file_index*/,
-                               std::string& /*out_path*/, int64_t& /*out_size*/) { return false; }
-
-    /// 文件列表实时查询（BT 覆写）：返回全量文件清单（pad 已过滤），含选中状态。
-    virtual dw_submit_result_t get_file_list(const std::string &/*client_id*/,
-                                              const std::string &/*natural_key*/) {
-        return dw_submit_result_t::failure(DW_REASON_ERROR, "不支持");
-    }
-
-protected:
-    TaskManager *task_manager_ = nullptr; // 事件投递目标（构造时注入）
-};
-
+    protected:
+        TaskManager *task_manager_ = nullptr;
+    };
 } // namespace dw
-
-

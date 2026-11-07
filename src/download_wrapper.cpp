@@ -161,11 +161,11 @@ DW_API void dw_destroy(void) {
     // 若先销毁引擎，stop 前仍存活的 maintenance_loop 对已析构对象的
     // sweep()/resume_task() 虚调用会段错误。
     if (dw::g_downloader->task_manager) {
-        dw::g_downloader->task_manager->stop();
+        dw::g_downloader->task_manager->stop(false);
     }
 
     // 再停止引擎：其线程 join 前可能回调 TaskManager，此时对象仍存活，
-    // 且 store_ 已关闭（db_ 空置、prepare 直接失败）、事件循环已停止
+    // 数据库保留至引擎最终快照保存完成；事件循环已停止
     //（post 到 stopped io_context 空转安全），回调均有防护。
     if (dw::g_downloader->http_engine) {
         dw::g_downloader->http_engine->destroy();
@@ -377,14 +377,7 @@ DW_API char *dw_parse_torrent_file(const char *params_json) {
         if (!result.files.empty()) {
             boost::json::array files_arr;
             for (const auto &fi: result.files) {
-                boost::json::object file_obj;
-                file_obj["index"] = fi.index;
-                file_obj["name"] = fi.name;
-                file_obj["size"] = fi.size;
-                file_obj["offset"] = fi.offset;
-                file_obj["full_path"] = fi.full_path;
-                file_obj["ext"] = fi.ext;
-                files_arr.push_back(std::move(file_obj));
+                files_arr.push_back(dw::to_json(fi));
             }
             data["files"] = std::move(files_arr);
         }
@@ -392,225 +385,6 @@ DW_API char *dw_parse_torrent_file(const char *params_json) {
     } catch (const std::exception &) {
         return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
     }
-}
-
-DW_API char *dw_info_hash_to_magnet(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
-
-    dw::TaskIdentity identity;
-    if (dw::parse_identity(params_json, identity) != 0) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (identity.client_id.empty() || identity.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
-    }
-
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
-    }
-
-    std::scoped_lock task_lock(tm->get_mutex());
-    auto *task_record = tm->load_task_record(identity.client_id.c_str(), DW_PROTOCOL_TORRENT,
-                                             identity.natural_key.c_str());
-    if (!task_record) {
-        return dw::utils::dup_cstr(dw::make_error_response("任务不存在"));
-    }
-    char *magnet = dw::TorrentEngine::info_hash_to_magnet(task_record->task_natural_key.c_str());
-    if (!magnet) {
-        return dw::utils::dup_cstr(dw::make_error_response("转换失败"));
-    }
-    boost::json::object data;
-    data["magnet_link"] = magnet;
-    std::free(magnet);
-    return dw::utils::dup_cstr(dw::make_success_response(data));
-}
-
-/* ------------------------------------------------------------------ */
-/*  边下边播（区间 / 提优 / 进度）                                    */
-/* ------------------------------------------------------------------ */
-
-DW_API char *dw_get_file_ranges(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
-
-    dw::TaskIdentity identity;
-    int32_t file_index = 0;
-    try {
-        auto obj = boost::json::parse(params_json).as_object();
-        dw::from_json(obj, identity);
-        dw::json_util::extract(obj, "file_index", file_index);
-    } catch (const std::exception &) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (identity.client_id.empty() || identity.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
-    }
-
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
-    }
-
-    const std::string &nk = identity.natural_key;
-    // 查询任务文件进度缓存
-    auto progress_list = tm->get_file_progress(identity.client_id, DW_PROTOCOL_HTTP, nk);
-    if (progress_list.empty()) {
-        progress_list = tm->get_file_progress(identity.client_id, DW_PROTOCOL_TORRENT, nk);
-    }
-    // 查找指定 file_index 的进度信息
-    const dw::FileProgressInfo *info = nullptr;
-    for (const auto &p: progress_list) {
-        if (p.file_index == file_index) {
-            info = &p;
-            break;
-        }
-    }
-    boost::json::array ranges_arr;
-    if (info) {
-        for (const auto &r: info->segments) {
-            boost::json::array pair;
-            pair.push_back(r.start);
-            pair.push_back(r.end);
-            ranges_arr.push_back(std::move(pair));
-        }
-    }
-    boost::json::object data;
-    data["ranges"] = std::move(ranges_arr);
-    return dw::utils::dup_cstr(dw::make_success_response(data));
-}
-
-DW_API char *dw_get_task_file_info(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
-
-    dw::TaskIdentity identity;
-    int32_t file_index = 0;
-    try {
-        auto obj = boost::json::parse(params_json).as_object();
-        dw::from_json(obj, identity);
-        dw::json_util::extract(obj, "file_index", file_index);
-    } catch (const std::exception &) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (identity.client_id.empty() || identity.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
-    }
-
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
-    }
-
-    const std::string &nk = identity.natural_key;
-    std::scoped_lock task_lock(tm->get_mutex());
-    auto *task_record = tm->load_task_record(identity.client_id.c_str(), DW_PROTOCOL_HTTP, nk.c_str());
-    if (!task_record) {
-        task_record = tm->load_task_record(identity.client_id.c_str(), DW_PROTOCOL_TORRENT, nk.c_str());
-    }
-    if (!task_record) {
-        return dw::utils::dup_cstr(dw::make_error_response("任务不存在"));
-    }
-    const dw_protocol_t proto = task_record->task_protocol;
-    std::string file_path;
-    int64_t file_size = -1;
-    if (!tm->resolve_file_path(proto, nk.c_str(), file_index, file_path, file_size)) {
-        return dw::utils::dup_cstr(dw::make_error_response("无法解析文件路径"));
-    }
-
-    boost::json::object data;
-    data["path"] = file_path;
-    data["size"] = file_size;
-    return dw::utils::dup_cstr(dw::make_success_response(data));
-}
-
-DW_API char *dw_set_play_position(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
-
-    dw::TaskIdentity identity;
-    int32_t file_index = 0;
-    int64_t position_ms = 0;
-    try {
-        auto obj = boost::json::parse(params_json).as_object();
-        dw::from_json(obj, identity);
-        dw::json_util::extract(obj, "file_index", file_index);
-        dw::json_util::extract(obj, "position_ms", position_ms);
-    } catch (const std::exception &) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (identity.client_id.empty() || identity.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
-    }
-
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
-    }
-
-    const std::string &nk = identity.natural_key;
-    std::scoped_lock task_lock(tm->get_mutex());
-    auto *task_record = tm->load_task_record(identity.client_id.c_str(), DW_PROTOCOL_HTTP, nk.c_str());
-    if (!task_record) {
-        task_record = tm->load_task_record(identity.client_id.c_str(), DW_PROTOCOL_TORRENT, nk.c_str());
-    }
-    if (!task_record) {
-        return dw::utils::dup_cstr(dw::make_error_response("任务不存在"));
-    }
-    tm->set_play_position(task_record->task_protocol, nk.c_str(), file_index, position_ms);
-    return dw::utils::dup_cstr(dw::make_success_response());
-}
-
-DW_API char *dw_get_play_position(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
-
-    dw::TaskIdentity identity;
-    int32_t file_index = 0;
-    try {
-        auto obj = boost::json::parse(params_json).as_object();
-        dw::from_json(obj, identity);
-        dw::json_util::extract(obj, "file_index", file_index);
-    } catch (const std::exception &) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (identity.client_id.empty() || identity.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
-    }
-
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        boost::json::object data;
-        data["position_ms"] = 0;
-        return dw::utils::dup_cstr(dw::make_success_response(data));
-    }
-
-    const std::string &nk = identity.natural_key;
-    std::scoped_lock task_lock(tm->get_mutex());
-    auto *task_record = tm->load_task_record(identity.client_id.c_str(), DW_PROTOCOL_HTTP, nk.c_str());
-    if (!task_record) {
-        task_record = tm->load_task_record(identity.client_id.c_str(), DW_PROTOCOL_TORRENT, nk.c_str());
-    }
-    if (!task_record) {
-        boost::json::object data;
-        data["position_ms"] = 0;
-        return dw::utils::dup_cstr(dw::make_success_response(data));
-    }
-    const int64_t pos = tm->get_play_position(task_record->task_protocol, nk.c_str(), file_index);
-    boost::json::object data;
-    data["position_ms"] = pos;
-    return dw::utils::dup_cstr(dw::make_success_response(data));
 }
 
 /* ------------------------------------------------------------------ */
@@ -639,56 +413,20 @@ DW_API char *dw_list_tasks(const char *params_json) {
         return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
     }
 
-    const auto records = tm->list();
+    const auto tasks = tm->list();
     boost::json::array arr;
-    for (const auto &fr: records) {
-        arr.push_back(dw::to_json(fr));
+    for (const auto &task : tasks) {
+        auto item = dw::to_json(task);
+        item["task_natural_key"] = task.task_id;
+        const auto source = task.task_protocol == DW_PROTOCOL_TORRENT ? DW_SOURCE_REMOTE_FILE
+            : (task.task_protocol == DW_PROTOCOL_HTTP ? DW_SOURCE_TASK_FILE : DW_SOURCE_LOCAL_FILE);
+        item["type"] = static_cast<int>(source);
+        item["files"] = boost::json::value_from(task.files);
+        arr.push_back(std::move(item));
     }
     boost::json::object data;
     data["tasks"] = std::move(arr);
     return dw::utils::dup_cstr(dw::make_success_response(data));
-}
-
-DW_API char *dw_set_task_priority(const char *params_json) {
-    auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
-    }
-
-    dw::TaskParams params;
-    if (dw::parse_task_params(params_json, params) != 0) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (params.client_id.empty() || params.natural_key.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
-    }
-
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
-    }
-
-    // 补充 protocol（调用方可能未传递）
-    if (params.protocol == DW_PROTOCOL_LOCAL) {
-        std::scoped_lock task_lock(tm->get_mutex());
-        auto *task_record = tm->
-                load_task_record(params.client_id.c_str(), DW_PROTOCOL_HTTP, params.natural_key.c_str());
-        if (!task_record) {
-            task_record = tm->load_task_record(params.client_id.c_str(), DW_PROTOCOL_TORRENT,
-                                               params.natural_key.c_str());
-        }
-        if (task_record) {
-            params.protocol = task_record->task_protocol;
-        } else {
-            return dw::utils::dup_cstr(dw::make_error_response("任务不存在"));
-        }
-    }
-
-    auto result = tm->resume(params);
-    if (result.code != DW_REASON_NONE) {
-        return dw::utils::dup_cstr(dw::make_error_response(result.message));
-    }
-    return dw::utils::dup_cstr(dw::make_success_response());
 }
 
 /* ------------------------------------------------------------------ */

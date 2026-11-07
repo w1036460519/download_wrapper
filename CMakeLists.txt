@@ -175,6 +175,8 @@ target_include_directories(download_wrapper
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+# 使用与预编译库配套的头文件，避免 vcpkg 中的另一版本优先被找到。
+target_include_directories(download_wrapper SYSTEM BEFORE PRIVATE "${DW_LIBTORRENT_DIR}/include")
 
 target_link_libraries(download_wrapper PRIVATE
     CURL::libcurl

@@ -7,8 +7,12 @@
 
 #include "internal/task_identity.h"
 
+#include <charconv>
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/json.hpp>
@@ -25,12 +29,17 @@ namespace dw {
         std::string magnet_link;
         std::string torrent_file;
         std::vector<int32_t> file_indexes;
-        std::vector<int32_t> priority_file_indexes;
+        std::map<int32_t, int32_t> file_priorities; // 文件索引 -> 下载优先级。
         std::vector<std::string> url_seeds;
         std::vector<uint8_t> resume_data; // 断点续传数据
-        int32_t priority = 0;
+        std::optional<int32_t> queue_priority; // 添加任务时的队列优先级。
         bool delete_files = false; // 删除任务时是否同时删除本地文件
         bool force = false; // 恢复时强制准入（调度器暂停最慢任务让行）
+
+        const std::string &task_key() const {
+            if (!natural_key.empty() || protocol == DW_PROTOCOL_LOCAL) return natural_key;
+            return protocol == DW_PROTOCOL_TORRENT ? info_hash : url;
+        }
     };
 
     // ---- C++ 序列化（内部消费） ----
@@ -42,7 +51,7 @@ namespace dw {
         if (!p.info_hash.empty()) obj["info_hash"] = p.info_hash;
         if (!p.magnet_link.empty()) obj["magnet_link"] = p.magnet_link;
         if (!p.torrent_file.empty()) obj["torrent_file"] = p.torrent_file;
-        if (p.priority != 0) obj["priority"] = p.priority;
+        if (p.queue_priority) obj["priority"] = *p.queue_priority;
         if (p.delete_files) obj["delete_files"] = true;
         if (p.force) obj["force"] = true;
 
@@ -52,10 +61,12 @@ namespace dw {
             obj["file_indexes"] = std::move(fi);
         }
 
-        if (!p.priority_file_indexes.empty()) {
-            boost::json::array pfi;
-            for (auto x: p.priority_file_indexes) pfi.push_back(x);
-            obj["priority_file_indexes"] = std::move(pfi);
+        if (!p.file_priorities.empty()) {
+            boost::json::object priorities;
+            for (const auto &[index, priority] : p.file_priorities) {
+                priorities.emplace(std::to_string(index), priority);
+            }
+            obj["file_priorities"] = std::move(priorities);
         }
 
         if (!p.url_seeds.empty()) {
@@ -76,11 +87,39 @@ namespace dw {
         json_util::extract(obj, "info_hash", p.info_hash);
         json_util::extract(obj, "magnet_link", p.magnet_link);
         json_util::extract(obj, "torrent_file", p.torrent_file);
-        json_util::extract(obj, "priority", p.priority);
+        if (const auto *value = obj.if_contains("priority");
+            value && value->is_int64() && std::in_range<int32_t>(value->as_int64())) {
+            p.queue_priority = static_cast<int32_t>(value->as_int64());
+        }
         json_util::extract(obj, "delete_files", p.delete_files);
         json_util::extract(obj, "force", p.force);
         json_util::extract(obj, "file_indexes", p.file_indexes);
-        json_util::extract(obj, "priority_file_indexes", p.priority_file_indexes);
+        if (const auto *priorities = obj.if_contains("file_priorities"); priorities && priorities->is_object()) {
+            p.file_priorities.clear();
+            for (const auto &entry : priorities->as_object()) {
+                const auto key = entry.key();
+                int32_t index = 0;
+                const auto *end = key.data() + key.size();
+                const auto [ptr, ec] = std::from_chars(key.data(), end, index);
+                const auto &priority = entry.value();
+                if (ec == std::errc{} && ptr == end && index >= 0 && priority.is_int64()) {
+                    const auto level = priority.as_int64();
+                    if (level >= 0 && level <= 7) {
+                        p.file_priorities.insert_or_assign(index, static_cast<int32_t>(level));
+                    }
+                }
+            }
+        } else if (const auto *indexes = obj.if_contains("priority_file_indexes"); indexes && indexes->is_array()) {
+            // 兼容旧请求中的索引数组和统一优先级。
+            p.file_priorities.clear();
+            const int32_t priority = p.queue_priority.value_or(4);
+            const int32_t file_priority = priority < 4 ? 1 : (priority > 4 ? 7 : 4);
+            for (const auto &index : indexes->as_array()) {
+                if (index.is_int64() && index.as_int64() >= 0 && std::in_range<int32_t>(index.as_int64())) {
+                    p.file_priorities.try_emplace(static_cast<int32_t>(index.as_int64()), file_priority);
+                }
+            }
+        }
         json_util::extract(obj, "url_seeds", p.url_seeds);
     }
 

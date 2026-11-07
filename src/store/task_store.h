@@ -1,48 +1,95 @@
 #pragma once
 
+#include "core/sqlite_database.h"
 #include "core/task.h"
 #include "core/task_record.h"
 #include "utils/string_util.h"
 #include <sqlite3.h>
+#include <memory>
 #include <mutex>
 
 namespace dw {
-    /// 仅处理 tasks 表；借用统一连接，不管理连接生命周期。
+    /// 处理 tasks 表；借用统一连接，不管理连接生命周期。
     class TaskStore {
     public:
-        explicit TaskStore(sqlite3 *const &db) : db_(db) {}
+        explicit TaskStore(sqlite3 *const &db) : db_(db) {
+        }
+
         TaskStore(const TaskStore &) = delete;
+
         TaskStore &operator=(const TaskStore &) = delete;
 
         bool init_schema() const {
             std::scoped_lock lock(mutex_);
-            return db_ && sqlite3_exec(db_, R"SQL(CREATE TABLE IF NOT EXISTS tasks (protocol INTEGER NOT NULL, unique_key TEXT NOT NULL, id INTEGER NOT NULL, client_id TEXT NOT NULL, is_remote INTEGER NOT NULL, save_path TEXT NOT NULL, original_root_name TEXT NOT NULL, root_name TEXT NOT NULL, full_path TEXT NOT NULL, file_type INTEGER NOT NULL, ext TEXT NOT NULL, parsed INTEGER NOT NULL, url TEXT NOT NULL, info_hash TEXT NOT NULL, magnet_link TEXT NOT NULL, torrent_file TEXT NOT NULL, status INTEGER NOT NULL, total_size INTEGER NOT NULL, total_done INTEGER NOT NULL, priority INTEGER NOT NULL, reason INTEGER NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL, modified_at INTEGER NOT NULL, support_range INTEGER NOT NULL, etag TEXT NOT NULL, last_modified TEXT NOT NULL, force INTEGER NOT NULL, dirty INTEGER NOT NULL, is_delete INTEGER NOT NULL, download_rate REAL NOT NULL, upload_rate REAL NOT NULL, select_file_indexes TEXT NOT NULL, priority_file_indexes TEXT NOT NULL, PRIMARY KEY(protocol, unique_key)); CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(protocol, status); CREATE INDEX IF NOT EXISTS idx_tasks_info_hash ON tasks(protocol, info_hash);)SQL", nullptr, nullptr, nullptr) == SQLITE_OK;
+            return db_ && sqlite3_exec(
+                       db_,
+                       R"SQL(CREATE TABLE IF NOT EXISTS tasks (protocol INTEGER NOT NULL, task_id TEXT NOT NULL PRIMARY KEY, id INTEGER NOT NULL, client_id TEXT NOT NULL, is_remote INTEGER NOT NULL, save_path TEXT NOT NULL, original_root_name TEXT NOT NULL, root_name TEXT NOT NULL, full_path TEXT NOT NULL, file_type INTEGER NOT NULL, ext TEXT NOT NULL, parsed INTEGER NOT NULL, url TEXT NOT NULL, info_hash TEXT NOT NULL, magnet_link TEXT NOT NULL, torrent_file TEXT NOT NULL, status INTEGER NOT NULL, total_size INTEGER NOT NULL, total_done INTEGER NOT NULL, priority INTEGER NOT NULL, reason INTEGER NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL, modified_at INTEGER NOT NULL, support_range INTEGER NOT NULL, etag TEXT NOT NULL, last_modified TEXT NOT NULL, force INTEGER NOT NULL, dirty INTEGER NOT NULL, is_delete INTEGER NOT NULL, is_read INTEGER NOT NULL DEFAULT 0, download_rate REAL NOT NULL, upload_rate REAL NOT NULL, select_file_indexes TEXT NOT NULL, priority_file_indexes TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(protocol, status);)SQL",
+                       nullptr, nullptr, nullptr) == SQLITE_OK
+                   && ensure_sqlite_column(db_, "tasks", "is_delete",
+                                           "ALTER TABLE tasks ADD COLUMN is_delete INTEGER NOT NULL DEFAULT 0")
+                   && ensure_sqlite_column(db_, "tasks", "is_read",
+                                           "ALTER TABLE tasks ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0");
         }
 
-        bool insert_task(const Task &task, const std::string &unique_key) const {
+        // 重新添加时在同一事务中替换任务及其文件。调用方须持有 TaskManager 锁。
+        bool replace_task(const Task &task) const {
+            const auto &task_id = task.task_id;
             std::scoped_lock lock(mutex_);
-            if (!db_ || unique_key.empty()) return false;
+            if (!db_ || task_id.empty()) return false;
+            // HTTP 工作线程也会使用此连接保存续传数据，防止其写入混入本事务。
+            auto *connection_mutex = sqlite3_db_mutex(db_);
+            if (connection_mutex) sqlite3_mutex_enter(connection_mutex);
+            const std::unique_ptr<sqlite3_mutex, decltype(&sqlite3_mutex_leave)>
+                    connection_lock(connection_mutex, &sqlite3_mutex_leave);
+            if (sqlite3_exec(db_, "SAVEPOINT replace_task", nullptr, nullptr, nullptr) != SQLITE_OK) return false;
+            const bool replaced =
+                    delete_for_readd("DELETE FROM tasks WHERE task_id=?", task_id)
+                    && delete_for_readd("DELETE FROM task_file WHERE task_id=?", task_id)
+                    && insert_task(task);
+            if (replaced && sqlite3_exec(db_, "RELEASE replace_task", nullptr, nullptr, nullptr) == SQLITE_OK) {
+                return true;
+            }
+            sqlite3_exec(db_, "ROLLBACK TO replace_task; RELEASE replace_task", nullptr, nullptr, nullptr);
+            return false;
+        }
+
+    private:
+        bool delete_for_readd(const char *sql, const std::string &task_id) const {
             sqlite3_stmt *statement = nullptr;
+            if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK) return false;
+            sqlite3_bind_text(statement, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+            const bool success = sqlite3_step(statement) == SQLITE_DONE;
+            sqlite3_finalize(statement);
+            return success;
+        }
+
+        bool insert_task(const Task &task) const {
+            sqlite3_stmt *statement = nullptr;
+            // 旧库的 priority_file_indexes 列要求非空，保留占位值。
             if (sqlite3_prepare_v2(
                     db_,
-                    "INSERT INTO tasks(protocol,unique_key,id,client_id,is_remote,save_path,original_root_name,root_name,full_path,file_type,ext,parsed,url,info_hash,magnet_link,torrent_file,status,total_size,total_done,priority,reason,message,created_at,modified_at,support_range,etag,last_modified,force,dirty,is_delete,download_rate,upload_rate,select_file_indexes,priority_file_indexes) VALUES(:protocol,:unique_key,:id,:client_id,:is_remote,:save_path,:original_root_name,:root_name,:full_path,:file_type,:ext,:parsed,:url,:info_hash,:magnet_link,:torrent_file,:status,:total_size,:total_done,:priority,:reason,:message,:created_at,:modified_at,:support_range,:etag,:last_modified,:force,:dirty,:is_delete,:download_rate,:upload_rate,:select_file_indexes,:priority_file_indexes)",
+                    "INSERT INTO tasks(protocol,task_id,id,client_id,is_remote,save_path,original_root_name,root_name,full_path,file_type,ext,parsed,url,info_hash,magnet_link,torrent_file,status,total_size,total_done,priority,reason,message,created_at,modified_at,support_range,etag,last_modified,force,dirty,is_delete,is_read,download_rate,upload_rate,select_file_indexes,priority_file_indexes) VALUES(:protocol,:task_id,:id,:client_id,:is_remote,:save_path,:original_root_name,:root_name,:full_path,:file_type,:ext,:parsed,:url,:info_hash,:magnet_link,:torrent_file,:status,:total_size,:total_done,:priority,:reason,:message,:created_at,:modified_at,:support_range,:etag,:last_modified,:force,:dirty,:is_delete,:is_read,:download_rate,:upload_rate,:select_file_indexes,'')",
                     -1, &statement, nullptr) != SQLITE_OK)
                 return false;
             sqlite3_bind_int(statement, sqlite3_bind_parameter_index(statement, ":protocol"),
                              static_cast<int>(task.task_protocol));
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":unique_key"), unique_key.c_str(), -1,
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":task_id"), task.task_id.c_str(), -1,
                               SQLITE_TRANSIENT);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":id"), task.id);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":client_id"), task.client_id.c_str(), -1,
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":client_id"), task.client_id.c_str(),
+                              -1,
                               SQLITE_TRANSIENT);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":is_remote"), task.is_remote);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":save_path"), task.save_path.c_str(), -1,
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":save_path"), task.save_path.c_str(),
+                              -1,
                               SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":original_root_name"),
                               task.original_root_name.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":root_name"), task.root_name.c_str(), -1,
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":root_name"), task.root_name.c_str(),
+                              -1,
                               SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":full_path"), task.full_path.c_str(), -1,
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":full_path"), task.full_path.c_str(),
+                              -1,
                               SQLITE_TRANSIENT);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":file_type"), task.file_type);
             sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":ext"), task.ext.c_str(), -1,
@@ -50,9 +97,11 @@ namespace dw {
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":parsed"), task.parsed);
             sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":url"), task.url.c_str(), -1,
                               SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":info_hash"), task.info_hash.c_str(), -1,
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":info_hash"), task.info_hash.c_str(),
+                              -1,
                               SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":magnet_link"), task.magnet_link.c_str(),
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":magnet_link"),
+                              task.magnet_link.c_str(),
                               -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":torrent_file"),
                               task.torrent_file.c_str(), -1, SQLITE_TRANSIENT);
@@ -60,12 +109,13 @@ namespace dw {
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":total_size"), task.total_size);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":total_done"), task.total_done);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":priority"), task.priority);
-            sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":reason"), task.reason);
+            sqlite3_bind_int(statement, sqlite3_bind_parameter_index(statement, ":reason"), task.reason);
             sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":message"), task.message.c_str(), -1,
                               SQLITE_TRANSIENT);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":created_at"), task.created_at);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":modified_at"), task.modified_at);
-            sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":support_range"), task.support_range);
+            sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":support_range"),
+                               task.support_range);
             sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":etag"), task.etag.c_str(), -1,
                               SQLITE_TRANSIENT);
             sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":last_modified"),
@@ -73,97 +123,115 @@ namespace dw {
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":force"), task.force);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":dirty"), task.dirty);
             sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":is_delete"), task.is_delete);
-            sqlite3_bind_double(statement, sqlite3_bind_parameter_index(statement, ":download_rate"), task.download_rate);
+            sqlite3_bind_int(statement, sqlite3_bind_parameter_index(statement, ":is_read"), task.is_read);
+            sqlite3_bind_double(statement, sqlite3_bind_parameter_index(statement, ":download_rate"),
+                                task.download_rate);
             sqlite3_bind_double(statement, sqlite3_bind_parameter_index(statement, ":upload_rate"), task.upload_rate);
             const auto selected = utils::join_ints(task.select_file_indexes);
-            const auto priorities = utils::join_ints(task.priority_file_indexes);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":select_file_indexes"), selected.c_str(),
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":select_file_indexes"),
+                              selected.c_str(),
                               -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":priority_file_indexes"),
-                              priorities.c_str(), -1, SQLITE_TRANSIENT);
             const bool success = sqlite3_step(statement) == SQLITE_DONE;
             sqlite3_finalize(statement);
             return success;
         }
 
-        bool delete_task(dw_protocol_t protocol, const std::string &unique_key) const {
+    public:
+        bool delete_task(const std::string &task_id) const {
             std::scoped_lock lock(mutex_);
-            if (!db_ || unique_key.empty()) return false;
+            if (!db_ || task_id.empty()) return false;
             sqlite3_stmt *statement = nullptr;
-            if (sqlite3_prepare_v2(db_, "DELETE FROM tasks WHERE protocol=:protocol AND unique_key=:unique_key",
-                                   -1, &statement, nullptr) != SQLITE_OK)
+            if (sqlite3_prepare_v2(
+                    db_,
+                    "UPDATE tasks SET is_delete=1 WHERE task_id=:task_id AND is_delete=0",
+                    -1, &statement, nullptr) != SQLITE_OK)
                 return false;
-            sqlite3_bind_int(statement, sqlite3_bind_parameter_index(statement, ":protocol"), static_cast<int>(protocol));
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":unique_key"), unique_key.c_str(), -1,
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":task_id"), task_id.c_str(), -1,
                               SQLITE_TRANSIENT);
             const bool success = sqlite3_step(statement) == SQLITE_DONE;
             sqlite3_finalize(statement);
             return success;
         }
 
-        /// 按 info_hash 查询 BT 任务；未找到或失败返回 false，out 清空。
-        bool find_by_info_hash(const std::string &info_hash, Task &out) const {
+        bool update_read(const std::string &task_id, bool is_read) const {
+            std::scoped_lock lock(mutex_);
+            sqlite3_stmt *statement = nullptr;
+            if (!db_ || sqlite3_prepare_v2(db_,
+                                           "UPDATE tasks SET is_read=? WHERE task_id=? AND is_delete=0",
+                                           -1, &statement, nullptr) != SQLITE_OK)
+                return false;
+            sqlite3_bind_int(statement, 1, is_read);
+            sqlite3_bind_text(statement, 2, task_id.c_str(), -1, SQLITE_TRANSIENT);
+            const bool success = sqlite3_step(statement) == SQLITE_DONE;
+            sqlite3_finalize(statement);
+            return success;
+        }
+
+        /// 按任务标识查询，默认排除软删除记录。
+        bool find_by_task_id(const std::string &task_id, Task &out, const bool include_deleted = false) const {
             std::scoped_lock lock(mutex_);
             out = {};
-            if (!db_ || info_hash.empty()) return false;
+            if (!db_ || task_id.empty()) return false;
             sqlite3_stmt *statement = nullptr;
-            if (sqlite3_prepare_v2(db_, "SELECT id,client_id,is_remote,save_path,original_root_name,root_name,full_path,file_type,ext,parsed,url,info_hash,magnet_link,torrent_file,protocol,status,total_size,total_done,priority,reason,message,created_at,modified_at,support_range,etag,last_modified,force,dirty,is_delete,download_rate,upload_rate,select_file_indexes,priority_file_indexes FROM tasks WHERE protocol=:protocol AND info_hash=:info_hash LIMIT 1", -1, &statement, nullptr) != SQLITE_OK) return false;
-            sqlite3_bind_int(statement, sqlite3_bind_parameter_index(statement, ":protocol"), DW_PROTOCOL_TORRENT);
-            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":info_hash"), info_hash.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_prepare_v2(db_,
+                                   "SELECT * FROM tasks WHERE task_id=:task_id AND (is_delete=0 OR :include_deleted)",
+                                   -1, &statement, nullptr) != SQLITE_OK)
+                return false;
+            sqlite3_bind_int(statement, sqlite3_bind_parameter_index(statement, ":include_deleted"), include_deleted);
+            sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":task_id"), task_id.c_str(), -1,
+                              SQLITE_TRANSIENT);
             const bool found = sqlite3_step(statement) == SQLITE_ROW;
-            if (found) {
-                auto text = [&](int index) -> std::string {
-                    const auto *value = sqlite3_column_text(statement, index);
-                    return value ? reinterpret_cast<const char *>(value) : "";
-                };
-                out.id = sqlite3_column_int64(statement, 0);
-                out.client_id = text(1);
-                out.is_remote = sqlite3_column_int(statement, 2) != 0;
-                out.save_path = text(3);
-                out.original_root_name = text(4);
-                out.root_name = text(5);
-                out.full_path = text(6);
-                out.file_type = sqlite3_column_int(statement, 7) != 0;
-                out.ext = text(8);
-                out.parsed = sqlite3_column_int(statement, 9) != 0;
-                out.url = text(10);
-                out.info_hash = text(11);
-                out.magnet_link = text(12);
-                out.torrent_file = text(13);
-                out.task_protocol = static_cast<dw_protocol_t>(sqlite3_column_int(statement, 14));
-                out.status = sqlite3_column_int(statement, 15);
-                out.total_size = sqlite3_column_int64(statement, 16);
-                out.total_done = sqlite3_column_int64(statement, 17);
-                out.priority = sqlite3_column_int(statement, 18);
-                out.reason = sqlite3_column_int(statement, 19);
-                out.message = text(20);
-                out.created_at = sqlite3_column_int64(statement, 21);
-                out.modified_at = sqlite3_column_int64(statement, 22);
-                out.support_range = sqlite3_column_int(statement, 23);
-                out.etag = text(24);
-                out.last_modified = text(25);
-                out.force = sqlite3_column_int(statement, 26) != 0;
-                out.dirty = sqlite3_column_int(statement, 27) != 0;
-                out.is_delete = sqlite3_column_int(statement, 28) != 0;
-                out.download_rate = sqlite3_column_double(statement, 29);
-                out.upload_rate = sqlite3_column_double(statement, 30);
-                out.select_file_indexes = utils::split_ints(text(31));
-                out.priority_file_indexes = utils::split_ints(text(32));
-            }
+            if (found) out = read_task(statement);
             sqlite3_finalize(statement);
             return found;
         }
 
+        /// 查询所有未删除的任务。
+        std::vector<Task> find_all() const {
+            std::scoped_lock lock(mutex_);
+            std::vector<Task> tasks;
+            sqlite3_stmt *statement = nullptr;
+            if (!db_ || sqlite3_prepare_v2(db_,
+                    "SELECT * FROM tasks WHERE is_delete=0 ORDER BY modified_at DESC",
+                    -1, &statement, nullptr) != SQLITE_OK) return tasks;
+            while (sqlite3_step(statement) == SQLITE_ROW) tasks.push_back(read_task(statement));
+            sqlite3_finalize(statement);
+            return tasks;
+        }
+
+        /// 按任务状态批量查询未删除的任务。
+        std::vector<Task> find_by_status(const std::vector<dw_task_status_t> &statuses) const {
+            std::scoped_lock lock(mutex_);
+            std::vector<Task> tasks;
+            if (!db_ || statuses.empty()) return tasks;
+
+            std::string sql = "SELECT * FROM tasks WHERE is_delete=0 AND status IN (?";
+            for (size_t index = 1; index < statuses.size(); ++index) sql += ",?";
+            sql += ") ORDER BY modified_at DESC";
+
+            sqlite3_stmt *statement = nullptr;
+            if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &statement, nullptr) != SQLITE_OK) return tasks;
+            int param = 1;
+            for (const auto status: statuses) sqlite3_bind_int(statement, param++, static_cast<int>(status));
+            while (sqlite3_step(statement) == SQLITE_ROW) tasks.push_back(read_task(statement));
+            sqlite3_finalize(statement);
+            return tasks;
+        }
+
     private:
+        static Task read_task(sqlite3_stmt *statement);
+
         sqlite3 *const &db_;
         mutable std::mutex mutex_;
     };
+
     /**
      * SQLite 任务存储。借用统一连接，不负责打开和关闭。
      */
     class LegacyTaskStore {
     public:
-        explicit LegacyTaskStore(sqlite3 *const &db) : db_(db) {}
+        explicit LegacyTaskStore(sqlite3 *const &db) : db_(db) {
+        }
 
         ~LegacyTaskStore() = default;
 
@@ -173,21 +241,15 @@ namespace dw {
 
         /// 建表（IF NOT EXISTS）：复合主键 (client_id, protocol, natural_key)；
         /// 检测到旧 schema（task_id 列）则 DROP 全部表重建（项目未上线）。
-        void init_schema() const;
+        bool init_schema() const;
 
 
-        /// 删除任务及其 resume_data / file_progress_cache / file_records（统一按复合键）。
+        /// 软删除旧任务记录并清理续传和进度缓存。
         void remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const;
 
         /// 写入 / 覆盖断点续传数据。
         void save_resume(const std::string &client_id, dw_protocol_t protocol,
                          const std::string &natural_key, const uint8_t *data, size_t size) const;
-
-        /// 保存任务来源（save_path / magnet_link / torrent_file），不影响 data 列；用于 resume data 尚未生成时的兜底恢复。
-        void save_resume_source(const std::string &client_id, dw_protocol_t protocol,
-                                const std::string &natural_key,
-                                const std::string &save_path,
-                                const std::string &magnet_link, const std::string &torrent_file) const;
 
         /// 恢复信息结构体：包含 resume data 二进制、magnet_link、torrent_file
         struct ResumeInfo {
@@ -236,7 +298,7 @@ namespace dw {
                                                int32_t status) const;
 
         /// 按三要素更新文件记录的运行时可变字段（元数据 + 状态 + 进度），单次 SQL。
-        void update_file_record(const FileRecord &rec) const;
+        void update_file_record(const Task &rec) const;
 
         // ---- 播放进度（独立表 play_progress，以完整路径为键）----
 
@@ -277,16 +339,15 @@ namespace dw {
 
         /// 按任务三要素查询文件进度缓存（每个文件一条记录）；不存在返回空 vector。
         std::vector<FileProgressInfo> load_file_progress(const std::string &client_id,
-                                                          dw_protocol_t protocol,
-                                                          const std::string &natural_key) const;
+                                                         dw_protocol_t protocol,
+                                                         const std::string &natural_key) const;
 
         /// 按完整路径批量查询文件进度（file_done + intervals 原始 JSON）。
         /// @return full_path -> {file_done, intervals_json} 映射
-        std::unordered_map<std::string, std::pair<int64_t, std::string>>
+        std::unordered_map<std::string, std::pair<int64_t, std::string> >
         load_file_progress_by_paths(const std::vector<std::string> &paths) const;
 
     private:
         sqlite3 *const &db_;
     };
-
 }
