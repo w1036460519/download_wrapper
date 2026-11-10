@@ -260,12 +260,11 @@ namespace dw {
             task.priority = params->queue_priority.value_or(0);
             task.status = DW_TASK_STATUS_DOWNLOADING;
             task.created_at = task.modified_at = utils::now_unix_ms();
-            if (!manager->get_task_store().replace_task(task)) {
+            if (!manager->replace_engine_task(std::move(task))) {
                 std::scoped_lock lock(he::g_map_mtx);
                 he::g_tasks.erase(url);
                 return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务持久化失败");
             }
-            manager->get_engine_task(task.url);
         }
         start_task(tCtx);
 
@@ -307,18 +306,16 @@ namespace dw {
                 return dw_submit_result_t::failure(DW_REASON_FAIL, "HTTP 任务正在暂停");
             }
         }
+        std::scoped_lock lock(manager->get_mutex());
+        const auto *task = manager->get_engine_task(natural_key);
+        if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->save_path.empty()) {
+            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务或保存路径不存在");
+        }
         TaskParams p{};
         p.client_id = client_id;
         p.url = natural_key;
-        {
-            std::scoped_lock lock(manager->get_mutex());
-            const auto *file_record = manager->get_engine_task(natural_key);
-            if (!file_record || file_record->save_path.empty()) {
-                return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务或保存路径不存在");
-            }
-            p.save_path = file_record->save_path;
-            p.resume_data = manager->get_store().load_resume_info(client_id, DW_PROTOCOL_HTTP, natural_key).data;
-        }
+        p.save_path = task->save_path;
+        p.resume_data = manager->get_store().load_resume_info(client_id, DW_PROTOCOL_HTTP, natural_key).data;
         return start_download(&p, false);
     }
 
@@ -332,6 +329,14 @@ namespace dw {
 
         if (!ensure_running()) {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "ensure_running failed");
+        }
+
+        auto *manager = he::g_task_manager;
+        if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
+        std::scoped_lock lock(manager->get_mutex());
+        auto *task = manager->get_engine_task(id);
+        if (!task || task->task_protocol != DW_PROTOCOL_HTTP) {
+            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务不存在");
         }
 
         try {
@@ -362,6 +367,14 @@ namespace dw {
         }
 
         // 置取消和删除标志，待线程退出后由 sweep 回收上下文。
+        auto *manager = he::g_task_manager;
+        if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
+        std::scoped_lock lock(manager->get_mutex());
+        auto *task = manager->get_engine_task(id);
+        if (!task || task->task_protocol != DW_PROTOCOL_HTTP) {
+            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务不存在");
+        }
+
         try {
             bool hit = false;
             {
@@ -372,6 +385,8 @@ namespace dw {
                     hit = true;
                 }
             }
+            task->is_delete = true;
+            task->dirty = true;
             if (hit) {
                 log_i(id.c_str(), "HTTP delete_task 已标记，等待回收上下文");
                 return dw_submit_result_t::success();

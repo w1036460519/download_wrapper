@@ -1,6 +1,6 @@
 /**
  * @file task.h
- * @brief 统一任务结构；字段和默认值沿用原 FileRecord，供后续迁移使用。
+ * @brief 统一任务结构，供引擎、任务管理和持久化使用。
  */
 #pragma once
 
@@ -14,8 +14,8 @@
 
 namespace dw {
     struct Task {
-        int64_t id = 0; // 自增主键（0=未落库）
-        std::string task_id; // 唯一任务标识，HTTP 为 URL，BT 为 info_hash。
+        // ---- 持久化到 tasks 表 ----
+        std::string task_id; // 任务主键，HTTP 为 URL，BT 为 info_hash。
         std::string client_id; // 客户端标识
         bool is_remote = false; // 远程标识
         std::string name; // 任务名称
@@ -37,7 +37,7 @@ namespace dw {
         // 任务关联（无关联时 protocol=LOCAL、natural_key 为空）
         dw_protocol_t task_protocol = DW_PROTOCOL_LOCAL;
 
-        // 任务状态持久化（权威列：状态迁移即时写，进度经节流同步）
+        // 任务状态和进度，由维护线程同步。
         int32_t status = 0; // 任务状态（dw_task_status_t）
         int64_t total_size = -1; // 总字节
         int64_t total_done = 0; // 已完成字节
@@ -50,30 +50,28 @@ namespace dw {
         bool is_delete = false; // 软删除标记
         bool is_read = false; // 已读标记
 
-        // ---- 非持久化运行时字段（仅内存态，不入库） ----
+        // ---- 独立持久化到 task_file 表 ----
         std::vector<TaskFile> files; // 按 file_index 升序保存，同一索引只保留一条记录。
-        int32_t support_range = 0; // 服务端 Range 支持：0=不支持，1=支持
-        std::string etag; // 响应 ETag
-        std::string last_modified; // 响应 Last-Modified
-        std::vector<int32_t> select_file_indexes; // 文件索引列表
-        std::map<int32_t, int32_t> priority_file_indexes; // 文件索引 -> 下载优先级
-        bool force = false; // 强制准入标记（调度器让行后自动清除）
-        bool dirty = false; // 数据已变更待同步（持久化 + 推送 app）
 
-        // session 删除标识 true:已从session中删除
-        bool need_delete_session = false;
-        // file 删除标识 true:任务文件删除
-        bool need_delete_file = false;
-
-
-        // 运行态遥测（不持久化）
-        double download_rate = 0.0; // 下载速率（B/s）
-        double upload_rate = 0.0; // 上传速率（B/s）；HTTP 恒为 0
+        // ---- 运行时字段，不写入 tasks 表 ----
+        // BT 文件选择与优先级的恢复以引擎续传数据为准。
+        std::vector<int32_t> select_file_indexes;
+        std::map<int32_t, int32_t> priority_file_indexes;
+        int32_t support_range = 0; // HTTP Range 支持，续传所需的值由 HTTP 续传数据保存。
+        std::string etag; // HTTP 响应 ETag，续传所需的值由 HTTP 续传数据保存。
+        std::string last_modified; // HTTP 响应 Last-Modified，续传所需的值由 HTTP 续传数据保存。
+        bool force = false; // 本次调度的强制准入标记。
+        bool dirty = false; // 任务有待保存和推送的变化。
+        bool bt_waiting_file_priorities = false; // 等待引擎确认本次优先级变更。
+        bool file_dirty = false; // 文件有待同步的变化。
+        bool need_delete_session = false; // 已从 session 中移除。
+        bool need_delete_file = false; // 任务文件已删除。
+        double download_rate = 0.0; // 实时下载速率（B/s）。
+        double upload_rate = 0.0; // 实时上传速率（B/s）。
     };
 
     inline boost::json::object to_json(const Task &r) {
         boost::json::object obj;
-        obj["id"] = r.id;
         obj["task_id"] = r.task_id;
         obj["client_id"] = r.client_id;
         obj["is_remote"] = r.is_remote;

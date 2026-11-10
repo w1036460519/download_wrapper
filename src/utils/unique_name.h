@@ -21,8 +21,7 @@ namespace dw::utils {
  *   - 原名未冲突：由 multi_file 决定——多文件 BT 的 name 是根目录名，须建目录；
  *     单文件 BT 与 HTTP 的 name 是文件名，须建空文件。形态错配会导致引擎后续
  *     落盘失败（同名文件挡住建目录，或同名目录挡住写文件）。
- *   - 原名冲突：按 n=1..9999 依次尝试 name(n) 作为包层目录名，形态恒为目录。
- *     整名尾部加序号、不拆扩展名，带点名（如 Ubuntu.22.04-LTS）也不会插错位置。
+ *   - 原名冲突：依次尝试带序号的包层目录，默认以原名为前缀。
  *
  * 占位创建失败（磁盘满 / 权限等）不阻断定名：经 out_error 回报原因并返回候选名 ，
  * 退化为无占位行为，真实落盘时由引擎自身的错误路径归因。
@@ -31,12 +30,14 @@ namespace dw::utils {
  * @param name       期望名称（basename，不含路径分隔符）。
  * @param multi_file 原名对应内容是否为多文件（决定原名占位形态：true=目录）。
  * @param out_error  非 NULL 时写入占位失败原因；成功置空串。
+ * @param collision_base 可选的冲突目录名前缀，例如去掉扩展名后的名称。
  * @return 抢占到的 basename；原名未冲突时原样返回。
  */
 std::string acquire_unique_name(const std::string& dir,
                                 const std::string& name,
                                 bool multi_file,
-                                std::string* out_error = nullptr);
+                                std::string* out_error = nullptr,
+                                const std::string& collision_base = {});
 
 /**
  * 在目录 dir 下抢占一个 wrapper 文件夹名（恒建目录占位）。

@@ -479,8 +479,8 @@ DW_API void dw_set_log_callback(dw_log_cb cb);
  *   "info_hash": "...",               // BT 必填
  *   "magnet_link": "...",             // BT 可选
  *   "torrent_file": "...",            // BT 可选
- *   "file_indexes": [0, 1, 2],        // 可选
- *   "priority_file_indexes": [],      // 可选
+ *   "file_indexes": [0, 1, 2],        // BT 可选，应用文件优先级的索引
+ *   "file_priority": 4,               // BT 可选，范围 0–7，默认 4
  *   "url_seeds": [],                  // 可选
  *   "priority": 0                     // 可选
  * }
@@ -580,17 +580,10 @@ DW_API char *dw_list_tasks(const char *params_json);
 /* ================================================================== */
 
 /**
- * 扫描本地文件：校验全量记录存在性 + 增量发现新文件/目录。
- *
- * 1. 查询全量 file_records，逐条校验物理文件存在性：
- *    - 本地文件不存在：删除 DB，经进度回调通知 App。
- *    - 下载任务不存在：状态改为 ERROR（可利用 resume_data 重新下载）。
- *    - 文件存在但 save_path 不在传入集合中：删除本地文件记录。
- * 2. 扫描传入目录集合，将未登记的条目注册为本地文件条目。
+ * 本地目录扫描接口暂不可用，保留符号供后续实现。
  *
  * @param params_json  JSON 字符串：{"client_id": "...", "catalog_paths": ["/path1", "/path2"]}
- * @return             成功返回 JSON 响应（调用者 dw_free 释放）。
- *                     响应格式：{"code": 0, "data": {"affected_count": 3}} 或 {"code": -1, "message": "..."}
+ * @return             返回错误 JSON（调用者 dw_free 释放）。
  */
 DW_API char *dw_scan_local_file(const char *params_json);
 

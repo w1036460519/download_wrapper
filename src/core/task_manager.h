@@ -3,11 +3,6 @@
  * @brief 库内任务中枢：SQLite 持久化 + 内存注册表 + 优先级就绪队列 + 周期调度。
  *
  * 设计要点：
- *   - 注册表仅常驻排队 / 活跃任务（DOWNLOADING/QUEUED），
- *     暂停 / 完成 / 错误任务状态即时投影至 file_records 后从内存移除，按需经 add/resume/list 回读；
- *     引擎仅持有当前活跃任务的运行时句柄；
- *   - 注册表 key 为 union_id（"client_id|type|raw_key" 格式），client_id 过滤在 API 入口校验；
- *   - 控制接口统一接 (proto, natural_key)，client_id 从 session 取；
  *   - 内存任务按 Task::task_id 索引；
  *   - HTTP worker 和 BT 引擎各自保存断点续传数据；
  *   - 并发准入：活跃任务数 < max_concurrent_downloads 才准入下载，其余置 QUEUED；
@@ -18,7 +13,6 @@
 
 #include "download_wrapper/download_wrapper.h"
 #include "internal/downloader_internal.h"
-#include "task_record.h"
 #include "store/task_store.h"
 #include "store/task_bt_resume_store.h"
 #include "store/task_file_store.h"
@@ -114,26 +108,24 @@ namespace dw {
         TaskStore &get_task_store() { return task_store_; }
 
         /// 内存未命中时加载任务及文件。使用返回指针期间须持有 get_mutex()。
-        Task *get_engine_task(const std::string &key);
+        Task *get_engine_task(const std::string &key, bool include_deleted = false);
+        bool replace_engine_task(Task task, bool cache_task = true);
 
 
         TaskBtResumeStore &get_bt_resume_store() { return bt_resume_store_; }
 
     private:
-        // A 线程（轻量）：周期任务调度准入。
-        // stop() 置 running_=false 后由 notify_all 唤醒等待点并退出循环。
+        /// 任务调度 调度准入任务
         void scheduler_loop();
 
         // B 线程（重载）：周期持久化 dirty 记录 + 推送 JSON + 引擎 sweep。
         void maintenance_loop();
 
         // ---- 内部工具 ----
-        int32_t active_count_locked() const; // 占用下载额度的任务数
-
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
         IDownloadEngine *engine_of(dw_protocol_t proto) const;
 
-        // 填充 FileInfo 列表的下载进度（根据 full_path 匹配 file_progress_cache 表）。
+        // 填充 FileInfo 列表的下载进度（根据 full_path 匹配 task_file 表）。
         void fill_file_progress(std::vector<FileInfo> &files) const;
 
         // 删除任务数据目录，含路径逃逸防护。

@@ -455,19 +455,7 @@ DW_API char *dw_scan_local_file(const char *params_json) {
         return dw::utils::dup_cstr(dw::make_error_response("参数不完整"));
     }
 
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
-    }
-
-    auto result = tm->scan_local_file(catalog_paths);
-    if (result.code != DW_REASON_NONE) {
-        return dw::utils::dup_cstr(dw::make_error_response(result.message));
-    }
-
-    boost::json::object data;
-    data["affected_count"] = result.affected_count;
-    return dw::utils::dup_cstr(dw::make_success_response(data));
+    return dw::utils::dup_cstr(dw::make_error_response("本地文件扫描暂不可用"));
 }
 
 /* ------------------------------------------------------------------ */

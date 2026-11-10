@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,28 +19,22 @@
 #include <boost/json.hpp>
 
 namespace dw {
-    /**
-     * 任务参数（继承三要素）：用于 FFI 边界的 JSON 序列化/反序列化。
-     * 内部使用 C++ 特性（std::string, std::vector），无需跨边界内存管理。
-     */
-    struct TaskParams : TaskIdentity {
+
+    struct TaskParams {
+        std::string client_id;
         std::string save_path;
         std::string url;
         std::string info_hash;
         std::string magnet_link;
         std::string torrent_file;
         std::vector<int32_t> file_indexes;
+        int32_t file_priority = 4; // 添加 BT 任务时，file_indexes 共用的下载优先级。
         std::map<int32_t, int32_t> file_priorities; // 文件索引 -> 下载优先级。
         std::vector<std::string> url_seeds;
         std::vector<uint8_t> resume_data; // 断点续传数据
         std::optional<int32_t> queue_priority; // 添加任务时的队列优先级。
         bool delete_files = false; // 删除任务时是否同时删除本地文件
         bool force = false; // 恢复时强制准入（调度器暂停最慢任务让行）
-
-        const std::string &task_key() const {
-            if (!natural_key.empty() || protocol == DW_PROTOCOL_LOCAL) return natural_key;
-            return protocol == DW_PROTOCOL_TORRENT ? info_hash : url;
-        }
     };
 
     // ---- C++ 序列化（内部消费） ----
@@ -54,6 +49,7 @@ namespace dw {
         if (p.queue_priority) obj["priority"] = *p.queue_priority;
         if (p.delete_files) obj["delete_files"] = true;
         if (p.force) obj["force"] = true;
+        if (!p.file_indexes.empty() || p.file_priority != 4) obj["file_priority"] = p.file_priority;
 
         if (!p.file_indexes.empty()) {
             boost::json::array fi;
@@ -63,7 +59,7 @@ namespace dw {
 
         if (!p.file_priorities.empty()) {
             boost::json::object priorities;
-            for (const auto &[index, priority] : p.file_priorities) {
+            for (const auto &[index, priority]: p.file_priorities) {
                 priorities.emplace(std::to_string(index), priority);
             }
             obj["file_priorities"] = std::move(priorities);
@@ -93,10 +89,25 @@ namespace dw {
         }
         json_util::extract(obj, "delete_files", p.delete_files);
         json_util::extract(obj, "force", p.force);
-        json_util::extract(obj, "file_indexes", p.file_indexes);
+        p.file_priority = 4;
+        if (const auto *value = obj.if_contains("file_priority")) {
+            if (!value->is_int64() || value->as_int64() < 0 || value->as_int64() > 7) {
+                throw std::invalid_argument("file_priority must be an integer from 0 to 7");
+            }
+            p.file_priority = static_cast<int32_t>(value->as_int64());
+        }
+        if (const auto *indexes = obj.if_contains("file_indexes"); indexes && indexes->is_array()) {
+            p.file_indexes.clear();
+            for (const auto &index: indexes->as_array()) {
+                if (!index.is_int64() || index.as_int64() < 0 || !std::in_range<int32_t>(index.as_int64())) {
+                    throw std::invalid_argument("file_indexes must contain non-negative int32 indexes");
+                }
+                p.file_indexes.push_back(static_cast<int32_t>(index.as_int64()));
+            }
+        }
         if (const auto *priorities = obj.if_contains("file_priorities"); priorities && priorities->is_object()) {
             p.file_priorities.clear();
-            for (const auto &entry : priorities->as_object()) {
+            for (const auto &entry: priorities->as_object()) {
                 const auto key = entry.key();
                 int32_t index = 0;
                 const auto *end = key.data() + key.size();
@@ -114,7 +125,7 @@ namespace dw {
             p.file_priorities.clear();
             const int32_t priority = p.queue_priority.value_or(4);
             const int32_t file_priority = priority < 4 ? 1 : (priority > 4 ? 7 : 4);
-            for (const auto &index : indexes->as_array()) {
+            for (const auto &index: indexes->as_array()) {
                 if (index.is_int64() && index.as_int64() >= 0 && std::in_range<int32_t>(index.as_int64())) {
                     p.file_priorities.try_emplace(static_cast<int32_t>(index.as_int64()), file_priority);
                 }

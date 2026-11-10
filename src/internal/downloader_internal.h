@@ -6,7 +6,6 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
-#include "core/task_record.h"
 #include "internal/file_info.h"
 #include "internal/json_util.h"
 #include "internal/config.h"

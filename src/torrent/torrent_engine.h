@@ -29,7 +29,7 @@ public:
     /// 持有 tasks_mutex() 时查询内存任务并使用返回指针。
     /// @param info_hash BT 任务哈希。
     /// @return 匹配的 BT 任务，未找到时返回 nullptr。
-    static Task *get_task(const std::string &info_hash);
+    static Task *get_task(const std::string &info_hash, bool include_deleted = false);
 
     /// 返回已关联任务管理器的递归互斥锁。
     static std::recursive_mutex &tasks_mutex();

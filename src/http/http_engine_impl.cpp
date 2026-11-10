@@ -798,7 +798,7 @@ namespace dw {
             }
 
             void emit_resume(dl_task_ctx *tCtx) {
-                if (!tCtx || !g_task_manager) return;
+                if (!tCtx || !g_task_manager || tCtx->delete_req.load()) return;
                 const std::string blob = serialize_resume(tCtx);
                 if (blob.empty()) return;
                 g_task_manager->get_store().save_resume(

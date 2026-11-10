@@ -21,6 +21,7 @@
 #include "utils/string_util.h"
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <ranges>
@@ -33,13 +34,6 @@ namespace dw {
     namespace {
         bool is_download_task(const Task &task) {
             return task.task_protocol == DW_PROTOCOL_HTTP || task.task_protocol == DW_PROTOCOL_TORRENT;
-        }
-
-        /// 占用下载额度的状态集合：DOWNLOADING + RESOLVING。
-        /// RESOLVING 正在下载元数据（BT 磁力链），占用网络带宽；
-        /// QUEUED 为纯等待态，不占名额；暂停/错误/完成自动释放额度。
-        bool status_occupies_slot(int32_t s) {
-            return s == DW_TASK_STATUS_DOWNLOADING || s == DW_TASK_STATUS_RESOLVING;
         }
     } // namespace
 
@@ -80,7 +74,7 @@ namespace dw {
             return -1;
         }
         if (!store_.init_schema() || !task_store_.init_schema() || !task_file_store_.init_schema() ||
-            !task_file_store_.init_task_triggers() || !bt_resume_store_.init_schema()) {
+            !bt_resume_store_.init_schema()) {
             log_e("manager", "数据任务初始化失败");
             database_.close();
             return -1;
@@ -138,7 +132,7 @@ namespace dw {
             log_e("manager", "添加任务失败 链接不能为空");
             return dw_submit_result_t::failure();
         }
-        if (protocol == DW_PROTOCOL_TORRENT && (params.magnet_link.empty() || params.torrent_file.empty())) {
+        if (protocol == DW_PROTOCOL_TORRENT && (params.magnet_link.empty() && params.torrent_file.empty())) {
             log_e("manager", "添加任务失败 链接/文件不能为空");
             return dw_submit_result_t::failure();
         }
@@ -146,7 +140,7 @@ namespace dw {
             // 使用配置中的路径
             params.save_path = config_.save_path;
             IDownloadEngine *eng = engine_of(protocol);
-            return eng->add_task(&params);;
+            return eng ? eng->add_task(&params) : dw_submit_result_t::failure();
         }
         log_e("manager", "添加任务 暂不支持");
         return dw_submit_result_t::failure();
@@ -156,7 +150,7 @@ namespace dw {
         log_i("manager", "暂停任务[{}]", to_json_string(params));
         if (params.client_id.empty()) {
             IDownloadEngine *eng = engine_of(params.protocol);
-            return eng->pause_task(&params);
+            return eng ? eng->pause_task(&params) : dw_submit_result_t::failure();
         }
         log_e("manager", "暂停任务 暂不支持");
         return dw_submit_result_t::failure();
@@ -167,7 +161,7 @@ namespace dw {
         log_i("manager", "恢复任务[{}]", to_json_string(params));
         if (params.client_id.empty()) {
             IDownloadEngine *engine = engine_of(params.protocol);
-            return engine->resume_task(&params);
+            return engine ? engine->resume_task(&params) : dw_submit_result_t::failure();
         }
         log_e("manager", "恢复任务 暂不支持");
         return dw_submit_result_t::failure();
@@ -177,22 +171,36 @@ namespace dw {
         log_i("manager", "删除任务[{}]", to_json_string(params));
         if (params.client_id.empty()) {
             IDownloadEngine *engine = engine_of(params.protocol);
-            return engine->delete_task(&params);
+            return engine ? engine->delete_task(&params) : dw_submit_result_t::failure();
         }
         log_e("manager", "恢复任务 暂不支持");
         return dw_submit_result_t::failure();
     }
 
-    Task *TaskManager::get_engine_task(const std::string &key) {
+    Task *TaskManager::get_engine_task(const std::string &key, bool include_deleted) {
         std::scoped_lock lock(mtx_);
-        if (const auto it = tasks_.find(key); it != tasks_.end()) return &it->second;
+        if (const auto it = tasks_.find(key); it != tasks_.end())
+            return !include_deleted && it->second.is_delete ? nullptr : &it->second;
 
         Task task;
-        if (!task_store_.find_by_task_id(key, task)) {
+        if (!task_store_.find_by_task_id(key, task, include_deleted)) {
             return nullptr;
         }
         task.files = task_file_store_.get(key);
         return &tasks_.try_emplace(key, std::move(task)).first->second;
+    }
+
+    bool TaskManager::replace_engine_task(Task task, bool cache_task) {
+        std::scoped_lock lock(mtx_);
+        const auto key = task.task_id;
+        if (const auto it = tasks_.find(key); it != tasks_.end() && it->second.is_delete)
+            return false; // 等待维护线程保存并取走删除通知。
+        if (!task_store_.replace_task(task)) return false;
+        if (cache_task) {
+            task.dirty = true;
+            tasks_.insert_or_assign(key, std::move(task));
+        }
+        return true;
     }
 
     /* ================================================================== */
@@ -202,7 +210,22 @@ namespace dw {
     std::vector<Task> TaskManager::list() {
         std::scoped_lock lock(mtx_);
         auto tasks = task_store_.find_all();
-        for (auto &task : tasks) {
+        std::erase_if(tasks, [this](const Task &task) {
+            const auto it = tasks_.find(task.task_id);
+            return it != tasks_.end() && it->second.is_delete;
+        });
+        for (auto &task: tasks) {
+            if (const auto it = tasks_.find(task.task_id); it != tasks_.end()) {
+                const auto &live = it->second;
+                task.select_file_indexes = live.select_file_indexes;
+                task.priority_file_indexes = live.priority_file_indexes;
+                task.support_range = live.support_range;
+                task.etag = live.etag;
+                task.last_modified = live.last_modified;
+                task.force = live.force;
+                task.download_rate = live.download_rate;
+                task.upload_rate = live.upload_rate;
+            }
             task.files = task_file_store_.get(task.task_id);
         }
         return tasks;
@@ -220,86 +243,56 @@ namespace dw {
             params.natural_key = task.task_id;
             return params;
         };
+        const auto higher_priority = [](const Task &a, const Task &b) {
+            if (a.force != b.force) return a.force;
+            if (a.priority != b.priority) return a.priority > b.priority;
+            if (a.created_at != b.created_at) return a.created_at < b.created_at;
+            return a.task_id < b.task_id;
+        };
         while (running_.load()) {
-            std::vector<TaskParams> to_pause;
             {
                 std::scoped_lock lock(mtx_);
-                std::erase_if(tasks_, [](const auto &entry) {
-                    const auto &task = entry.second;
-                    return task.is_delete && !task.dirty &&
-                           (task.task_protocol != DW_PROTOCOL_TORRENT ||
-                            (task.need_delete_session && task.need_delete_file));
-                });
+                Task *priority_task = nullptr;
+                Task *slowest_task = nullptr;
+                std::vector<Task *> downloading;
 
-                if (net_allowed_) {
-                    while (running_.load() && config_.max_concurrent_downloads > 0) {
-                        // 强制任务优先，再按任务优先级和创建时间排序。
-                        Task *next = nullptr;
-                        for (auto &task: tasks_ | std::views::values) {
-                            if (task.is_delete || task.status != DW_TASK_STATUS_QUEUED ||
-                                !is_download_task(task) || !engine_of(task.task_protocol)) continue;
-                            if (!next ||
-                                task.force > next->force ||
-                                (task.force == next->force && task.priority > next->priority) ||
-                                (task.force == next->force && task.priority == next->priority &&
-                                 task.created_at < next->created_at)) {
-                                next = &task;
-                            }
-                        }
-                        if (!next) break;
+                for (auto &task: tasks_ | std::views::values) {
+                    if (task.is_delete || !is_download_task(task) || !engine_of(task.task_protocol)) continue;
 
-                        if (active_count_locked() >= config_.max_concurrent_downloads) {
-                            if (!next->force) break;
-                            Task *slowest = nullptr;
-                            for (auto &task: tasks_ | std::views::values) {
-                                if (task.is_delete || task.status != DW_TASK_STATUS_DOWNLOADING ||
-                                    !is_download_task(task) || !engine_of(task.task_protocol)) continue;
-                                if (!slowest || task.download_rate < slowest->download_rate) {
-                                    slowest = &task;
-                                }
-                            }
-                            if (!slowest) break;
-
-                            log_i(slowest->task_id.c_str(), "暂停最慢任务");
-                            const auto params = task_params(*slowest);
-                            if (engine_of(params.protocol)->pause_task(&params).code != DW_REASON_NONE) {
-                                break;
-                            }
-                            slowest->status = DW_TASK_STATUS_PAUSED;
-                            slowest->download_rate = 0.0;
-                            slowest->upload_rate = 0.0;
-                            slowest->modified_at = now_unix_ms();
-                            slowest->dirty = true;
-                            continue;
-                        }
-
-                        auto params = task_params(*next);
-                        params.file_priorities = next->priority_file_indexes;
-                        log_i(next->task_id.c_str(), "调度派发[proto={}]", static_cast<int>(params.protocol));
-                        const auto result = engine_of(params.protocol)->do_resume(&params);
-                        if (result.code == DW_REASON_FAIL) break;
-
-                        next->force = false;
-                        next->status = result.code == DW_REASON_NONE
-                                           ? DW_TASK_STATUS_DOWNLOADING
-                                           : DW_TASK_STATUS_ERROR;
-                        next->reason = result.code;
-                        next->message = result.message;
-                        next->modified_at = now_unix_ms();
-                        next->dirty = true;
+                    // 检索“队列中”任务，获取高优先级的任务
+                    if (task.status == DW_TASK_STATUS_QUEUED && (
+                            !priority_task || higher_priority(task, *priority_task))) {
+                        priority_task = &task;
                     }
-                } else {
-                    for (const auto &task: tasks_ | std::views::values) {
-                        if (!task.is_delete && is_download_task(task) && status_occupies_slot(task.status)) {
-                            to_pause.push_back(task_params(task));
+                    // 检索“下载中”任务，获取低下载速率的任务
+                    if (task.status == DW_TASK_STATUS_DOWNLOADING) {
+                        downloading.push_back(&task);
+                        if (!slowest_task || task.download_rate < slowest_task->download_rate) {
+                            slowest_task = &task;
                         }
                     }
                 }
-            }
 
-            for (const auto &params: to_pause) {
-                if (IDownloadEngine *engine = engine_of(params.protocol)) {
-                    engine->pause_task(&params);
+                if (!net_allowed_) {
+                    // 禁用流量时，暂停所有正在下载的任务。
+                    for (const auto *task: downloading) {
+                        const auto params = task_params(*task);
+                        engine_of(params.protocol)->pause_task(&params);
+                    }
+                } else if (priority_task && config_.max_concurrent_downloads > 0 && running_.load()) {
+                    const auto limit = static_cast<std::size_t>(config_.max_concurrent_downloads);
+                    if (downloading.size() >= limit && priority_task->force && slowest_task) {
+                        log_i(slowest_task->task_id.c_str(), "调度器 暂停最慢任务[{}]", slowest_task->name);
+                        const auto params = task_params(*slowest_task);
+                        engine_of(params.protocol)->pause_task(&params);
+                    }
+
+                    if (downloading.size() < limit) {
+                        auto params = task_params(*priority_task);
+                        params.file_priorities = priority_task->priority_file_indexes;
+                        log_i(priority_task->task_id.c_str(), "调度器 派发任务[{}]", priority_task->name);
+                        engine_of(params.protocol)->do_resume(&params);
+                    }
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(flush_interval_ms_));
@@ -307,53 +300,70 @@ namespace dw {
     }
 
     void TaskManager::maintenance_loop() {
-        while (running_.load()) {
+        for (;;) {
+            const bool stopping = !running_.load();
             std::vector<Task> dirty_records;
             {
                 std::scoped_lock lock(mtx_);
-                // 持锁保存并收集快照，回调期间发生的新变更留给下一轮。
-                for (auto &task_record: tasks_ | std::views::values) {
-                    if (task_record.dirty) {
-                        if (task_record.is_delete) {
-                            if (task_record.task_protocol == DW_PROTOCOL_LOCAL) {
-                                if (!task_record.full_path.empty())
-                                    store_.delete_file_record_by_path(
-                                        task_record.full_path);
-                            } else {
-                                store_.remove(task_record.client_id, task_record.task_protocol,
-                                              task_record.task_id);
-                            }
-                        } else {
-                            store_.update_file_record(task_record);
-                            if (task_record.task_protocol != DW_PROTOCOL_LOCAL) {
-                                task_store_.update_read(task_record.task_id, task_record.is_read);
-                            }
+                for (auto it = tasks_.begin(); it != tasks_.end();) {
+                    const auto current = it++;
+                    auto &task = current->second;
+                    // 清理删除任务 内存+数据库
+                    if (task.is_delete) {
+                        if (!task_store_.delete_task(task.task_id)) {
+                            log_e(task.task_id.c_str(), "任务[{}]软删除失败", task.name);
+                        } else if (!task_file_store_.delete_task(task.task_id)) {
+                            log_e(task.task_id.c_str(), "任务[{}]文件软删除失败", task.name);
                         }
-                        dirty_records.push_back(task_record);
-                        task_record.dirty = false;
+                        tasks_.erase(current);
+                        continue;
                     }
+
+                    bool saved_changes = false;
+                    for (auto &file: task.files) {
+                        if (!file.dirty) continue;
+                        if (task_file_store_.save(file)) {
+                            file.dirty = false;
+                            saved_changes = true;
+                        } else {
+                            log_e(task.task_id.c_str(), "任务[{}]文件保存失败", task.name);
+                        }
+                    }
+
+                    if (task.dirty) {
+                        if (task_store_.save(task)) {
+                            task.dirty = false;
+                            saved_changes = true;
+                        } else {
+                            log_e(task.task_id.c_str(), "任务[{}]保存失败", task.name);
+                        }
+                    }
+                    if (saved_changes) dirty_records.push_back(task);
                 }
             }
 
-            for (const auto &rec: dirty_records) {
+            for (const auto &task: dirty_records) {
                 // 回调
-                auto payload = to_json(rec);
-                payload["task_natural_key"] = rec.task_id;
-                const auto source = rec.task_protocol == DW_PROTOCOL_TORRENT
+                auto payload = to_json(task);
+                payload["task_natural_key"] = task.task_id;
+                const auto source = task.task_protocol == DW_PROTOCOL_TORRENT
                                         ? DW_SOURCE_REMOTE_FILE
-                                        : (rec.task_protocol == DW_PROTOCOL_HTTP
+                                        : (task.task_protocol == DW_PROTOCOL_HTTP
                                                ? DW_SOURCE_TASK_FILE
                                                : DW_SOURCE_LOCAL_FILE);
                 payload["type"] = static_cast<int>(source);
+                payload["files"] = boost::json::value_from(task.files);
                 const std::string json = boost::json::serialize(payload);
                 emit_progress(json.c_str());
             }
+
+            if (stopping) break;
 
             // 引擎清理
             if (http_) http_->sweep();
             if (torrent_) torrent_->sweep();
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            std::this_thread::sleep_for(std::chrono::milliseconds(maintenance_interval_ms_));
         }
     }
 
@@ -399,7 +409,7 @@ namespace dw {
                 paths.push_back(fi.full_path);
             }
         }
-        const auto progress_map = store_.load_file_progress_by_paths(paths);
+        const auto progress_map = task_file_store_.load_progress_by_paths(paths);
         for (auto &fi: files) {
             auto it = progress_map.find(fi.full_path);
             if (it == progress_map.end()) continue;
@@ -421,15 +431,6 @@ namespace dw {
 
     IDownloadEngine *TaskManager::engine_of(const dw_protocol_t proto) const {
         return proto == DW_PROTOCOL_HTTP ? http_ : torrent_;
-    }
-
-    int32_t TaskManager::active_count_locked() const {
-        int32_t n = 0;
-        for (const auto &task_record: tasks_ | std::views::values) {
-            if (task_record.is_delete || !is_download_task(task_record)) continue;
-            if (status_occupies_slot(task_record.status)) ++n;
-        }
-        return n;
     }
 
     void TaskManager::remove_data_directory(const std::string &save_path,

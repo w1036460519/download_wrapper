@@ -38,7 +38,8 @@ namespace dw::utils {
     } // namespace
 
     std::string acquire_unique_name(const std::string &dir, const std::string &name,
-                                    const bool multi_file, std::string *out_error) {
+                                    const bool multi_file, std::string *out_error,
+                                    const std::string &collision_base) {
         if (out_error) out_error->clear();
         if (name.empty()) return name;
         const std::filesystem::path base_dir(dir);
@@ -52,9 +53,10 @@ namespace dw::utils {
             return name;
         }
 
+        const auto &prefix = collision_base.empty() ? name : collision_base;
         // 原名冲突：逐序号抢占包层目录（包层形态恒为目录，与内容结构无关）。
         for (int n = 1; n <= 9999; ++n) {
-            const std::string candidate = name + "(" + std::to_string(n) + ")";
+            const std::string candidate = prefix + "(" + std::to_string(n) + ")";
             const auto target = base_dir / candidate;
             if (entry_exists(target)) continue;
             if (std::error_code ec; !create_entry(target, true, ec) && out_error) {
@@ -66,7 +68,7 @@ namespace dw::utils {
         // 兜底：毫秒时间戳后缀，几乎不可能再冲突。
         const auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        const std::string fallback = name + "_" + std::to_string(ts);
+        const std::string fallback = prefix + "_" + std::to_string(ts);
         if (std::error_code ec; !create_entry(base_dir / fallback, true, ec) && out_error) {
             *out_error = ec.message();
         }

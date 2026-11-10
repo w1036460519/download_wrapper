@@ -1,25 +1,11 @@
-/**
- * @file task_store.cpp
- * @brief 任务持久化存储层实现：SQLite 建表 / 读写与分片续传态序列化。
- *
- * 说明：本层不加锁、不涉及调度与内存注册表，仅围绕 sqlite3 连接完成 file_records
- * （任务状态持久化权威）、resume_data 及进度缓存的存取。并发串行化由调用方
- * （TaskManager 持有 mtx_）保证。
- */
-
 #include "task_store.h"
-#include "internal/json_util.h"
 
-#include "internal/downloader_internal.h"
-#include "utils/string_util.h"
 #include "utils/time_util.h"
 
 #include <sqlite3.h>
 
-#include <filesystem>
 #include <string_view>
 #include <unordered_map>
-#include <utility>
 
 namespace dw {
     using utils::now_unix_ms;
@@ -48,7 +34,6 @@ namespace dw {
             std::string getText(std::string_view name) const { return col_text(st, idx(name)); }
             int getInt(std::string_view name) const { return sqlite3_column_int(st, idx(name)); }
             int64_t getInt64(std::string_view name) const { return sqlite3_column_int64(st, idx(name)); }
-            double getDouble(std::string_view name) const { return sqlite3_column_double(st, idx(name)); }
         };
 
         /// 命名参数绑定辅助：SQL 使用 :name 占位符，按名绑定不依赖位置索引。
@@ -58,12 +43,6 @@ namespace dw {
 
         void bind_text(sqlite3_stmt *st, const char *name, const std::string &val) {
             sqlite3_bind_text(st, param_idx(st, name), val.c_str(), -1, SQLITE_TRANSIENT);
-        }
-
-        void bind_text_or_null(sqlite3_stmt *st, const char *name, const std::string &val) {
-            const int idx = param_idx(st, name);
-            if (val.empty()) sqlite3_bind_null(st, idx);
-            else sqlite3_bind_text(st, idx, val.c_str(), -1, SQLITE_TRANSIENT);
         }
 
         void bind_int(sqlite3_stmt *st, const char *name, int val) {
@@ -82,10 +61,11 @@ namespace dw {
     Task TaskStore::read_task(sqlite3_stmt *statement) {
         const col_map columns(statement);
         Task task;
-        task.id = columns.getInt64("id");
         task.task_id = columns.getText("task_id");
         task.client_id = columns.getText("client_id");
         task.is_remote = columns.getInt("is_remote") != 0;
+        task.name = columns.getText("name");
+        task.wrapper_name = columns.getText("wrapper_name");
         task.save_path = columns.getText("save_path");
         task.original_root_name = columns.getText("original_root_name");
         task.root_name = columns.getText("root_name");
@@ -106,15 +86,7 @@ namespace dw {
         task.message = columns.getText("message");
         task.created_at = columns.getInt64("created_at");
         task.modified_at = columns.getInt64("modified_at");
-        task.support_range = columns.getInt("support_range");
-        task.etag = columns.getText("etag");
-        task.last_modified = columns.getText("last_modified");
-        task.force = columns.getInt("force") != 0;
-        task.dirty = columns.getInt("dirty") != 0;
         task.is_delete = columns.getInt("is_delete") != 0;
-        task.download_rate = columns.getDouble("download_rate");
-        task.upload_rate = columns.getDouble("upload_rate");
-        task.select_file_indexes = utils::split_ints(columns.getText("select_file_indexes"));
         task.is_read = columns.getInt("is_read") != 0;
         return task;
     }
@@ -132,52 +104,6 @@ namespace dw {
                 saved_at INTEGER,
                 PRIMARY KEY (client_id, protocol, natural_key)
             );
-
-            CREATE TABLE IF NOT EXISTS file_records (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_id       TEXT NOT NULL,
-                type            INTEGER NOT NULL DEFAULT 0,
-                is_remote       INTEGER DEFAULT 0,
-                save_path       TEXT NOT NULL,
-                original_root_name TEXT NOT NULL DEFAULT '',  -- 重名/包装前的原始名称
-                root_name       TEXT NOT NULL,
-                full_path       TEXT,
-                file_type       INTEGER DEFAULT 1,
-                ext             TEXT,
-                parsed          INTEGER DEFAULT 0,             -- 元数据已解析标志
-                task_protocol   INTEGER,
-                task_natural_key TEXT,
-                url             TEXT NOT NULL DEFAULT '',  -- 任务元数据：HTTP 源地址
-                info_hash       TEXT NOT NULL DEFAULT '',  -- 任务元数据：BT info hash
-                magnet_link     TEXT NOT NULL DEFAULT '',  -- 任务元数据：BT 磁力链接
-                torrent_file    TEXT NOT NULL DEFAULT '',  -- 任务元数据：BT 种子文件路径
-                status          INTEGER DEFAULT 0,
-                total_size      INTEGER DEFAULT -1,
-                total_done      INTEGER DEFAULT 0,
-                priority        INTEGER DEFAULT 0,
-                reason          INTEGER DEFAULT 0,
-                message         TEXT NOT NULL DEFAULT '',
-                created_at      INTEGER,
-                modified_at     INTEGER,
-                is_delete       INTEGER NOT NULL DEFAULT 0,
-                is_read         INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_file_records_task ON file_records(client_id, task_protocol, task_natural_key);
-            CREATE INDEX IF NOT EXISTS idx_file_records_path ON file_records(full_path);
-
-            CREATE TABLE IF NOT EXISTS file_progress_cache (
-                client_id        TEXT NOT NULL,
-                protocol         INTEGER NOT NULL,
-                natural_key      TEXT NOT NULL,
-                file_index       INTEGER NOT NULL,
-                full_path        TEXT NOT NULL,
-                size             INTEGER DEFAULT 0,
-                downloaded_bytes INTEGER DEFAULT 0,
-                segments         TEXT NOT NULL,
-                modified_at      INTEGER,
-                PRIMARY KEY (client_id, protocol, natural_key, file_index)
-            );
-            CREATE INDEX IF NOT EXISTS idx_fpc_path ON file_progress_cache(full_path);
 
             CREATE TABLE IF NOT EXISTS play_progress (
                 full_path    TEXT NOT NULL PRIMARY KEY,
@@ -220,86 +146,7 @@ namespace dw {
                 }
             }
         }
-        // 补建旧库缺少的任务元数据列。
-        for (const char *ddl: {
-                 "ALTER TABLE file_records ADD COLUMN url TEXT NOT NULL DEFAULT '';",
-                 "ALTER TABLE file_records ADD COLUMN info_hash TEXT NOT NULL DEFAULT '';",
-                 "ALTER TABLE file_records ADD COLUMN magnet_link TEXT NOT NULL DEFAULT '';",
-                 "ALTER TABLE file_records ADD COLUMN torrent_file TEXT NOT NULL DEFAULT '';",
-             }) {
-            sqlite3_exec(db_, ddl, nullptr, nullptr, nullptr);
-        }
-        return ensure_sqlite_column(db_, "file_records", "is_delete",
-                   "ALTER TABLE file_records ADD COLUMN is_delete INTEGER NOT NULL DEFAULT 0")
-            && ensure_sqlite_column(db_, "file_records", "is_read",
-                   "ALTER TABLE file_records ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0");
-    }
-
-    void LegacyTaskStore::remove(const std::string &client_id, dw_protocol_t protocol, const std::string &natural_key) const {
-        // resume_data / file_progress_cache 仍用 protocol + natural_key 列名
-        auto del_by_key = [this, &client_id, &protocol, &natural_key](const char *table) {
-            sqlite3_stmt *st = nullptr;
-            const std::string sql = std::string("DELETE FROM ") + table +
-                                    " WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key;";
-            if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) {
-                bind_text(st, ":client_id", client_id);
-                bind_int(st, ":protocol", static_cast<int>(protocol));
-                bind_text(st, ":natural_key", natural_key);
-                sqlite3_step(st);
-                sqlite3_finalize(st);
-            }
-        };
-        del_by_key("resume_data");
-        del_by_key("file_progress_cache");
-        // file_records 使用 task_protocol + task_natural_key 列名
-        {
-            sqlite3_stmt *st = nullptr;
-            constexpr auto sql =
-                    "UPDATE file_records SET is_delete=1 WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;";
-            if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
-                bind_text(st, ":client_id", client_id);
-                bind_int(st, ":task_protocol", static_cast<int>(protocol));
-                bind_text(st, ":task_natural_key", natural_key);
-                sqlite3_step(st);
-                sqlite3_finalize(st);
-            }
-        }
-    }
-
-    void LegacyTaskStore::update_file_record(const Task &rec) const {
-        constexpr auto sql = R"(
-            UPDATE file_records SET save_path=:save_path, original_root_name=:original_root_name,
-                root_name=:root_name, full_path=:full_path, file_type=:file_type, ext=:ext,
-                url=:url, info_hash=:info_hash, magnet_link=:magnet_link, torrent_file=:torrent_file,
-                status=:status, total_size=:total_size, total_done=:total_done,
-                reason=:reason, message=:message,
-                is_read=:is_read, modified_at=:modified_at
-            WHERE is_delete=0 AND client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_text(st, ":save_path", rec.save_path);
-        bind_text(st, ":original_root_name", rec.original_root_name);
-        bind_text(st, ":root_name", rec.root_name);
-        bind_text(st, ":full_path", rec.full_path);
-        bind_int(st, ":file_type", rec.file_type ? 1 : 0);
-        bind_text_or_null(st, ":ext", rec.ext);
-        bind_text(st, ":url", rec.url);
-        bind_text(st, ":info_hash", rec.info_hash);
-        bind_text(st, ":magnet_link", rec.magnet_link);
-        bind_text(st, ":torrent_file", rec.torrent_file);
-        bind_int(st, ":status", rec.status);
-        bind_int64(st, ":total_size", rec.total_size);
-        bind_int64(st, ":total_done", rec.total_done);
-        bind_int(st, ":reason", rec.reason);
-        bind_text(st, ":message", rec.message);
-        bind_int(st, ":is_read", rec.is_read);
-        bind_int64(st, ":modified_at", now_unix_ms());
-        bind_text(st, ":client_id", rec.client_id);
-        bind_int(st, ":task_protocol", static_cast<int>(rec.task_protocol));
-        bind_text(st, ":task_natural_key", rec.task_id);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
+        return true;
     }
 
     void LegacyTaskStore::save_resume(const std::string &client_id, dw_protocol_t protocol,
@@ -308,7 +155,8 @@ namespace dw {
         // 只更新续传数据和保存时间，保留旧记录中的来源字段。
         constexpr auto sql = R"(
             INSERT INTO resume_data (client_id, protocol, natural_key, data, saved_at)
-            VALUES (:client_id, :protocol, :natural_key, :data, :saved_at)
+            SELECT :client_id, :protocol, :natural_key, :data, :saved_at
+            WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE task_id=:natural_key AND is_delete=1)
             ON CONFLICT(client_id, protocol, natural_key) DO UPDATE SET
                 data = excluded.data,
                 saved_at = excluded.saved_at;
@@ -354,237 +202,6 @@ namespace dw {
         return info;
     }
 
-    // ---- 文件目录表（file_records）----
-
-    namespace {
-        void fill_file_record(sqlite3_stmt *st, FileRecord &r) {
-            const col_map cm(st);
-            r.id = cm.getInt64("id");
-            r.client_id = cm.getText("client_id");
-            r.type = static_cast<dw_source_t>(cm.getInt("type"));
-            r.is_remote = cm.getInt("is_remote") != 0;
-            r.save_path = cm.getText("save_path");
-            r.original_root_name = cm.getText("original_root_name");
-            r.root_name = cm.getText("root_name");
-            r.full_path = cm.getText("full_path");
-            r.file_type = cm.getInt("file_type") != 0;
-            r.ext = cm.getText("ext");
-            r.parsed = cm.getInt("parsed") != 0;
-            r.task_protocol = static_cast<dw_protocol_t>(cm.getInt("task_protocol"));
-            r.task_natural_key = cm.getText("task_natural_key");
-            r.task_id = r.task_natural_key;
-            r.url = cm.getText("url");
-            r.info_hash = cm.getText("info_hash");
-            r.magnet_link = cm.getText("magnet_link");
-            r.torrent_file = cm.getText("torrent_file");
-            r.status = cm.getInt("status");
-            r.total_size = cm.getInt64("total_size");
-            r.total_done = cm.getInt64("total_done");
-            r.priority = cm.getInt("priority");
-            r.reason = cm.getInt("reason");
-            r.message = cm.getText("message");
-            // support_range/etag/last_modified 不再从 file_records 读取（已在 resume_data 表中）
-            r.created_at = cm.getInt64("created_at");
-            r.modified_at = cm.getInt64("modified_at");
-            r.is_delete = cm.getInt("is_delete") != 0;
-            r.is_read = cm.getInt("is_read") != 0;
-        }
-    } // namespace
-
-    bool LegacyTaskStore::find_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
-                                     const std::string &task_natural_key, FileRecord &out) const {
-        constexpr auto sql =
-                "SELECT * FROM file_records WHERE is_delete=0 AND client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key LIMIT 1;";
-        sqlite3_stmt *st = nullptr;
-        bool found = false;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
-            bind_text(st, ":client_id", client_id);
-            bind_int(st, ":task_protocol", static_cast<int>(task_protocol));
-            bind_text(st, ":task_natural_key", task_natural_key);
-            if (sqlite3_step(st) == SQLITE_ROW) {
-                fill_file_record(st, out);
-                found = true;
-            }
-            sqlite3_finalize(st);
-        }
-        return found;
-    }
-
-    bool LegacyTaskStore::file_record_exists_by_path(const std::string &full_path) const {
-        constexpr auto sql =
-                "SELECT 1 FROM file_records WHERE is_delete=0 AND full_path=:full_path LIMIT 1;";
-        sqlite3_stmt *st = nullptr;
-        bool found = false;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
-            bind_text(st, ":full_path", full_path);
-            found = (sqlite3_step(st) == SQLITE_ROW);
-            sqlite3_finalize(st);
-        }
-        return found;
-    }
-
-    void LegacyTaskStore::touch_file_record(const std::string &client_id, const dw_protocol_t task_protocol,
-                                      const std::string &task_natural_key) const {
-        constexpr auto sql =
-                "UPDATE file_records SET modified_at=:modified_at WHERE client_id=:client_id AND task_protocol=:task_protocol AND task_natural_key=:task_natural_key;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
-            bind_int64(st, ":modified_at", now_unix_ms());
-            bind_text(st, ":client_id", client_id);
-            bind_int(st, ":task_protocol", static_cast<int>(task_protocol));
-            bind_text(st, ":task_natural_key", task_natural_key);
-            sqlite3_step(st);
-            sqlite3_finalize(st);
-        }
-    }
-
-    void LegacyTaskStore::insert_file_record(FileRecord &r) const {
-        const int64_t now = now_unix_ms();
-        if (r.created_at == 0) r.created_at = now;
-        if (r.modified_at == 0) r.modified_at = now;
-        constexpr auto sql = R"(
-            INSERT INTO file_records (client_id, type, is_remote, save_path, original_root_name, root_name,
-                full_path, file_type, ext, parsed, task_protocol, task_natural_key,
-                url, info_hash, magnet_link, torrent_file,
-                status, total_size, total_done,
-                priority, reason, message, created_at, modified_at, is_delete, is_read)
-            VALUES (:client_id, :type, :is_remote, :save_path, :original_root_name, :root_name,
-                :full_path, :file_type, :ext, :parsed, :task_protocol, :task_natural_key,
-                :url, :info_hash, :magnet_link, :torrent_file,
-                :status, :total_size, :total_done,
-                :priority, :reason, :message, :created_at, :modified_at, :is_delete, :is_read);
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return;
-        bind_text(st, ":client_id", r.client_id);
-        bind_int(st, ":type", r.type);
-        bind_int(st, ":is_remote", r.is_remote ? 1 : 0);
-        bind_text(st, ":save_path", r.save_path);
-        bind_text(st, ":original_root_name", r.original_root_name);
-        bind_text(st, ":root_name", r.root_name);
-        bind_text_or_null(st, ":full_path", r.full_path);
-        bind_int(st, ":file_type", r.file_type ? 1 : 0);
-        bind_text_or_null(st, ":ext", r.ext);
-        bind_int(st, ":parsed", r.parsed ? 1 : 0);
-        if (r.task_protocol != DW_PROTOCOL_LOCAL && !r.task_natural_key.empty()) {
-            bind_int(st, ":task_protocol", static_cast<int>(r.task_protocol));
-            bind_text(st, ":task_natural_key", r.task_natural_key);
-        } else {
-            sqlite3_bind_null(st, sqlite3_bind_parameter_index(st, ":task_protocol"));
-            sqlite3_bind_null(st, sqlite3_bind_parameter_index(st, ":task_natural_key"));
-        }
-        bind_int(st, ":status", r.status);
-        bind_int64(st, ":total_size", r.total_size);
-        bind_int64(st, ":total_done", r.total_done);
-        bind_int(st, ":priority", r.priority);
-        bind_int(st, ":reason", r.reason);
-        bind_text(st, ":message", r.message);
-        bind_text(st, ":url", r.url);
-        bind_text(st, ":info_hash", r.info_hash);
-        bind_text(st, ":magnet_link", r.magnet_link);
-        bind_text(st, ":torrent_file", r.torrent_file);
-        bind_int64(st, ":created_at", r.created_at);
-        bind_int64(st, ":modified_at", r.modified_at);
-        bind_int(st, ":is_delete", r.is_delete);
-        bind_int(st, ":is_read", r.is_read);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-        r.id = sqlite3_last_insert_rowid(db_);
-    }
-
-    std::vector<FileRecord> LegacyTaskStore::load_file_records() const {
-        std::vector<FileRecord> out;
-        constexpr auto sql = "SELECT * FROM file_records WHERE is_delete=0 ORDER BY modified_at DESC;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            FileRecord r;
-            fill_file_record(st, r);
-            out.push_back(std::move(r));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
-    std::vector<FileRecord> LegacyTaskStore::load_file_records(const std::string &client_id) const {
-        std::vector<FileRecord> out;
-        constexpr auto sql =
-                "SELECT * FROM file_records WHERE is_delete=0 AND client_id=:client_id ORDER BY modified_at DESC;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        bind_text(st, ":client_id", client_id);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            FileRecord r;
-            fill_file_record(st, r);
-            out.push_back(std::move(r));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
-    std::vector<FileRecord> LegacyTaskStore::load_file_records(const std::string &client_id,
-                                                         const std::vector<dw_protocol_t> &protocols,
-                                                         const std::vector<dw_task_status_t> &statuses) const {
-        std::vector<FileRecord> out;
-        if (protocols.empty() || statuses.empty()) return out;
-        // 动态构建 IN 子句：protocol IN (?, ...) AND status IN (?, ...)
-        std::string proto_placeholders, status_placeholders;
-        for (size_t i = 0; i < protocols.size(); ++i) {
-            if (i > 0) proto_placeholders += ", ";
-            proto_placeholders += "?";
-        }
-        for (size_t i = 0; i < statuses.size(); ++i) {
-            if (i > 0) status_placeholders += ", ";
-            status_placeholders += "?";
-        }
-        const std::string sql =
-                "SELECT * FROM file_records WHERE is_delete=0 AND client_id=? AND task_protocol IN (" + proto_placeholders +
-                ") AND status IN (" + status_placeholders + ") ORDER BY modified_at DESC;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return out;
-        int idx = 1;
-        sqlite3_bind_text(st, idx++, client_id.c_str(), -1, SQLITE_TRANSIENT);
-        for (size_t i = 0; i < protocols.size(); ++i) {
-            sqlite3_bind_int(st, idx++, static_cast<int>(protocols[i]));
-        }
-        for (size_t i = 0; i < statuses.size(); ++i) {
-            sqlite3_bind_int(st, idx++, static_cast<int>(statuses[i]));
-        }
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            FileRecord r;
-            fill_file_record(st, r);
-            out.push_back(std::move(r));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
-    void LegacyTaskStore::delete_file_record_by_path(const std::string &full_path) const {
-        constexpr auto sql =
-                "UPDATE file_records SET is_delete=1 WHERE full_path=:full_path;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
-            return;
-        bind_text(st, ":full_path", full_path);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void LegacyTaskStore::update_file_record_status_by_name(const std::string &save_path, const std::string &root_name,
-                                                      const int32_t status) const {
-        constexpr auto sql =
-                "UPDATE file_records SET status=:status, modified_at=:modified_at WHERE is_delete=0 AND save_path=:save_path AND root_name=:root_name;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
-            return;
-        bind_int(st, ":status", status);
-        bind_int64(st, ":modified_at", now_unix_ms());
-        bind_text(st, ":save_path", save_path);
-        bind_text(st, ":root_name", root_name);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
     // ---- 播放进度（独立表 play_progress，以完整路径为键）----
 
     void LegacyTaskStore::set_play_position(const std::string &full_path, const int64_t position_ms) const {
@@ -616,222 +233,5 @@ namespace dw {
         }
         sqlite3_finalize(st);
         return position_ms;
-    }
-
-    // ---- 文件下载进度缓存 ----
-
-    void LegacyTaskStore::replace_file_progress(
-        const std::string &client_id, const dw_protocol_t protocol, const std::string &natural_key,
-        const std::vector<std::tuple<std::string, int32_t, std::vector<dw_byte_range_t> > > &file_ranges) const {
-        if (file_ranges.empty()) return;
-        sqlite3_exec(db_, "BEGIN;", nullptr, nullptr, nullptr);
-        constexpr auto sql = R"(
-            INSERT OR REPLACE INTO file_progress_cache
-            (client_id, protocol, natural_key, file_index, full_path, segments, modified_at)
-            VALUES (?,?,?,?,?,?,?);
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
-            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-            return;
-        }
-        for (const auto &[path, idx, ranges]: file_ranges) {
-            if (ranges.empty()) continue;
-            // 序列化区间集合为 JSON：[[start1,end1],[start2,end2],...]
-            boost::json::array segments_arr;
-            for (const auto &[start, end]: ranges) {
-                boost::json::array interval;
-                interval.push_back(start);
-                interval.push_back(end);
-                segments_arr.push_back(std::move(interval));
-            }
-            const std::string segments_json = boost::json::serialize(segments_arr);
-            sqlite3_reset(st);
-            bind_text(st, ":client_id", client_id);
-            bind_int(st, ":protocol", static_cast<int>(protocol));
-            bind_text(st, ":natural_key", natural_key);
-            bind_int(st, ":file_index", idx);
-            bind_text(st, ":full_path", path);
-            bind_text(st, ":segments", segments_json);
-            bind_int64(st, ":modified_at", now_unix_ms());
-            sqlite3_step(st);
-        }
-        sqlite3_finalize(st);
-        sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
-    }
-
-    int64_t LegacyTaskStore::save_file_progress(const std::string &client_id, const dw_protocol_t protocol,
-                                          const std::string &natural_key, const int32_t file_index,
-                                          const std::string &full_path,
-                                          const int64_t size, const int64_t downloaded_bytes,
-                                          const std::string &segments_json) const {
-        if (segments_json.empty()) return 0;
-        constexpr auto sql = R"(
-            INSERT OR REPLACE INTO file_progress_cache
-            (client_id, protocol, natural_key, file_index, full_path, size, downloaded_bytes, segments, modified_at)
-            VALUES (:client_id, :protocol, :natural_key, :file_index, :full_path, :size, :downloaded_bytes, :segments, :modified_at);
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) == SQLITE_OK) {
-            bind_text(st, ":client_id", client_id);
-            bind_int(st, ":protocol", static_cast<int>(protocol));
-            bind_text(st, ":natural_key", natural_key);
-            bind_int(st, ":file_index", file_index);
-            bind_text(st, ":full_path", full_path);
-            bind_int64(st, ":size", size);
-            bind_int64(st, ":downloaded_bytes", downloaded_bytes);
-            bind_text(st, ":segments", segments_json);
-            bind_int64(st, ":modified_at", now_unix_ms());
-            sqlite3_step(st);
-            sqlite3_finalize(st);
-        }
-        return downloaded_bytes;
-    }
-
-    void LegacyTaskStore::delete_file_progress_by_file(const std::string &client_id, const dw_protocol_t protocol,
-                                                 const std::string &natural_key, const int32_t file_index) const {
-        constexpr auto sql =
-                "DELETE FROM file_progress_cache WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key AND file_index=:file_index;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
-            return;
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        bind_int(st, ":file_index", file_index);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    void LegacyTaskStore::mark_file_complete(const std::string &client_id, const dw_protocol_t protocol,
-                                       const std::string &natural_key, const int32_t file_index) const {
-        // 更新 downloaded_bytes = size，segments = [[0, size-1]]
-        constexpr auto sql = R"(
-            UPDATE file_progress_cache
-            SET downloaded_bytes = size,
-                segments = '[[0,' || (size - 1) || ']]',
-                modified_at = :modified_at
-            WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key AND file_index=:file_index;
-        )";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
-            return;
-        bind_int64(st, ":modified_at", now_unix_ms());
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        bind_int(st, ":file_index", file_index);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-
-    int64_t LegacyTaskStore::sum_file_progress_by_file(const std::string &client_id, const dw_protocol_t protocol,
-                                                 const std::string &natural_key, const int32_t file_index) const {
-        constexpr auto sql =
-                "SELECT segments FROM file_progress_cache WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key AND file_index=:file_index;";
-        sqlite3_stmt *st = nullptr;
-        int64_t total = 0;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK)
-            return total;
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        bind_int(st, ":file_index", file_index);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            const char *json_str = reinterpret_cast<const char *>(sqlite3_column_text(st, 0));
-            if (json_str) {
-                try {
-                    auto json = boost::json::parse(json_str);
-                    if (json.is_array()) {
-                        for (const auto &interval: json.as_array()) {
-                            if (interval.is_array() && interval.as_array().size() == 2) {
-                                const int64_t start = interval.as_array()[0].as_int64();
-                                const int64_t end = interval.as_array()[1].as_int64();
-                                total += (end - start + 1);
-                            }
-                        }
-                    }
-                } catch (...) {
-                    // JSON 解析失败，返回 0
-                }
-            }
-        }
-        sqlite3_finalize(st);
-        return total;
-    }
-
-    std::vector<FileProgressInfo> LegacyTaskStore::load_file_progress(const std::string &client_id,
-                                                                const dw_protocol_t protocol,
-                                                                const std::string &natural_key) const {
-        std::vector<FileProgressInfo> out;
-        constexpr auto sql =
-                "SELECT file_index, full_path, size, downloaded_bytes, segments FROM file_progress_cache "
-                "WHERE client_id=:client_id AND protocol=:protocol AND natural_key=:natural_key "
-                "ORDER BY file_index;";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) return out;
-        bind_text(st, ":client_id", client_id);
-        bind_int(st, ":protocol", static_cast<int>(protocol));
-        bind_text(st, ":natural_key", natural_key);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            FileProgressInfo info;
-            info.file_index = sqlite3_column_int(st, 0);
-            if (const char *p = reinterpret_cast<const char *>(sqlite3_column_text(st, 1)); p) {
-                info.full_path = p;
-            }
-            info.size = sqlite3_column_int64(st, 2);
-            info.downloaded_bytes = sqlite3_column_int64(st, 3);
-            // 解析 segments JSON
-            if (const char *json_str = reinterpret_cast<const char *>(sqlite3_column_text(st, 4)); json_str) {
-                try {
-                    auto json = boost::json::parse(json_str);
-                    if (json.is_array()) {
-                        for (const auto &interval: json.as_array()) {
-                            if (interval.is_array() && interval.as_array().size() == 2) {
-                                dw_byte_range_t seg{};
-                                seg.start = interval.as_array()[0].as_int64();
-                                seg.end = interval.as_array()[1].as_int64();
-                                info.segments.push_back(seg);
-                            }
-                        }
-                    }
-                } catch (...) {
-                    // JSON 解析失败，忽略
-                }
-            }
-            out.push_back(std::move(info));
-        }
-        sqlite3_finalize(st);
-        return out;
-    }
-
-    std::unordered_map<std::string, std::pair<int64_t, std::string> >
-    LegacyTaskStore::load_file_progress_by_paths(const std::vector<std::string> &paths) const {
-        std::unordered_map<std::string, std::pair<int64_t, std::string> > result;
-        if (paths.empty() || !db_) return result;
-        // 构建 IN 子句
-        std::string placeholders;
-        for (size_t i = 0; i < paths.size(); ++i) {
-            if (i > 0) placeholders += ",";
-            placeholders += "?";
-        }
-        const std::string sql =
-                "SELECT full_path, downloaded_bytes, segments FROM file_progress_cache WHERE full_path IN (" +
-                placeholders + ")";
-        sqlite3_stmt *st = nullptr;
-        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return result;
-        for (size_t i = 0; i < paths.size(); ++i) {
-            sqlite3_bind_text(st, static_cast<int>(i + 1), paths[i].c_str(), -1, SQLITE_TRANSIENT);
-        }
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const char *path = reinterpret_cast<const char *>(sqlite3_column_text(st, 0));
-            const int64_t downloaded_bytes = sqlite3_column_int64(st, 1);
-            const char *segments = reinterpret_cast<const char *>(sqlite3_column_text(st, 2));
-            if (path) {
-                result[path] = {downloaded_bytes, segments ? segments : ""};
-            }
-        }
-        sqlite3_finalize(st);
-        return result;
     }
 } // namespace dw
