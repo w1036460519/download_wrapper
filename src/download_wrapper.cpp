@@ -7,9 +7,6 @@
 
 #include "internal/downloader_internal.h"
 #include "core/task_manager.h"
-#include "http/http_engine.h"
-#include "torrent/torrent_engine.h"
-#include "utils/memory_util.h"
 #include "utils/string_util.h"
 #include "utils/time_util.h"
 
@@ -17,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -26,6 +24,7 @@ namespace dw {
     namespace {
         // 全局单例实例
         std::once_flag g_init_flag;
+        std::atomic<dw_log_level_t> g_log_level{DW_LOG_INFO};
         std::unique_ptr<dw_downloader> g_downloader;
 
         void do_init_singleton() {
@@ -40,10 +39,8 @@ namespace dw {
     void emit_progress(const char *json) {
         if (!g_downloader || !json) return;
         if (const auto cb = g_downloader->progress_cb.load()) {
-            // 堆分配字符串，所有权交给回调消费方（Dart 侧 dw_free 释放）。
-            // NativeCallable.listener 异步投递，回调立即返回，
-            // 不能用局部变量（返回即析构），必须 strdup 保证生命周期。
-            char *heap_json = strdup(json);
+            // 堆分配字符串，所有权交给回调消费方（Dart 侧 release_memory 释放）。
+            const char *heap_json = strdup(json);
             if (!heap_json) return;
             cb(heap_json);
         }
@@ -55,7 +52,7 @@ namespace dw {
                      const char *func,
                      const int32_t line) {
         // 统一日志级别过滤：低于全局配置级别的消息直接丢弃
-        if (g_downloader && level < g_downloader->config.log_level) return;
+        if (level < g_log_level.load()) return;
         const char *tid = (trace_id && trace_id[0]) ? trace_id : "";
         const int64_t ts = utils::now_unix_ms();
         if (auto cb = g_downloader ? g_downloader->log_cb.load() : nullptr) {
@@ -94,240 +91,221 @@ extern "C" {
 /*  生命周期                                                          */
 /* ------------------------------------------------------------------ */
 
-DW_API char *dw_init(const char *config_json) {
-    std::call_once(dw::g_init_flag, dw::do_init_singleton);
-    if (!dw::g_downloader) {
-        return dw::result_to_json(dw::dw_submit_result_t::failure(DW_REASON_ERROR, "下载器创建失败"));
-    }
-
-    std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-
-    // 解析 JSON 配置（NULL 或空字符串使用默认配置）
-    if (config_json && config_json[0]) {
-        if (dw::parse_config(config_json, dw::g_downloader->config) != 0) {
-            return dw::result_to_json(dw::dw_submit_result_t::failure(DW_REASON_INVALID_INPUT, "非法输入"));
+DW_API char *create(void) {
+    try {
+        log_i("", "wrapper 下载器构建开始...");
+        std::call_once(dw::g_init_flag, dw::do_init_singleton);
+        std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
+        if (dw::g_downloader->destroying) return dw::result_to_json(dw::dw_submit_result_t::failure());
+        if (!dw::g_downloader->task_manager) {
+            dw::g_downloader->task_manager = std::make_unique<dw::TaskManager>();
         }
+        log_i("", "wrapper 下载器构建完成");
+        return dw::result_to_json(dw::dw_submit_result_t::success());
+    } catch (const std::exception &e) {
+        log_e("", "wrapper 创建下载器失败: {}", e.what());
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    } catch (...) {
+        log_e("", "wrapper 创建下载器失败: 未知异常");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    }
+}
+
+DW_API char *init(const char *config_json) {
+    log_i("", "wrapper 下载器初始化开始 config={}", config_json ? config_json : "(null)");
+    if (!dw::g_downloader || !config_json || !config_json[0]) {
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    }
+    std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
+    dw::Config config;
+    if (dw::parse_config(config_json, config) != 0) {
+        log_e("", "wrapper 配置无效");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
     }
 
     if (dw::g_downloader->initialized.load()) {
+        log_i("", "wrapper 下载器已初始化完成");
         return dw::result_to_json(dw::dw_submit_result_t::success());
     }
 
-    // 创建 TaskManager，先于引擎（引擎初始化时从 TaskManager config 读取）
-    dw::g_downloader->task_manager = std::make_unique<dw::TaskManager>();
     auto *tm = dw::g_downloader->task_manager.get();
-
-    // 校验并应用配置
-    if (auto cfg_result = tm->apply_config(dw::g_downloader->config); cfg_result.code != DW_REASON_NONE) {
+    if (!tm) {
+        log_e("", "wrapper 管理器无效");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    }
+    if (auto cfg_result = tm->config(config); cfg_result.code != DW_REASON_NONE) {
+        log_e("", "wrapper 管理器配置失败");
         return dw::result_to_json(std::move(cfg_result));
     }
 
-    // 创建引擎（构造时注入 TaskManager）
-    dw::g_downloader->http_engine = std::make_unique<dw::HttpEngine>(tm);
-    dw::g_downloader->torrent_engine = std::make_unique<dw::TorrentEngine>(tm);
+    dw::g_log_level.store(config.log_level);
 
-    if (dw::g_downloader->http_engine->init() != 0) {
-        return dw::result_to_json(dw::dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎初始化失败"));
-    }
-    if (dw::g_downloader->torrent_engine->init() != 0) {
-        dw::g_downloader->http_engine->destroy();
-        return dw::result_to_json(dw::dw_submit_result_t::failure(DW_REASON_ERROR, "BT 引擎初始化失败"));
-    }
-
-    // 注入引擎并启动 TaskManager
-    tm->set_engines(dw::g_downloader->http_engine.get(), dw::g_downloader->torrent_engine.get());
-    if (dw::g_downloader->task_manager->start() != 0) {
-        dw::g_downloader->task_manager.reset();
-        return dw::result_to_json(dw::dw_submit_result_t::failure(DW_REASON_ERROR, "下载器启动失败"));
+    if (auto init_result = tm->init(); init_result.code != DW_REASON_NONE) {
+        log_e("", "wrapper 管理器初始化失败");
+        return dw::result_to_json(std::move(init_result));
     }
 
     dw::g_downloader->initialized.store(true);
     return dw::result_to_json(dw::dw_submit_result_t::success());
 }
 
-DW_API void dw_destroy(void) {
+DW_API void destroy(void) {
     if (!dw::g_downloader) {
-        log_d("", "下载器已销毁");
+        log_d("", "wrapper 下载器已销毁");
         return;
     }
 
-    std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-    if (!dw::g_downloader->initialized.load()) {
-        log_d("", "下载器尚未初始化");
-        return;
+    auto &downloader = *dw::g_downloader;
+    std::unique_ptr<dw::TaskManager> manager;
+    {
+        std::lock_guard<std::mutex> lock(downloader.mutex);
+        if (downloader.destroying) return;
+        downloader.destroying = true;
+        downloader.initialized.store(false);
+        downloader.progress_cb.store(nullptr);
+        downloader.log_cb.store(nullptr);
+        manager = std::move(downloader.task_manager);
     }
-
-    // 先停止任务中枢线程：调度/维护循环持有引擎裸指针（set_engines 注入），
-    // 若先销毁引擎，stop 前仍存活的 maintenance_loop 对已析构对象的
-    // sweep()/resume_task() 虚调用会段错误。
-    if (dw::g_downloader->task_manager) {
-        dw::g_downloader->task_manager->stop(false);
+    manager.reset();
+    {
+        std::lock_guard<std::mutex> lock(downloader.mutex);
+        dw::g_log_level.store(DW_LOG_INFO);
+        downloader.destroying = false;
     }
-
-    // 再停止引擎：其线程 join 前可能回调 TaskManager，此时对象仍存活，
-    // 数据库保留至引擎最终快照保存完成；事件循环已停止
-    //（post 到 stopped io_context 空转安全），回调均有防护。
-    if (dw::g_downloader->http_engine) {
-        dw::g_downloader->http_engine->destroy();
-        dw::g_downloader->http_engine.reset();
-    }
-    if (dw::g_downloader->torrent_engine) {
-        dw::g_downloader->torrent_engine->destroy();
-        dw::g_downloader->torrent_engine.reset();
-    }
-
-    // 最后销毁任务中枢对象（线程均已 join）
-    if (dw::g_downloader->task_manager) {
-        dw::g_downloader->task_manager.reset();
-    }
-
-    // 释放配置
-    dw::g_downloader->config = {};
-
-    dw::g_downloader->initialized.store(false);
     log_i("", "下载器销毁完成");
 }
 
-DW_API char *dw_set_config(const char *config_json) {
-    auto *d = dw::global_downloader();
-    if (!d) {
-        log_e("", "配置失败: 下载器已销毁");
-        return dw::utils::dup_cstr(dw::make_error_response("下载器已销毁"));
-    }
-    if (!config_json) {
-        log_e("", "配置失败: 参数为空");
-        return dw::utils::dup_cstr(dw::make_error_response("参数为空"));
+DW_API char *set_config(const char *config_json) {
+    log_i("", "wrapper 配置开始 config={}", config_json ? config_json : "(null)");
+    std::lock_guard<std::mutex> lock(dw::global_downloader()->mutex);
+    if (!dw::global_downloader()->initialized.load()) {
+        log_e("", "wrapper 下载器未初始化");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
     }
 
-    // 解析 JSON 配置
     dw::Config cfg;
     if (dw::parse_config(config_json, cfg) != 0) {
-        log_e("", "配置失败: JSON 解析失败");
-        return dw::utils::dup_cstr(dw::make_error_response("非法输入"));
+        log_e("", "wrapper 配置失败 参数无效");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
     }
-
-    log_i("", "配置开始: {}", config_json);
-
-    // 更新权威配置并下发到 TaskManager（引擎运行时从 TaskManager config 拉取）
-    dw::TaskManager *tm = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(d->mutex);
-        d->config = cfg;
-        if (d->task_manager) tm = d->task_manager.get();
+    auto *tm = dw::global_downloader()->task_manager.get();
+    auto result = tm->config(cfg);
+    if (result.code != DW_REASON_NONE) {
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
     }
-    if (tm) tm->apply_config(cfg);
-
-    log_i("", "配置完成");
-    return dw::utils::dup_cstr(dw::make_success_response());
+    dw::g_log_level.store(cfg.log_level);
+    log_i("", "wrapper 配置完成");
+    return dw::result_to_json(std::move(result));
 }
 
 /* ------------------------------------------------------------------ */
 /*  回调注册                                                          */
 /* ------------------------------------------------------------------ */
 
-DW_API void dw_set_progress_callback(const dw_progress_cb cb) {
-    if (!dw::g_downloader) {
-        log_e("", "进度回调注册失败: 下载器已销毁");
-        return;
+DW_API char *set_progress_callback(const dw_progress_cb cb) {
+    auto *downloader = dw::global_downloader();
+    if (!downloader) return dw::result_to_json(dw::dw_submit_result_t::failure());
+    std::lock_guard<std::mutex> lock(downloader->mutex);
+    if (!downloader->task_manager || downloader->destroying) {
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
     }
-    if (dw::g_downloader->progress_cb.load() == cb) return;
-    log_i("", "注册进度回调: enabled={}", cb != nullptr);
-    std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-    dw::g_downloader->progress_cb.store(cb);
+    downloader->progress_cb.store(cb);
+    return dw::result_to_json(dw::dw_submit_result_t::success());
 }
 
-DW_API void dw_set_log_callback(const dw_log_cb cb) {
-    if (!dw::g_downloader) {
-        log_e("", "日志回调注册失败: 下载器已销毁");
-        return;
+DW_API char *set_log_callback(const dw_log_cb cb) {
+    auto *downloader = dw::global_downloader();
+    if (!downloader) return dw::result_to_json(dw::dw_submit_result_t::failure());
+    std::lock_guard<std::mutex> lock(downloader->mutex);
+    if (!downloader->task_manager || downloader->destroying) {
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
     }
-    if (dw::g_downloader->log_cb.load() == cb) return;
-    log_i("", "注册日志回调: enabled={}", cb != nullptr);
-    std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-    dw::g_downloader->log_cb.store(cb);
+    downloader->log_cb.store(cb);
+    return dw::result_to_json(dw::dw_submit_result_t::success());
 }
 
 /* ------------------------------------------------------------------ */
 /*  任务接口                                                          */
 /* ------------------------------------------------------------------ */
 
-DW_API char *dw_add_task(const char *params_json) {
-    log_i("engine", "添加任务 params={}", params_json ? params_json : "null");
-
+DW_API char *add_task(const char *params_json) {
+    log_i("", "wrapper 添加任务 params={}", params_json ? params_json : "null");
+    if (!dw::global_downloader()->initialized.load()) {
+        log_e("", "wrapper 下载器未初始化");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    }
     // 通用参数校验与解析
     dw::TaskParams params;
     if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        log_e("", "wrapper 添加任务 参数无效");
         return err;
     }
 
     auto *d = dw::global_downloader();
-    dw::TaskManager *tm = d->task_manager.get();
-    if (!tm) {
-        log_e(params.natural_key.c_str(), "添加任务失败: 管理器未初始化");
-        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
+    std::lock_guard<std::mutex> lock(d->mutex);
+    if (!d->initialized.load()) {
+        return dw::utils::dup_cstr(dw::make_error_response("下载器未初始化"));
     }
-
+    const dw::TaskManager *tm = d->task_manager.get();
     auto result = tm->add(params);
-    log_i(params.natural_key.c_str(), "添加任务完成: {}", boost::json::serialize(to_json(result)));
+    log_i("", "wrapper 添加任务完成: {}", boost::json::serialize(to_json(result)));
     return dw::result_to_json(std::move(result));
 }
 
-DW_API char *dw_pause_task(const char *params_json) {
-    log_i("engine", "暂停任务 params={}", params_json ? params_json : "null");
-
+DW_API char *pause_task(const char *params_json) {
+    log_i("", "wrapper 暂停任务 params={}", params_json ? params_json : "null");
+    if (!dw::global_downloader()->initialized.load()) {
+        log_e("", "wrapper 下载器未初始化");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    }
     dw::TaskParams params;
     if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        log_e("", "wrapper 暂停任务 参数无效");
         return err;
     }
 
-    const auto *d = dw::global_downloader();
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        log_e(params.natural_key.c_str(), "暂停任务失败: 管理器未初始化");
-        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
-    }
-
+    std::lock_guard<std::mutex> lock(dw::global_downloader()->mutex);
+    const auto *tm = dw::global_downloader()->task_manager.get();
     auto result = tm->pause(params);
-    log_i(params.natural_key.c_str(), "暂停任务完成: {}", boost::json::serialize(to_json(result)));
+    log_i("", "暂停任务完成: {}", boost::json::serialize(to_json(result)));
     return dw::result_to_json(std::move(result));
 }
 
-DW_API char *dw_resume_task(const char *params_json) {
-    log_i("engine", "恢复任务 params={}", params_json ? params_json : "null");
-
+DW_API char *resume_task(const char *params_json) {
+    log_i("", "wrapper 恢复任务 params={}", params_json ? params_json : "null");
+    if (!dw::global_downloader()->initialized.load()) {
+        log_e("", "wrapper 下载器未初始化");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    }
     dw::TaskParams params;
     if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        log_e("", "wrapper 恢复任务 参数无效");
         return err;
     }
 
-    const auto *d = dw::global_downloader();
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        log_e(params.natural_key.c_str(), "恢复任务失败: 管理器未初始化");
-        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
-    }
-
+    std::lock_guard<std::mutex> lock(dw::global_downloader()->mutex);
+    const auto *tm = dw::global_downloader()->task_manager.get();
     auto result = tm->resume(params);
-    log_i(params.natural_key.c_str(), "恢复任务完成: {}", boost::json::serialize(to_json(result)));
+    log_i("", "wrapper 恢复任务完成: {}", boost::json::serialize(to_json(result)));
     return dw::result_to_json(std::move(result));
 }
 
-DW_API char *dw_delete_task(const char *params_json) {
-    log_i("engine", "删除任务 params={}", params_json ? params_json : "null");
+DW_API char *delete_task(const char *params_json) {
+    log_i("", "wrapper 删除任务 params={}", params_json ? params_json : "null");
+    if (!dw::global_downloader()->initialized.load()) {
+        log_e("", "wrapper 下载器未初始化");
+        return dw::result_to_json(dw::dw_submit_result_t::failure());
+    }
 
     dw::TaskParams params;
     if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
+        log_e("", "wrapper 删除任务 参数无效");
         return err;
     }
-    const auto *d = dw::global_downloader();
-    auto *tm = d->task_manager.get();
-    if (!tm) {
-        log_e(params.natural_key.c_str(), "删除任务失败: 管理器未初始化");
-        return dw::utils::dup_cstr(dw::make_error_response("管理器未初始化"));
-    }
-
+    std::lock_guard<std::mutex> lock(dw::global_downloader()->mutex);
+    const auto *tm = dw::global_downloader()->task_manager.get();
     auto result = tm->remove(params);
-    log_i(params.natural_key.c_str(), "删除任务完成: {}",boost::json::serialize(to_json(result)));
+    log_i("", "删除任务完成: {}", boost::json::serialize(to_json(result)));
     return dw::result_to_json(std::move(result));
 }
 
@@ -335,7 +313,7 @@ DW_API char *dw_delete_task(const char *params_json) {
 /*  BT 工具函数                                                       */
 /* ------------------------------------------------------------------ */
 
-DW_API char *dw_parse_magnet(const char *params_json) {
+DW_API char *parse_magnet(const char *params_json) {
     if (!params_json) {
         return dw::utils::dup_cstr(dw::make_error_response("参数为空"));
     }
@@ -345,7 +323,7 @@ DW_API char *dw_parse_magnet(const char *params_json) {
         if (magnet.empty()) {
             return dw::utils::dup_cstr(dw::make_error_response("magnet_link 为空"));
         }
-        auto result = dw::TorrentEngine::parse_magnet(magnet);
+        auto result = dw::TaskManager::parse_magnet(magnet);
         if (result.code != DW_REASON_NONE) {
             return dw::utils::dup_cstr(dw::make_error_response(result.message));
         }
@@ -357,7 +335,7 @@ DW_API char *dw_parse_magnet(const char *params_json) {
     }
 }
 
-DW_API char *dw_parse_torrent_file(const char *params_json) {
+DW_API char *parse_torrent_file(const char *params_json) {
     if (!params_json) {
         return dw::utils::dup_cstr(dw::make_error_response("参数为空"));
     }
@@ -367,7 +345,7 @@ DW_API char *dw_parse_torrent_file(const char *params_json) {
         if (path.empty()) {
             return dw::utils::dup_cstr(dw::make_error_response("torrent_file 为空"));
         }
-        auto result = dw::TorrentEngine::parse_torrent_file(path);
+        auto result = dw::TaskManager::parse_torrent_file(path);
         if (result.code != DW_REASON_NONE) {
             return dw::utils::dup_cstr(dw::make_error_response(result.message));
         }
@@ -391,49 +369,28 @@ DW_API char *dw_parse_torrent_file(const char *params_json) {
 /*  任务快照与队列                                              */
 /* ------------------------------------------------------------------ */
 
-DW_API char *dw_list_tasks(const char *params_json) {
+DW_API char *list_tasks(const char *params_json) {
     auto *d = dw::global_downloader();
-    if (!d || !d->initialized.load() || !params_json) {
+    if (!d || !params_json) {
         return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
     }
+    log_i("", "wrapper 任务列表 params={}", params_json);
 
-    std::string client_id;
-    try {
-        auto obj = boost::json::parse(params_json).as_object();
-        client_id = dw::json_get_string(obj, "client_id");
-    } catch (const std::exception &) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
-    }
-    if (client_id.empty()) {
-        return dw::utils::dup_cstr(dw::make_error_response("client_id 为空"));
-    }
-
+    std::lock_guard<std::mutex> lock(d->mutex);
     auto *tm = d->task_manager.get();
-    if (!tm) {
-        return dw::utils::dup_cstr(dw::make_error_response("路由失败"));
+    if (!d->initialized.load() || !tm) {
+        return dw::utils::dup_cstr(dw::make_error_response("下载器未初始化"));
     }
 
     const auto tasks = tm->list();
-    boost::json::array arr;
-    for (const auto &task : tasks) {
-        auto item = dw::to_json(task);
-        item["task_natural_key"] = task.task_id;
-        const auto source = task.task_protocol == DW_PROTOCOL_TORRENT ? DW_SOURCE_REMOTE_FILE
-            : (task.task_protocol == DW_PROTOCOL_HTTP ? DW_SOURCE_TASK_FILE : DW_SOURCE_LOCAL_FILE);
-        item["type"] = static_cast<int>(source);
-        item["files"] = boost::json::value_from(task.files);
-        arr.push_back(std::move(item));
-    }
-    boost::json::object data;
-    data["tasks"] = std::move(arr);
-    return dw::utils::dup_cstr(dw::make_success_response(data));
+    return dw::utils::dup_cstr(dw::make_success_response(boost::json::value_from(tasks).as_array()));
 }
 
 /* ------------------------------------------------------------------ */
 /*  本地文件浏览与管理                                                */
 /* ------------------------------------------------------------------ */
 
-DW_API char *dw_scan_local_file(const char *params_json) {
+DW_API char *scan_local_file(const char *params_json) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !params_json) {
         return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
@@ -462,29 +419,7 @@ DW_API char *dw_scan_local_file(const char *params_json) {
 /*  资源释放                                                          */
 /* ------------------------------------------------------------------ */
 
-DW_API void dw_file_list_free(dw_file_info_t *files, int32_t count) {
-    // 释放逻辑统一收敛至内存工具（各节点字符串 + 数组本体）。
-    dw::utils::free_file_list(files, count);
-}
-
-DW_API void dw_task_list_free(dw_task_snapshot_t *tasks, int32_t count) {
-    if (!tasks || count <= 0) {
-        return;
-    }
-    for (int32_t i = 0; i < count; ++i) {
-        if (tasks[i].natural_key) {
-            std::free(const_cast<char *>(tasks[i].natural_key));
-        }
-        std::free(tasks[i].url);
-        std::free(tasks[i].info_hash);
-        std::free(tasks[i].name);
-        std::free(tasks[i].save_path);
-        std::free(tasks[i].content_root);
-    }
-    std::free(tasks);
-}
-
-DW_API void dw_free(void *ptr) {
+DW_API void release_memory(void *ptr) {
     if (ptr) {
         std::free(ptr);
     }

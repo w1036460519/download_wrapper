@@ -7,6 +7,7 @@
 #include "internal/engine_interface.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 #include <mutex>
 #include "core/task.h"
@@ -18,7 +19,7 @@ class TorrentEngine final : public IDownloadEngine {
 public:
     /// 关联任务管理器及其存储。
     /// @param task_manager 任务管理器，须在引擎生命周期内有效。
-    explicit TorrentEngine(TaskManager *task_manager);
+    TorrentEngine() = default;
 
     /// 释放已初始化的引擎资源。
     ~TorrentEngine() override;
@@ -29,17 +30,23 @@ public:
     /// 持有 tasks_mutex() 时查询内存任务并使用返回指针。
     /// @param info_hash BT 任务哈希。
     /// @return 匹配的 BT 任务，未找到时返回 nullptr。
-    static Task *get_task(const std::string &info_hash, bool include_deleted = false);
+    static Task *get_task(const std::string &info_hash);
 
     /// 返回已关联任务管理器的递归互斥锁。
     static std::recursive_mutex &tasks_mutex();
 
     /// 创建 session 并启动后台线程。
     /// @return 成功返回 0，失败返回 -1。
-    int32_t init() override;
+    int32_t init(const std::vector<std::string> &task_ids = {}) override;
 
     /// 停止后台线程并释放 session。
     void destroy() override;
+
+    /// 仅应用传入的 session 下载并发、速率限制和网络开关。
+    void config(std::optional<int32_t> downloads = std::nullopt,
+                std::optional<int64_t> download_rate = std::nullopt,
+                std::optional<int64_t> upload_rate = std::nullopt,
+                std::optional<bool> network_allowed = std::nullopt) override;
 
     /// 注册并持久化 BT 任务，创建任务句柄。
     /// @param params 下载来源、保存路径和文件选择等参数。
@@ -70,11 +77,6 @@ public:
     void sweep() override;
 
 private:
-    /// 调度准入后获取或重建句柄，提交恢复操作。
-    /// @param params 任务哈希和要修改的文件优先级。
-    dw_submit_result_t do_resume(const TaskParams *params) override;
-
-    bool initialized_ = false;
 };
 
 } // namespace dw

@@ -21,7 +21,7 @@ namespace dw {
  */
 class HttpEngine final : public IDownloadEngine {
 public:
-    explicit HttpEngine(TaskManager *task_manager);
+    HttpEngine() = default;
     ~HttpEngine() override;
 
     HttpEngine(const HttpEngine&)            = delete;
@@ -31,7 +31,7 @@ public:
      * 初始化引擎。
      * @return 0=成功，-1=失败。
      */
-    int32_t init() override;
+    int32_t init(const std::vector<std::string> &task_ids = {}) override;
 
     /**
      * 销毁引擎，释放所有资源。
@@ -67,7 +67,6 @@ public:
 
 private:
     dw_submit_result_t start_download(const TaskParams *params, bool replace_record);
-    bool initialized_ = false;
 };
 
 } // namespace dw

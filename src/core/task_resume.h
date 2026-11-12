@@ -5,8 +5,8 @@
 #include <vector>
 
 namespace dw {
-    struct TaskBtResume {
-        std::string info_hash;
+    struct TaskResume {
+        std::string task_id;
         std::vector<uint8_t> resume_data;
     };
 }

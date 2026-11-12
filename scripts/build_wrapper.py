@@ -2,7 +2,7 @@
 """
 编译 download_wrapper 全平台产物。
 
-统一处理 vcpkg 依赖安装、libwebrtc 预编译产物下载、CMake 配置/编译、
+统一处理 vcpkg 依赖安装、libtorrent 预编译产物下载、CMake 配置/编译、
 产物后处理（strip/lipo/libtool 合并），消除 CI YAML 中的 bash 字符串拼接。
 
 用法：
@@ -29,13 +29,12 @@ if hasattr(sys.stdout, 'reconfigure'):
 # 从 versions.py 读取版本
 sys.path.insert(0, str(Path(__file__).parent))
 from versions import (
-    LIBTORRENT_VERSION, LIBWEBRTC_VERSION,
-    get_libtorrent_release_tag, get_libwebrtc_release_tag,
-    get_libtorrent_asset_name, get_libwebrtc_asset_name,
+    LIBTORRENT_VERSION,
+    get_libtorrent_release_tag,
+    get_libtorrent_asset_name,
 )
 
 # 兼容旧代码
-LIBWEBRTC_RELEASE_TAG = get_libwebrtc_release_tag()
 
 # ── 平台配置 ──
 # universal=True: 双架构编译后合并（macOS lipo / iOS libtool+lipo）
@@ -197,7 +196,7 @@ def _download_from_release(workspace: Path, release_tag: str, asset: str,
         workspace: 项目根目录
         release_tag: Release tag (如 'libtorrent-v2.1.2')
         asset: 文件名 (如 'libtorrent-v2.1.2-macos-universal.tar.gz')
-        component: 组件名 (如 'libtorrent', 'libwebrtc')
+        component: 组件名（例如 libtorrent）
         version: 版本号
         platform_tag: 平台标识 (如 'windows-arm64')，用于区分架构
     
@@ -251,43 +250,7 @@ def _download_from_release(workspace: Path, release_tag: str, asset: str,
     return dest
 
 
-# ── Step 2: libwebrtc 预编译产物 ──
-
-def download_libwebrtc(workspace: Path, platform_name: str) -> Path | None:
-    """从 GitHub Release 下载 libwebrtc 预编译产物。"""
-    asset = get_libwebrtc_asset_name(platform_name)
-    release_tag = get_libwebrtc_release_tag()
-    return _download_from_release(workspace, release_tag, asset, "libwebrtc", LIBWEBRTC_VERSION, platform_name)
-
-
-def _libwebrtc_dir_valid(d: Path) -> bool:
-    """校验 libwebrtc 目录完整性（判定条件与 CMakeLists 保持一致）。"""
-    return (d / "include" / "libwebrtc.h").exists() and (d / "lib").exists()
-
-
-def ensure_libwebrtc(workspace: Path, libwebrtc_dir: Path | None,
-                     platform_name: str) -> Path | None:
-    """确保 libwebrtc 可用：本地目录有效则使用，否则回退 Release 下载。
-
-    Returns:
-        有效目录；未指定本地目录且下载失败时返回 None（表示跳过 P2P）
-    """
-    if libwebrtc_dir and _libwebrtc_dir_valid(libwebrtc_dir):
-        print(f"libwebrtc 已存在: {libwebrtc_dir}")
-        return libwebrtc_dir
-    if libwebrtc_dir:
-        print(f"本地 libwebrtc 无效: {libwebrtc_dir}，回退 Release 下载")
-    release_dir = download_libwebrtc(workspace, platform_name)
-    if release_dir:
-        return release_dir
-    # 显式指定了本地目录却仍不可用属配置/产物错误；未指定则允许跳过 P2P
-    if libwebrtc_dir:
-        raise RuntimeError(
-            f"libwebrtc 不可用：本地目录无效且 Release 下载失败 ({platform_name})")
-    return None
-
-
-# ── Step 2.5: libtorrent 获取 ──
+# ── Step 2: libtorrent 获取 ──
 
 def download_libtorrent(workspace: Path, platform_name: str) -> Path | None:
     """从 GitHub Release 下载 libtorrent 预编译产物。"""
@@ -361,7 +324,7 @@ def ensure_libtorrent(workspace: Path, libtorrent_dir: Path | None,
 # ── Step 3: CMake 构建 ──
 
 def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
-                    vcpkg_dir: Path, libwebrtc_dir: Path | None,
+                    vcpkg_dir: Path,
                     libtorrent_dir: Path | None = None,
                     extra_args: list[str] = None):
     """构造并执行 cmake configure 命令。"""
@@ -389,14 +352,6 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
         overlay = workspace / "vcpkg-triplets"
         if overlay.exists():
             cmd.append(f"-DVCPKG_OVERLAY_TRIPLETS={overlay}")
-
-    # libwebrtc
-    # iOS 平台不传：上游无 iOS 预编译库（包 lib/ 为空），且 iOS 强制 P2P OFF（见 CMakeLists），
-    # 传入空壳包目录会让链接段 find_library 触发 FATAL
-    if cfg.get("os") == "ios":
-        cmd.append("-DDW_ENABLE_P2P=OFF")
-    elif libwebrtc_dir:
-        cmd.append(f"-DDW_LIBWEBRTC_DIR={libwebrtc_dir}")
 
     # libtorrent
     if libtorrent_dir:
@@ -567,11 +522,11 @@ def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path,
 # ── 主流程 ──
 
 def build_single_arch(workspace: Path, cfg: dict, vcpkg_dir: Path,
-                      libwebrtc_dir: Path | None, libtorrent_dir: Path | None,
+                      libtorrent_dir: Path | None,
                       build_name: str):
     """单架构构建（Linux/Windows/iOS-arm64/Android）。"""
     build_dir = workspace / "build"
-    cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
+    cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libtorrent_dir)
     cmake_build(build_dir)
 
     # 查找并复制产物
@@ -591,21 +546,21 @@ def build_single_arch(workspace: Path, cfg: dict, vcpkg_dir: Path,
 
 
 def build_macos_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
-                          libwebrtc_dir: Path | None, libtorrent_dir: Path | None):
+                          libtorrent_dir: Path | None):
     """macOS universal: arm64 + x64 编译后 lipo 合并。"""
     deploy = cfg["deploy_target"]
 
     # arm64
     cmake_configure(workspace / "build-arm64", workspace,
                     {**cfg, "triplet": "arm64-osx", "deploy_target": deploy},
-                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
+                    vcpkg_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=arm64"])
     cmake_build(workspace / "build-arm64")
 
     # x64
     cmake_configure(workspace / "build-x64", workspace,
                     {**cfg, "triplet": "x64-osx", "deploy_target": deploy},
-                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
+                    vcpkg_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=x86_64"])
     cmake_build(workspace / "build-x64")
 
@@ -625,19 +580,19 @@ def build_macos_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
 
 
 def build_ios_simulator_universal(workspace: Path, cfg: dict, vcpkg_dir: Path,
-                                  libwebrtc_dir: Path | None, libtorrent_dir: Path | None):
+                                  libtorrent_dir: Path | None):
     """iOS simulator universal: arm64 + x64 各编译后合并。"""
     # arm64 模拟器
     cmake_configure(workspace / "build-sim-arm64", workspace,
                     {**cfg, "triplet": "arm64-ios-simulator", "simulator": True},
-                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
+                    vcpkg_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=arm64"])
     cmake_build(workspace / "build-sim-arm64")
 
     # x64 模拟器
     cmake_configure(workspace / "build-sim-x64", workspace,
                     {**cfg, "triplet": "x64-ios-simulator", "simulator": True},
-                    vcpkg_dir, libwebrtc_dir, libtorrent_dir,
+                    vcpkg_dir, libtorrent_dir,
                     extra_args=["-DCMAKE_OSX_ARCHITECTURES=x86_64"])
     cmake_build(workspace / "build-sim-x64")
 
@@ -658,8 +613,6 @@ def main():
     parser.add_argument("--temp-dir",
                         default=os.environ.get("RUNNER_TEMP", "/tmp"),
                         help="临时目录")
-    parser.add_argument("--libwebrtc-dir",
-                        help="本地 libwebrtc 目录（跳过下载）")
     parser.add_argument("--libtorrent-dir",
                         help="本地 libtorrent 目录（跳过 FetchContent）")
     args = parser.parse_args()
@@ -681,36 +634,26 @@ def main():
         workspace, args.vcpkg_ref, temp_dir,
         Path(args.vcpkg_dir) if args.vcpkg_dir else None)
 
-    # 2. libwebrtc（本地目录优先，无效回退 Release 下载）
-    # iOS 无 libwebrtc 预编译库，跳过下载（P2P 强制 OFF，见 CMakeLists）
-    print("\n== Step 2: libwebrtc ==")
-    if cfg.get("os") == "ios":
-        libwebrtc_dir = None
-        print("iOS 平台: 跳过 libwebrtc 下载（P2P 强制 OFF）")
-    else:
-        libwebrtc_dir = Path(args.libwebrtc_dir).resolve() if args.libwebrtc_dir else None
-        libwebrtc_dir = ensure_libwebrtc(workspace, libwebrtc_dir, args.platform)
-
-    # 3. libtorrent（自动检测/编译）
-    print("\n== Step 3: libtorrent ==")
+    # 2. libtorrent（自动检测/编译）
+    print("\n== Step 2: libtorrent ==")
     libtorrent_dir = Path(args.libtorrent_dir).resolve() if args.libtorrent_dir else None
     libtorrent_dir = ensure_libtorrent(workspace, libtorrent_dir, args.platform, vcpkg_dir)
 
-    # 4. 构建
-    print("\n== Step 4: CMake 构建 ==")
+    # 3. 构建
+    print("\n== Step 3: CMake 构建 ==")
     if args.platform == "macos-universal":
-        output = build_macos_universal(workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
+        output = build_macos_universal(workspace, cfg, vcpkg_dir, libtorrent_dir)
     elif args.platform == "ios-simulator-universal":
-        output = build_ios_simulator_universal(workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
+        output = build_ios_simulator_universal(workspace, cfg, vcpkg_dir, libtorrent_dir)
     elif cfg.get("static") and cfg["os"] == "ios":
         # iOS arm64 单架构静态库
         build_dir = workspace / "build"
-        cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir)
+        cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libtorrent_dir)
         cmake_build(build_dir)
         # 单架构分支同样并入 libtorrent，否则产物缺 BT 符号
         output = merge_ios_static_libs(workspace, cfg, vcpkg_dir, libtorrent_dir)
     else:
-        output = build_single_arch(workspace, cfg, vcpkg_dir, libwebrtc_dir, libtorrent_dir, args.platform)
+        output = build_single_arch(workspace, cfg, vcpkg_dir, libtorrent_dir, args.platform)
 
     print(f"\n== 构建完成 ==")
     print(f"产物: {output}")

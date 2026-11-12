@@ -221,7 +221,7 @@ private:
         try {
             auto resp_obj = boost::json::parse(info_resp).as_object();
             if (resp_obj.at("code").as_int64() != 0) {
-                dw_free(info_resp);
+                release_memory(info_resp);
                 send_error(http::status::not_found, "Task or file not found");
                 return;
             }
@@ -229,11 +229,11 @@ private:
             file_path_ = data.at("path").as_string().c_str();
             total_size_ = data.at("size").as_int64();
         } catch (const std::exception &) {
-            dw_free(info_resp);
+            release_memory(info_resp);
             send_error(http::status::internal_server_error, "Parse response failed");
             return;
         }
-        dw_free(info_resp);
+        release_memory(info_resp);
 
         // ---- 开放区间补齐 ----
         if (range_end_ < 0) {
@@ -302,7 +302,7 @@ private:
             } catch (const std::exception &) {
                 // 解析失败，segments 为空
             }
-            dw_free(ranges_resp);
+            release_memory(ranges_resp);
         }
 
         // 查找 current_pos 所在的已下载范围

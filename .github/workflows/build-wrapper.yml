@@ -1,7 +1,7 @@
 name: Build Wrapper
 
 # 独立构建 download_wrapper（9 个平台）
-# 从 Release 下载 libwebrtc/libtorrent 预编译产物
+# 从 Release 下载 libtorrent 预编译产物
 #
 # 触发：仅手动触发
 on:
@@ -30,7 +30,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       libtorrent_version: ${{ steps.version.outputs.libtorrent_version }}
-      libwebrtc_version: ${{ steps.version.outputs.libwebrtc_version }}
       wrapper_version: ${{ steps.version.outputs.wrapper_version }}
       wrapper_release_tag: ${{ steps.version.outputs.wrapper_release_tag }}
     steps:
@@ -39,15 +38,12 @@ jobs:
         id: version
         run: |
           LT_VERSION=$(python3 -c "from scripts.versions import LIBTORRENT_VERSION; print(LIBTORRENT_VERSION)")
-          LW_VERSION=$(python3 -c "from scripts.versions import LIBWEBRTC_VERSION; print(LIBWEBRTC_VERSION)")
           W_VERSION=$(python3 -c "from scripts.versions import WRAPPER_VERSION; print(WRAPPER_VERSION)")
           W_TAG=$(python3 -c "from scripts.versions import get_wrapper_release_tag; print(get_wrapper_release_tag())")
           echo "libtorrent_version=$LT_VERSION" >> "$GITHUB_OUTPUT"
-          echo "libwebrtc_version=$LW_VERSION" >> "$GITHUB_OUTPUT"
           echo "wrapper_version=$W_VERSION" >> "$GITHUB_OUTPUT"
           echo "wrapper_release_tag=$W_TAG" >> "$GITHUB_OUTPUT"
           echo "libtorrent: $LT_VERSION"
-          echo "libwebrtc: $LW_VERSION"
           echo "wrapper: $W_VERSION (tag: $W_TAG)"
 
   build:
@@ -168,7 +164,6 @@ jobs:
             --vcpkg-ref "${{ env.VCPKG_REF }}" \
             --workspace "${{ github.workspace }}" \
             --temp-dir "${{ runner.temp }}" \
-            --libwebrtc-dir "${{ runner.temp }}/webrtc_build" \
             --libtorrent-dir "${{ runner.temp }}/libtorrent-${{ matrix.name }}"
 
           echo "== 构建后磁盘 =="

@@ -21,8 +21,8 @@
 namespace dw {
 
     struct TaskParams {
+        dw_protocol_t protocol = DW_PROTOCOL_HTTP;
         std::string client_id;
-        std::string save_path;
         std::string url;
         std::string info_hash;
         std::string magnet_link;
@@ -35,13 +35,17 @@ namespace dw {
         std::optional<int32_t> queue_priority; // 添加任务时的队列优先级。
         bool delete_files = false; // 删除任务时是否同时删除本地文件
         bool force = false; // 恢复时强制准入（调度器暂停最慢任务让行）
+        const std::string &task_key() const {
+            return protocol == DW_PROTOCOL_TORRENT ? info_hash : url;
+        }
     };
 
     // ---- C++ 序列化（内部消费） ----
 
     inline boost::json::object to_json(const TaskParams &p) {
-        auto obj = to_json(static_cast<const TaskIdentity &>(p));
-        if (!p.save_path.empty()) obj["save_path"] = p.save_path;
+        boost::json::object obj;
+        obj["client_id"] = p.client_id;
+        obj["protocol"] = static_cast<int>(p.protocol);
         if (!p.url.empty()) obj["url"] = p.url;
         if (!p.info_hash.empty()) obj["info_hash"] = p.info_hash;
         if (!p.magnet_link.empty()) obj["magnet_link"] = p.magnet_link;
@@ -75,12 +79,15 @@ namespace dw {
     }
 
     inline void from_json(const boost::json::object &obj, TaskParams &p) {
-        // 基类字段
-        from_json(obj, static_cast<TaskIdentity &>(p));
-        // 派生类字段（宽松提取）
-        json_util::extract(obj, "save_path", p.save_path);
+        TaskIdentity identity;
+        from_json(obj, identity);
+        p.client_id = std::move(identity.client_id);
+        p.protocol = identity.protocol;
         json_util::extract(obj, "url", p.url);
         json_util::extract(obj, "info_hash", p.info_hash);
+        // 旧请求的任务键直接归入对应协议的字段。
+        auto &key = p.protocol == DW_PROTOCOL_TORRENT ? p.info_hash : p.url;
+        if (key.empty()) key = std::move(identity.natural_key);
         json_util::extract(obj, "magnet_link", p.magnet_link);
         json_util::extract(obj, "torrent_file", p.torrent_file);
         if (const auto *value = obj.if_contains("priority");

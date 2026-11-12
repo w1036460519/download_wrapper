@@ -82,32 +82,4 @@ namespace dw::utils {
         return acquire_unique_name(dir, name, true, out_error);
     }
 
-    void ensure_placeholder(const std::string &dir,
-                            const std::string &name,
-                            const bool multi_file) {
-        if (name.empty()) return;
-        const std::filesystem::path target = std::filesystem::path(dir) / name;
-        if (entry_exists(target)) return;
-        std::error_code ec;
-        create_entry(target, multi_file, ec);
-    }
-
-    bool release_placeholder(const std::string &dir, const std::string &name) {
-        if (name.empty()) return false;
-        const std::filesystem::path target = std::filesystem::path(dir) / name;
-        std::error_code ec;
-        // symlink_status 不跟随符号链接：避免顺链删到目标位置的用户数据。
-        const auto st = std::filesystem::symlink_status(target, ec);
-        if (ec) return false;
-        if (std::filesystem::is_directory(st)) {
-            // remove 对非空目录失败，天然只回收空占位目录，不触碰已落盘数据。
-            return std::filesystem::remove(target, ec) && !ec;
-        }
-        if (std::filesystem::is_regular_file(st)) {
-            const auto size = std::filesystem::file_size(target, ec);
-            if (ec || size != 0) return false;
-            return std::filesystem::remove(target, ec) && !ec;
-        }
-        return false; // 符号链接等非常规条目一律不动
-    }
 } // namespace dw::utils

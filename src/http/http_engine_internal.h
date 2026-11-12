@@ -365,7 +365,7 @@ namespace dw {
             /** 探测完成后冻结元数据字段 */
             void finalize_probing(dl_task_ctx *tCtx, const dl_part_ctx *pCtx);
 
-            /** HTTP 续传数据（引擎自持序列化，落 resume_data 表；反序列化回灌 dl_task_ctx）。 */
+            /** HTTP 续传数据（引擎自持序列化，落 task_resume 表；反序列化回灌 dl_task_ctx）。 */
             struct HttpResumeData {
                 bool ok = false;
                 int64_t total_size = -1;
@@ -382,7 +382,7 @@ namespace dw {
             /** 反序列化续传 BLOB；解析失败时 ok=false，调用方回退全量重下。 */
             HttpResumeData deserialize_resume(const uint8_t *data, size_t size);
 
-            /** 序列化当前续传态并经全局下载器回灌 resume_data 表（以 url 为 key）。 */
+            /** 序列化当前续传态并经全局下载器回灌 task_resume 表（以 url 为 key）。 */
             void emit_resume(dl_task_ctx *tCtx);
 
             /** 单个分片一次请求完成后的结果判定，返回 true 表示需重试 */

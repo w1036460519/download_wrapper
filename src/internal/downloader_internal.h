@@ -6,7 +6,6 @@
 #pragma once
 
 #include "download_wrapper/download_wrapper.h"
-#include "internal/file_info.h"
 #include "internal/json_util.h"
 #include "internal/config.h"
 #include "internal/task_identity.h"
@@ -27,8 +26,6 @@
 
 namespace dw {
     // 前向声明各协议引擎
-    class HttpEngine;
-    class TorrentEngine;
     class TaskManager;
 
     // ---- 枚举名称序列化（供 to_string 重载使用）----
@@ -69,68 +66,6 @@ namespace dw {
         return boost::json::serialize(arr);
     }
 
-    // ---- dw_file_info_t 序列化（调试日志用）----
-
-    inline std::string to_string(const dw_file_info_t &f) {
-        boost::json::object obj;
-        obj["index"] = f.index;
-        obj["name"] = f.name ? f.name : "";
-        obj["full_path"] = f.full_path ? f.full_path : "";
-        obj["size"] = f.size;
-        obj["ext"] = f.ext ? f.ext : "";
-        obj["status"] = f.status;
-        obj["offset"] = f.offset;
-        obj["downloaded_bytes"] = f.downloaded_bytes;
-        return boost::json::serialize(obj);
-    }
-
-    // ---- dw_task_params_t 序列化（调试日志用，不含 resume_data）----
-
-    inline std::string to_string(const dw_task_params_t &p) {
-        boost::json::object obj;
-        obj["save_path"] = p.save_path ? p.save_path : "";
-        obj["url"] = p.url ? p.url : "";
-        obj["info_hash"] = p.info_hash ? p.info_hash : "";
-        obj["magnet"] = p.magnet_link ? p.magnet_link : "";
-        obj["torrent"] = p.torrent_file ? p.torrent_file : "";
-        obj["file_indexes"] = p.file_index_size;
-        obj["priority_file_indexes"] = p.priority_file_index_size;
-        obj["url_seeds"] = p.url_seed_count;
-        obj["priority"] = p.priority;
-        // source 已从参数结构体移除（由库内按 protocol 推导），此处不再输出。
-        return boost::json::serialize(obj);
-    }
-
-    // ---- dw_config_t 序列化（调试日志用）----
-
-    inline std::string to_string(const dw_config_t &c) {
-        boost::json::object obj;
-        // HTTP 配置
-        obj["connect_timeout"] = c.connect_timeout_seconds;
-        obj["request_timeout"] = c.request_timeout_seconds;
-        obj["low_speed_limit"] = c.low_speed_limit_bps;
-        obj["low_speed_time"] = c.low_speed_time;
-        obj["max_redirect"] = c.max_redirect;
-        obj["proxy"] = c.proxy ? c.proxy : "";
-        obj["user_agent"] = c.user_agent ? c.user_agent : "";
-        obj["verify_ssl"] = c.verify_ssl;
-        obj["ca_bundle"] = c.ca_bundle ? c.ca_bundle : "";
-        obj["max_retries"] = c.max_retries;
-        obj["default_parts"] = c.default_parts;
-        obj["min_size_for_split"] = c.min_size_for_split;
-        // BT 配置
-        obj["listen_port"] = c.listen_port;
-        obj["max_concurrent"] = c.max_concurrent_downloads;
-        obj["dl_rate_limit"] = c.download_rate_limit;
-        obj["ul_rate_limit"] = c.upload_rate_limit;
-        obj["seed_ratio"] = c.seed_ratio_limit;
-        // 通用配置
-        obj["log_level"] = static_cast<int>(c.log_level);
-        obj["work_dir"] = c.work_dir ? c.work_dir : "";
-        obj["client_id"] = c.client_id ? c.client_id : "";
-        return boost::json::serialize(obj);
-    }
-
     /**
      * 下载器全局单例内部实现。
      *
@@ -140,14 +75,11 @@ namespace dw {
         std::mutex mutex;
         std::atomic<bool> initialized{false};
 
-        std::unique_ptr<HttpEngine> http_engine;
-        std::unique_ptr<TorrentEngine> torrent_engine;
         std::unique_ptr<TaskManager> task_manager;
+        bool destroying = false; // 由 mutex 保护。
 
         std::atomic<dw_progress_cb> progress_cb{nullptr};
         std::atomic<dw_log_cb> log_cb{nullptr};
-
-        Config config{};
     };
 
     /**
@@ -252,6 +184,13 @@ namespace dw {
         if (!data.empty()) {
             resp["data"] = data;
         }
+        return boost::json::serialize(resp);
+    }
+
+    inline std::string make_success_response(boost::json::array data) {
+        boost::json::object resp;
+        resp["code"] = 0;
+        resp["data"] = std::move(data);
         return boost::json::serialize(resp);
     }
 

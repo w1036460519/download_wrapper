@@ -14,9 +14,9 @@
 
 #include "download_wrapper/download_wrapper.h"
 #include "internal/downloader_internal.h"
-#include "utils/memory_util.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,16 +28,26 @@ namespace dw {
      */
     class IDownloadEngine {
     public:
-        explicit IDownloadEngine(TaskManager *task_manager) : task_manager_(task_manager) {
+        bool initialized_ = false;
+
+        void set_task_manager(TaskManager *task_manager) {
+            task_manager_ = task_manager;
         }
 
         virtual ~IDownloadEngine() = default;
 
         /// 初始化引擎。@return 0=成功，-1=失败。
-        virtual int32_t init() = 0;
+        virtual int32_t init(const std::vector<std::string> &task_ids = {}) = 0;
 
         /// 销毁引擎，释放所有资源。
         virtual void destroy() = 0;
+
+        /// 应用运行期配置，支持动态配置的引擎覆写。
+        virtual void config(std::optional<int32_t> /*downloads*/,
+                            std::optional<int64_t> /*download_rate*/,
+                            std::optional<int64_t> /*upload_rate*/,
+                            std::optional<bool> /*network_allowed*/ = std::nullopt) {
+        }
 
         /// 添加单个下载任务。
         virtual dw_submit_result_t add_task(const TaskParams *params) = 0;
@@ -46,7 +56,9 @@ namespace dw {
         virtual dw_submit_result_t resume_task(const TaskParams *params) = 0;
 
         /// 调度器准入后实际恢复下载。
-        virtual dw_submit_result_t do_resume(const TaskParams *params) = 0;
+        virtual dw_submit_result_t do_resume(const TaskParams *params) {
+            return resume_task(params);
+        }
 
         /// 暂停单个下载任务。
         virtual dw_submit_result_t pause_task(const TaskParams *params) = 0;

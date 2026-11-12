@@ -58,21 +58,4 @@ std::string acquire_wrapper_name(const std::string& dir,
                                  const std::string& name,
                                  std::string* out_error = nullptr);
 
-/**
- * 物化已定名条目的占位（幂等）：dir/name 已存在则不动，不存在则按 multi_file
- * 形态创建。用于已持有定名凭证的任务（用户显式指定文件名 / 恢复任务）补齐占位，
- * 使其名称对其他任务的判重立即可见。
- */
-void ensure_placeholder(const std::string& dir,
-                        const std::string& name,
-                        bool multi_file);
-
-/**
- * 释放任务持有的占位（仅当仍为空占位）：dir/name 为空目录或零字节文件时删除并
- * 返回 true；已有真实数据、不存在、或删除失败均返回 false（不误删用户数据）。
- */
-bool release_placeholder(const std::string& dir, const std::string& name);
-
 } // namespace dw::utils
-
-

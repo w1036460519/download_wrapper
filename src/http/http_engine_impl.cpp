@@ -801,9 +801,11 @@ namespace dw {
                 if (!tCtx || !g_task_manager || tCtx->delete_req.load()) return;
                 const std::string blob = serialize_resume(tCtx);
                 if (blob.empty()) return;
-                g_task_manager->get_store().save_resume(
-                    tCtx->client_id, DW_PROTOCOL_HTTP, tCtx->url,
-                    reinterpret_cast<const uint8_t *>(blob.data()), blob.size());
+                if (!g_task_manager->get_task_resume_store().save({
+                        .task_id = tCtx->url, .resume_data = {blob.begin(), blob.end()}
+                    })) {
+                    log_e(tCtx->url.c_str(), "保存 HTTP 续传数据失败");
+                }
             }
 
             // worker 线程按门槛异步上报 resume：仅支持续传、且总已下载相比上次有推进时触发。

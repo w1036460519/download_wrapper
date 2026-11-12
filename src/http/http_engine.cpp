@@ -55,17 +55,13 @@ namespace dw {
         }
     } // anonymous namespace
 
-    HttpEngine::HttpEngine(TaskManager *task_manager) : IDownloadEngine(task_manager) {
-        he::g_task_manager = task_manager;
-    }
-
     HttpEngine::~HttpEngine() {
         if (initialized_) {
             destroy();
         }
     }
 
-    int32_t HttpEngine::init() {
+    int32_t HttpEngine::init(const std::vector<std::string> &) {
         if (!task_manager_) {
             log_e("", "HTTP init 失败: task_manager 为空");
             return -1;
@@ -77,6 +73,7 @@ namespace dw {
             return -1;
         }
 
+        he::g_task_manager = task_manager_;
         initialized_ = true;
         log_i("", "HTTP 引擎初始化完成");
         return 0;
@@ -132,22 +129,14 @@ namespace dw {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "ensure_running failed");
         }
 
-        // save_path 回退链：任务级 > 配置级 > 空（拒绝）
-        const std::string save_path = [&]() -> std::string {
-            if (!params->save_path.empty()) return params->save_path;
-            if (auto *d = global_downloader(); d && !d->config.save_path.empty()) {
-                return d->config.save_path;
-            }
-            return "";
-        }();
-
+        auto *manager = he::g_task_manager;
+        if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
+        std::scoped_lock task_lock(manager->get_mutex());
+        const std::string save_path = manager->config().save_path;
         if (!validate_add_input(url, save_path.c_str(), &err)) {
             log_e(url, "validate_add_input failed: output={} err={}", save_path, err ? err : "");
             return dw_submit_result_t::failure(DW_REASON_ERROR, err ? err : "输入校验失败");
         }
-        auto *manager = he::g_task_manager;
-        if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
-        std::scoped_lock task_lock(manager->get_mutex());
         if (const auto *task = manager->get_engine_task(url);
             replace_record && task && task->status == DW_TASK_STATUS_DELETING && !task->is_delete) {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务正在删除");
@@ -257,14 +246,9 @@ namespace dw {
             task.task_id = url;
             task.url = url;
             task.save_path = save_path;
-            task.priority = params->queue_priority.value_or(0);
             task.status = DW_TASK_STATUS_DOWNLOADING;
             task.created_at = task.modified_at = utils::now_unix_ms();
-            if (!manager->replace_engine_task(std::move(task))) {
-                std::scoped_lock lock(he::g_map_mtx);
-                he::g_tasks.erase(url);
-                return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务持久化失败");
-            }
+
         }
         start_task(tCtx);
 
@@ -308,14 +292,16 @@ namespace dw {
         }
         std::scoped_lock lock(manager->get_mutex());
         const auto *task = manager->get_engine_task(natural_key);
-        if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->save_path.empty()) {
+        if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->is_delete || task->save_path.empty()) {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务或保存路径不存在");
         }
         TaskParams p{};
         p.client_id = client_id;
         p.url = natural_key;
-        p.save_path = task->save_path;
-        p.resume_data = manager->get_store().load_resume_info(client_id, DW_PROTOCOL_HTTP, natural_key).data;
+        TaskResume resume;
+        if (manager->get_task_resume_store().find(natural_key, resume)) {
+            p.resume_data = std::move(resume.resume_data);
+        }
         return start_download(&p, false);
     }
 
@@ -335,7 +321,7 @@ namespace dw {
         if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
         std::scoped_lock lock(manager->get_mutex());
         auto *task = manager->get_engine_task(id);
-        if (!task || task->task_protocol != DW_PROTOCOL_HTTP) {
+        if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->is_delete) {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务不存在");
         }
 
@@ -371,7 +357,7 @@ namespace dw {
         if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
         std::scoped_lock lock(manager->get_mutex());
         auto *task = manager->get_engine_task(id);
-        if (!task || task->task_protocol != DW_PROTOCOL_HTTP) {
+        if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->is_delete) {
             return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务不存在");
         }
 
