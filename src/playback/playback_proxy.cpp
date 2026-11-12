@@ -3,15 +3,9 @@
  * @brief 边下边播本地 HTTP 代理：Boost.Beast 实现。
  *
  * 在 127.0.0.1 随机端口启动 HTTP 服务，接收播放器 Range 请求后：
- *   1. 经 dw_get_file_ranges 查询已下载分段（优先读 wrapper 内存缓存）；
- *   2. 经 dw_get_task_file_info 获取物理路径与总大小；
- *   3. 已下载部分直接读文件返回；未下载部分阻塞等待新数据到达后继续传输；
- *   4. 客户端断开（connection_reset / eof）时立即终止传输与等待。
- *
- * dw_get_file_ranges 返回值驱动代理行为：
- *   0 = 有数据 → 正常传输；
- *   1 = 下载中暂无 → 等待重试（数据会增长）；
- *   2 = 非下载中无数据 → 停止（数据不会增长）。
+ *   1. 从 TaskManager 获取文件路径、总大小和已下载区间；
+ *   2. 已下载部分直接读文件返回；未下载部分等待后重试；
+ *   3. 客户端断开时终止传输与等待。
  *
  * 响应模型：首次发送 206 响应头（含 Content-Range / Content-Length），
  * 后续仅写 body 数据（async_write raw bytes），避免重复发送头部。
@@ -19,11 +13,14 @@
 
 #include "download_wrapper/playback_proxy.h"
 
+#include "core/task_manager.h"
+#include "internal/downloader_internal.h"
+
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
-#include <boost/json.hpp>
 #include <boost/url.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -44,6 +41,25 @@ namespace beast = boost::beast;
 namespace http  = beast::http;
 namespace net   = boost::asio;
 using tcp = boost::asio::ip::tcp;
+
+static std::optional<TaskFile> find_playback_file(const std::string &client_id,
+                                                  const std::string &task_id,
+                                                  int32_t file_index) {
+    auto *downloader = global_downloader();
+    if (!downloader) return std::nullopt;
+
+    std::scoped_lock wrapper_lock(downloader->mutex);
+    auto *manager = downloader->task_manager.get();
+    if (!downloader->initialized.load() || !manager) return std::nullopt;
+
+    std::scoped_lock task_lock(manager->get_mutex());
+    const auto *task = manager->get_engine_task(task_id);
+    if (!task || task->is_delete || task->client_id != client_id) return std::nullopt;
+
+    const auto file = std::ranges::find(task->files, file_index, &TaskFile::file_index);
+    if (file == task->files.end() || file->is_delete || file->full_path.empty()) return std::nullopt;
+    return *file;
+}
 
 /// 单次读取并发送的最大块大小（64KB）
 static constexpr std::size_t kChunkSize = 65536;
@@ -209,31 +225,13 @@ private:
         }
 
         // ---- 获取文件路径与总大小 ----
-        boost::json::object info_params;
-        info_params["client_id"] = client_id_;
-        info_params["natural_key"] = natural_key_;
-        info_params["file_index"] = static_cast<int32_t>(file_index_);
-        char *info_resp = dw_get_task_file_info(boost::json::serialize(info_params).c_str());
-        if (!info_resp) {
+        const auto file = find_playback_file(client_id_, natural_key_, file_index_);
+        if (!file) {
             send_error(http::status::not_found, "Task or file not found");
             return;
         }
-        try {
-            auto resp_obj = boost::json::parse(info_resp).as_object();
-            if (resp_obj.at("code").as_int64() != 0) {
-                release_memory(info_resp);
-                send_error(http::status::not_found, "Task or file not found");
-                return;
-            }
-            const auto &data = resp_obj.at("data").as_object();
-            file_path_ = data.at("path").as_string().c_str();
-            total_size_ = data.at("size").as_int64();
-        } catch (const std::exception &) {
-            release_memory(info_resp);
-            send_error(http::status::internal_server_error, "Parse response failed");
-            return;
-        }
-        release_memory(info_resp);
+        file_path_ = file->full_path;
+        total_size_ = file->total_size;
 
         // ---- 开放区间补齐 ----
         if (range_end_ < 0) {
@@ -270,48 +268,24 @@ private:
     //    情况 2（start 命中，end 未命中）→ 发送已有部分 → 继续等待
     //    情况 3（start 命中，end 命中）→ 发送完整数据 → 结束
     //
-    //  dw_get_file_ranges 返回值语义：
-    //    0 = 有数据，-1 = 错误，1 = 下载中暂无（应等待），2 = 非下载中无数据（应停止）
     // ================================================================
     void do_stream(int64_t current_pos) {
         auto self = shared_from_this();
 
-        // ---- 查询已下载分段（优先缓存，按状态区分） ----
-        boost::json::object ranges_params;
-        ranges_params["client_id"] = client_id_;
-        ranges_params["natural_key"] = natural_key_;
-        ranges_params["file_index"] = static_cast<int32_t>(file_index_);
-        char *ranges_resp = dw_get_file_ranges(boost::json::serialize(ranges_params).c_str());
+        const auto file = find_playback_file(client_id_, natural_key_, file_index_);
+        if (!file || file->full_path != file_path_) {
+            if (!header_sent_) send_error(http::status::not_found, "Task or file not found");
 
-        // 解析 JSON 响应中的 ranges 数组
-        std::vector<std::pair<int64_t, int64_t>> segments;
-        if (ranges_resp) {
-            try {
-                auto resp_obj = boost::json::parse(ranges_resp).as_object();
-                if (resp_obj.at("code").as_int64() == 0) {
-                    const auto &data = resp_obj.at("data").as_object();
-                    if (data.contains("ranges")) {
-                        for (const auto &r : data.at("ranges").as_array()) {
-                            const auto &pair = r.as_array();
-                            segments.emplace_back(
-                                static_cast<int64_t>(pair[0].as_int64()),
-                                static_cast<int64_t>(pair[1].as_int64()));
-                        }
-                    }
-                }
-            } catch (const std::exception &) {
-                // 解析失败，segments 为空
-            }
-            release_memory(ranges_resp);
+            return;
         }
 
-        // 查找 current_pos 所在的已下载范围
         bool found = false;
         int64_t seg_end = 0;
-        for (const auto &[start, end] : segments) {
-            if (current_pos >= start && current_pos <= end) {
-                found  = true;
-                seg_end = end;
+        for (const auto &segment : file->segments) {
+            if (segment.status == SegmentStatus::Downloaded &&
+                current_pos >= segment.start && current_pos <= segment.end) {
+                found = true;
+                seg_end = segment.end;
                 break;
             }
         }
