@@ -313,17 +313,12 @@ DW_API char *delete_task(const char *params_json) {
 /*  BT 工具函数                                                       */
 /* ------------------------------------------------------------------ */
 
-DW_API char *parse_magnet(const char *params_json) {
-    if (!params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数为空"));
+DW_API char *parse_magnet(const char *magnet_link) {
+    if (!magnet_link || !*magnet_link) {
+        return dw::utils::dup_cstr(dw::make_error_response("magnet_link 为空"));
     }
     try {
-        auto obj = boost::json::parse(params_json).as_object();
-        std::string magnet = dw::json_get_string(obj, "magnet_link");
-        if (magnet.empty()) {
-            return dw::utils::dup_cstr(dw::make_error_response("magnet_link 为空"));
-        }
-        auto result = dw::TaskManager::parse_magnet(magnet);
+        auto result = dw::TaskManager::parse_magnet(magnet_link);
         if (result.code != DW_REASON_NONE) {
             return dw::utils::dup_cstr(dw::make_error_response(result.message));
         }
@@ -331,21 +326,16 @@ DW_API char *parse_magnet(const char *params_json) {
         data["info_hash"] = result.info_hash;
         return dw::utils::dup_cstr(dw::make_success_response(data));
     } catch (const std::exception &) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
+        return dw::utils::dup_cstr(dw::make_error_response("磁力链接解析失败"));
     }
 }
 
-DW_API char *parse_torrent_file(const char *params_json) {
-    if (!params_json) {
-        return dw::utils::dup_cstr(dw::make_error_response("参数为空"));
+DW_API char *parse_torrent_file(const char *torrent_file_path) {
+    if (!torrent_file_path || !*torrent_file_path) {
+        return dw::utils::dup_cstr(dw::make_error_response("torrent_file 为空"));
     }
     try {
-        auto obj = boost::json::parse(params_json).as_object();
-        std::string path = dw::json_get_string(obj, "torrent_file");
-        if (path.empty()) {
-            return dw::utils::dup_cstr(dw::make_error_response("torrent_file 为空"));
-        }
-        auto result = dw::TaskManager::parse_torrent_file(path);
+        const auto result = dw::TaskManager::parse_torrent_file(torrent_file_path);
         if (result.code != DW_REASON_NONE) {
             return dw::utils::dup_cstr(dw::make_error_response(result.message));
         }
@@ -361,7 +351,7 @@ DW_API char *parse_torrent_file(const char *params_json) {
         }
         return dw::utils::dup_cstr(dw::make_success_response(data));
     } catch (const std::exception &) {
-        return dw::utils::dup_cstr(dw::make_error_response("JSON 解析失败"));
+        return dw::utils::dup_cstr(dw::make_error_response("种子文件解析失败"));
     }
 }
 

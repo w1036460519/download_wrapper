@@ -315,22 +315,22 @@ DW_API char *delete_task(const char *params_json);
  *
  * 仅做解析，不创建任务、不依赖 session。
  *
- * @param params_json  JSON 字符串：{"magnet_link": "..."}
+ * @param magnet_link  UTF-8 磁力链接字符串。
  * @return             成功返回 JSON 响应（调用者 release_memory 释放）。
  *                     响应格式：{"code": 0, "data": {"info_hash": "..."}} 或 {"code": -1, "message": "..."}
  */
-DW_API char *parse_magnet(const char *params_json);
+DW_API char *parse_magnet(const char *magnet_link);
 
 /**
  * 从 .torrent 文件解析 info_hash 和文件列表。
  *
  * 仅做解析，不创建任务、不依赖 session。
  *
- * @param params_json  JSON 字符串：{"torrent_file": "..."}
+ * @param torrent_file_path  UTF-8 种子文件路径。
  * @return             成功返回 JSON 响应（调用者 release_memory 释放）。
  *                     响应格式：{"code": 0, "data": {"info_hash": "...", "files": [...]}} 或 {"code": -1, "message": "..."}
  */
-DW_API char *parse_torrent_file(const char *params_json);
+DW_API char *parse_torrent_file(const char *torrent_file_path);
 
 /* ================================================================== */
 /*                        任务快照与队列                              */
