@@ -46,13 +46,13 @@ namespace dw {
 
 
         /// 校验并深拷贝配置到内部；参数非法时返回失败原因。
-        dw_submit_result_t config(const Config &cfg);
+        dw_result<> config(const Config &cfg);
 
         /// 当前有效配置（已校验，引擎直接消费无需再判合法）。
         const Config &config() const { return config_; }
 
         /// 打开数据库、初始化引擎并启动维护线程。
-        dw_submit_result_t init();
+        dw_result<> init();
 
         /// 停止调度线程、最终刷库、关闭 DB。
         // 退出时可保留数据库供引擎保存最终快照，析构时统一关闭。
@@ -64,14 +64,14 @@ namespace dw {
         // ---- 控制操作（C ABI 转发到此） ----
 
         /// 添加任务（三要素从 params 取，无需单独传递）。
-        dw_submit_result_t add(const TaskParams &params) const;
+        dw_result<> add(const TaskParams &params) const;
 
-        dw_submit_result_t pause(const TaskParams &params) const;
+        dw_result<> pause(const TaskParams &params) const;
 
-        dw_submit_result_t resume(const TaskParams &params) const;
+        dw_result<> resume(const TaskParams &params) const;
 
         /// 向对应引擎提交删除请求。
-        dw_submit_result_t remove(const TaskParams &params) const;
+        dw_result<> remove(const TaskParams &params) const;
 
         // ---- 快照查询 ----
         /// 查询所有未删除的任务及其文件（供 App 启动恢复列表）。
@@ -88,10 +88,10 @@ namespace dw {
         // ---- BT 解析工具（转发至 TorrentEngine 静态方法） ----
 
         /// 解析磁力链接获取 info_hash。
-        static dw_submit_result_t parse_magnet(const std::string &magnet_link);
+        static dw_result<std::string> parse_magnet(const std::string &magnet_link);
 
         /// 解析 .torrent 文件获取 info_hash 和文件列表。
-        static dw_submit_result_t parse_torrent_file(const std::string &torrent_file_path);
+        static dw_result<std::vector<TaskFile>> parse_torrent_file(const std::string &torrent_file_path, std::string *info_hash = nullptr);
 
         /// 当前本机 clientId（从 config_ 读取）。
         const std::string &client_id() const { return config_.client_id; }

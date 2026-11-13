@@ -41,22 +41,22 @@ public:
     /**
      * 添加单个 HTTP 下载任务。
      */
-    dw_submit_result_t add_task(const TaskParams *params) override;
+    dw_result<> add_task(const TaskParams *params) override;
 
-    dw_submit_result_t resume_task(const TaskParams *params) override;
+    dw_result<> resume_task(const TaskParams *params) override;
 
     /// 调度准入后，读取保存路径和续传数据并启动下载。
-    dw_submit_result_t do_resume(const TaskParams *params) override;
+    dw_result<> do_resume(const TaskParams *params) override;
 
     /**
      * 暂停单个 HTTP 下载任务。
      */
-    dw_submit_result_t pause_task(const TaskParams *params) override;
+    dw_result<> pause_task(const TaskParams *params) override;
 
     /**
      * 设置取消和删除标志，待下载线程退出后由 sweep 回收上下文。
      */
-    dw_submit_result_t delete_task(const TaskParams *params) override;
+    dw_result<> delete_task(const TaskParams *params) override;
 
     /**
      * 周期性维护策略：回收线程已退出（终态 / 暂停 / 删除中）任务的上下文
@@ -66,7 +66,7 @@ public:
     void sweep() override;
 
 private:
-    dw_submit_result_t start_download(const TaskParams *params, bool replace_record);
+    dw_result<> start_download(const TaskParams *params, bool replace_record);
 };
 
 } // namespace dw

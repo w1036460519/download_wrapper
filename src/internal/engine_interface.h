@@ -50,21 +50,21 @@ namespace dw {
         }
 
         /// 添加单个下载任务。
-        virtual dw_submit_result_t add_task(const TaskParams *params) = 0;
+        virtual dw_result<> add_task(const TaskParams *params) = 0;
 
         /// 提交恢复请求，更新任务状态并等待调度。
-        virtual dw_submit_result_t resume_task(const TaskParams *params) = 0;
+        virtual dw_result<> resume_task(const TaskParams *params) = 0;
 
         /// 调度器准入后实际恢复下载。
-        virtual dw_submit_result_t do_resume(const TaskParams *params) {
+        virtual dw_result<> do_resume(const TaskParams *params) {
             return resume_task(params);
         }
 
         /// 暂停单个下载任务。
-        virtual dw_submit_result_t pause_task(const TaskParams *params) = 0;
+        virtual dw_result<> pause_task(const TaskParams *params) = 0;
 
         /// 提交单个下载任务的删除请求。
-        virtual dw_submit_result_t delete_task(const TaskParams *params) = 0;
+        virtual dw_result<> delete_task(const TaskParams *params) = 0;
 
         /// 周期性维护：回收终态任务的运行时上下文。由上层调度循环定时调用。
         virtual void sweep() = 0;
@@ -77,9 +77,9 @@ namespace dw {
         }
 
         /// 文件列表实时查询（BT 覆写）：返回全量文件清单（pad 已过滤），含选中状态。
-        virtual dw_submit_result_t get_file_list(const std::string &/*client_id*/,
+        virtual dw_result<> get_file_list(const std::string &/*client_id*/,
                                                  const std::string &/*natural_key*/) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "不支持");
+            return dw_result<>::failure(DW_REASON_ERROR, "不支持");
         }
 
     protected:

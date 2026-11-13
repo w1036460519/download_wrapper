@@ -50,28 +50,28 @@ public:
 
     /// 注册并持久化 BT 任务，创建任务句柄。
     /// @param params 下载来源、保存路径和文件选择等参数。
-    dw_submit_result_t add_task(const TaskParams *params) override;
+    dw_result<> add_task(const TaskParams *params) override;
 
     /// 更新内存任务并入队，等待调度器恢复下载。
     /// @param params 任务哈希、强制调度标记和文件优先级映射。
     /// @return 入队结果。
-    dw_submit_result_t resume_task(const TaskParams *params) override;
+    dw_result<> resume_task(const TaskParams *params) override;
 
     /// 请求暂停任务并刷新状态。
     /// @param params BT 任务哈希。
-    dw_submit_result_t pause_task(const TaskParams *params) override;
+    dw_result<> pause_task(const TaskParams *params) override;
 
     /// 请求从 session 移除任务并软删除数据库记录。
     /// @param params 任务哈希及是否删除本地文件。
-    dw_submit_result_t delete_task(const TaskParams *params) override;
+    dw_result<> delete_task(const TaskParams *params) override;
 
     /// 提取磁力链接中的十六进制哈希，优先返回 v2。
     /// @param magnet_link 待解析的磁力链接。
-    static dw_submit_result_t parse_magnet(const std::string &magnet_link);
+    static dw_result<std::string> parse_magnet(const std::string &magnet_link);
 
     /// 解析种子哈希和文件列表，跳过填充文件。
     /// @param torrent_file_path .torrent 文件路径。
-    static dw_submit_result_t parse_torrent_file(const std::string &torrent_file_path);
+    static dw_result<std::vector<TaskFile>> parse_torrent_file(const std::string &torrent_file_path, std::string *info_hash = nullptr);
 
     /// 移除已标记删除或做种分享率达标的任务句柄。
     void sweep() override;

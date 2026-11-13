@@ -48,10 +48,10 @@ namespace dw {
     /*                          生命周期                                  */
     /* ================================================================== */
 
-    dw_submit_result_t TaskManager::config(const Config &cfg) {
+    dw_result<> TaskManager::config(const Config &cfg) {
         if (cfg.client_id.empty()) {
             log_e("", "manager 客户端标识为空");
-            return dw_submit_result_t::failure();
+            return dw_result<>::failure();
         }
         std::scoped_lock lock(mtx_);
         const auto previous_downloads = config_.max_concurrent_downloads;
@@ -72,27 +72,27 @@ namespace dw {
                              changed(previous_net_allowed, net_allowed_));
         }
         log_i("", "manager 应用配置[{}]", to_json_string(config_));
-        return dw_submit_result_t::success();
+        return dw_result<>::success();
     }
 
-    dw_submit_result_t TaskManager::init() {
+    dw_result<> TaskManager::init() {
         const std::string dir = !config_.work_dir.empty() ? config_.work_dir : ".";
         const std::string story_path = dir + "/leopard_tasks.db";
 
         std::unique_lock lock(mtx_);
         if (running_.load()) {
             log_i("", "manager 已初始化");
-            return dw_submit_result_t::success();
+            return dw_result<>::success();
         }
         if (!database_.open(story_path)) {
             log_e("", "manager 数据存储初始化失败[{}]", story_path);
-            return dw_submit_result_t::failure();
+            return dw_result<>::failure();
         }
         if (!task_store_.init_schema() || !task_file_store_.init_schema() ||
             !task_resume_store_.init_schema()) {
             log_e("", "manager 数据任务初始化失败");
             database_.close();
-            return dw_submit_result_t::failure();
+            return dw_result<>::failure();
         }
         const std::vector<Task> all_tasks = task_store_.find_all();
         std::vector<std::string> torrent_task_ids;
@@ -108,7 +108,7 @@ namespace dw {
                 log_e("", "manager HTTP 引擎初始化失败");
                 lock.unlock();
                 stop();
-                return dw_submit_result_t::failure();
+                return dw_result<>::failure();
             }
 
             torrent_->set_task_manager(this);
@@ -116,7 +116,7 @@ namespace dw {
                 log_e("", "manager BT 引擎初始化失败");
                 lock.unlock();
                 stop();
-                return dw_submit_result_t::failure();
+                return dw_result<>::failure();
             }
 
             running_.store(true);
@@ -125,11 +125,11 @@ namespace dw {
             log_e("", "manager 下载器初始化失败: {}", e.what());
             lock.unlock();
             stop();
-            return dw_submit_result_t::failure();
+            return dw_result<>::failure();
         }
 
         log_i(config_.client_id.c_str(), "manager 下载器启动成功");
-        return dw_submit_result_t::success();
+        return dw_result<>::success();
     }
 
     void TaskManager::stop() {
@@ -150,54 +150,54 @@ namespace dw {
     /*                          控制操作                                  */
     /* ================================================================== */
 
-    dw_submit_result_t TaskManager::add(const TaskParams &params) const {
+    dw_result<> TaskManager::add(const TaskParams &params) const {
         log_i("", "manager 添加任务[{}]", to_json_string(params));
         const dw_protocol_t protocol = params.protocol;
         if (protocol == DW_PROTOCOL_HTTP && params.url.empty()) {
             log_e("", "manager 添加任务失败 链接不能为空");
-            return dw_submit_result_t::failure();
+            return dw_result<>::failure();
         }
         if (protocol == DW_PROTOCOL_TORRENT && params.magnet_link.empty() && params.torrent_file.empty()) {
             log_e("", "manager 添加任务失败 链接/文件不能为空");
-            return dw_submit_result_t::failure();
+            return dw_result<>::failure();
         }
         if (params.client_id.empty() || params.client_id == config_.client_id) {
             IDownloadEngine *eng = engine_of(protocol);
-            return eng ? eng->add_task(&params) : dw_submit_result_t::failure();
+            return eng ? eng->add_task(&params) : dw_result<>::failure();
         }
         log_e("", "manager 添加任务 暂不支持");
-        return dw_submit_result_t::failure();
+        return dw_result<>::failure();
     }
 
-    dw_submit_result_t TaskManager::pause(const TaskParams &params) const {
+    dw_result<> TaskManager::pause(const TaskParams &params) const {
         log_i(params.task_key().c_str(), "manager 暂停任务[{}]", to_json_string(params));
         if (params.client_id.empty() || params.client_id == config_.client_id) {
             IDownloadEngine *eng = engine_of(params.protocol);
-            return eng ? eng->pause_task(&params) : dw_submit_result_t::failure();
+            return eng ? eng->pause_task(&params) : dw_result<>::failure();
         }
         log_e(params.task_key().c_str(), "manager 暂停任务 暂不支持");
-        return dw_submit_result_t::failure();
+        return dw_result<>::failure();
     }
 
 
-    dw_submit_result_t TaskManager::resume(const TaskParams &params) const {
+    dw_result<> TaskManager::resume(const TaskParams &params) const {
         log_i(params.task_key().c_str(), "manager 恢复任务[{}]", to_json_string(params));
         if (params.client_id.empty() || params.client_id == config_.client_id) {
             IDownloadEngine *engine = engine_of(params.protocol);
-            return engine ? engine->resume_task(&params) : dw_submit_result_t::failure();
+            return engine ? engine->resume_task(&params) : dw_result<>::failure();
         }
         log_e(params.task_key().c_str(), "manager 恢复任务 暂不支持");
-        return dw_submit_result_t::failure();
+        return dw_result<>::failure();
     }
 
-    dw_submit_result_t TaskManager::remove(const TaskParams &params) const {
+    dw_result<> TaskManager::remove(const TaskParams &params) const {
         log_i(params.task_key().c_str(), "manager 删除任务[{}]", to_json_string(params));
         if (params.client_id.empty() || params.client_id == config_.client_id) {
             IDownloadEngine *engine = engine_of(params.protocol);
-            return engine ? engine->delete_task(&params) : dw_submit_result_t::failure();
+            return engine ? engine->delete_task(&params) : dw_result<>::failure();
         }
         log_e(params.task_key().c_str(), "manager 删除任务 暂不支持");
-        return dw_submit_result_t::failure();
+        return dw_result<>::failure();
     }
 
     Task *TaskManager::get_engine_task(const std::string &key) {
@@ -342,12 +342,12 @@ namespace dw {
     // ---- 本地文件浏览与管理 ----
 
 
-    dw_submit_result_t TaskManager::parse_magnet(const std::string &magnet_link) {
+    dw_result<std::string> TaskManager::parse_magnet(const std::string &magnet_link) {
         return TorrentEngine::parse_magnet(magnet_link);
     }
 
-    dw_submit_result_t TaskManager::parse_torrent_file(const std::string &torrent_file_path) {
-        return TorrentEngine::parse_torrent_file(torrent_file_path);
+    dw_result<std::vector<TaskFile>> TaskManager::parse_torrent_file(const std::string &torrent_file_path, std::string *info_hash) {
+        return TorrentEngine::parse_torrent_file(torrent_file_path, info_hash);
     }
 
     IDownloadEngine *TaskManager::engine_of(const dw_protocol_t proto) const {

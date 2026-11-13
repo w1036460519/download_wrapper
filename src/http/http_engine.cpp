@@ -112,34 +112,34 @@ namespace dw {
         log_i("", "HTTP 引擎已销毁");
     }
 
-    dw_submit_result_t HttpEngine::add_task(const TaskParams *params) {
+    dw_result<> HttpEngine::add_task(const TaskParams *params) {
         return start_download(params, true);
     }
 
-    dw_submit_result_t HttpEngine::start_download(const TaskParams *params, bool replace_record) {
+    dw_result<> HttpEngine::start_download(const TaskParams *params, bool replace_record) {
         if (!params) {
             log_e("", "HTTP add_task 失败: 入参为空");
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "入参为空");
+            return dw_result<>::failure(DW_REASON_ERROR, "入参为空");
         }
         const char *url = params->url.c_str();
         log_i(url, "HTTP 添加任务: url={}", url);
         const char *err = nullptr;
 
         if (!ensure_running()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "ensure_running failed");
+            return dw_result<>::failure(DW_REASON_ERROR, "ensure_running failed");
         }
 
         auto *manager = he::g_task_manager;
-        if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
+        if (!manager) return dw_result<>::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
         std::scoped_lock task_lock(manager->get_mutex());
         const std::string save_path = manager->config().save_path;
         if (!validate_add_input(url, save_path.c_str(), &err)) {
             log_e(url, "validate_add_input failed: output={} err={}", save_path, err ? err : "");
-            return dw_submit_result_t::failure(DW_REASON_ERROR, err ? err : "输入校验失败");
+            return dw_result<>::failure(DW_REASON_ERROR, err ? err : "输入校验失败");
         }
         if (const auto *task = manager->get_engine_task(url);
             replace_record && task && task->status == DW_TASK_STATUS_DELETING && !task->is_delete) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务正在删除");
+            return dw_result<>::failure(DW_REASON_ERROR, "HTTP 任务正在删除");
         }
 
         /* URL 判重：线程仍在运行且非删除中视为继续（幂等返回）；删除中 / 线程已结束
@@ -152,7 +152,7 @@ namespace dw {
                 if (const auto it = he::g_tasks.find(url); it != he::g_tasks.end()) {
                     if (it->second->thread_done.load() != 1 && it->second->delete_req.load() != 1) {
                         log_i(url, "HTTP add_task 任务运行中（幂等继续）");
-                        return dw_submit_result_t::success();
+                        return dw_result<>::success();
                     }
                     stale = std::move(it->second);
                     he::g_tasks.erase(it);
@@ -171,14 +171,14 @@ namespace dw {
         if (auto dir_path = std::filesystem::path(save_path);
             !dir_path.empty() && !mkdir_recursive(dir_path.string())) {
             log_e(url, "mkdir_recursive failed: dir={}", dir_path.string());
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "目录创建失败");
+            return dw_result<>::failure(DW_REASON_ERROR, "目录创建失败");
         }
 
         const bool has_resume = !params->resume_data.empty();
 
         auto tCtx_guard = task_create_new(url, save_path.c_str());
         if (!tCtx_guard) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "task_create_new failed");
+            return dw_result<>::failure(DW_REASON_ERROR, "task_create_new failed");
         }
         dl_task_ctx *tCtx = tCtx_guard.get();
 
@@ -236,7 +236,7 @@ namespace dw {
             inserted = snd;
         } catch (...) { inserted = false; }
         if (!inserted) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "g_tasks.emplace failed");
+            return dw_result<>::failure(DW_REASON_ERROR, "g_tasks.emplace failed");
         }
 
         if (replace_record) {
@@ -253,47 +253,47 @@ namespace dw {
         start_task(tCtx);
 
         log_i(tCtx->url.c_str(), "HTTP add_task 成功: output={} probing={}", tCtx->output_path, tCtx->probing);
-        return dw_submit_result_t::success();
+        return dw_result<>::success();
     }
 
-    dw_submit_result_t HttpEngine::resume_task(const TaskParams *params) {
-        if (!params) return dw_submit_result_t::failure(DW_REASON_INVALID_INPUT, "入参为空");
+    dw_result<> HttpEngine::resume_task(const TaskParams *params) {
+        if (!params) return dw_result<>::failure(DW_REASON_INVALID_INPUT, "入参为空");
         const auto &natural_key = params->task_key();
         auto *manager = he::g_task_manager;
         if (!manager || natural_key.empty()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 恢复参数无效或引擎未启动");
+            return dw_result<>::failure(DW_REASON_ERROR, "HTTP 恢复参数无效或引擎未启动");
         }
         std::scoped_lock lock(manager->get_mutex());
         auto *task = manager->get_engine_task(natural_key);
         if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->is_delete) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务不存在或不可恢复");
+            return dw_result<>::failure(DW_REASON_ERROR, "HTTP 任务不存在或不可恢复");
         }
         task->force = params->force;
         task->status = DW_TASK_STATUS_QUEUED;
         task->modified_at = utils::now_unix_ms();
         task->dirty = true;
-        return dw_submit_result_t::success();
+        return dw_result<>::success();
     }
 
-    dw_submit_result_t HttpEngine::do_resume(const TaskParams *params) {
-        if (!params) return dw_submit_result_t::failure(DW_REASON_INVALID_INPUT, "入参为空");
+    dw_result<> HttpEngine::do_resume(const TaskParams *params) {
+        if (!params) return dw_result<>::failure(DW_REASON_INVALID_INPUT, "入参为空");
         const auto &natural_key = params->task_key();
         const auto &client_id = params->client_id;
         auto *manager = he::g_task_manager;
         if (!manager || natural_key.empty() || client_id.empty()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 恢复参数无效或引擎未启动");
+            return dw_result<>::failure(DW_REASON_ERROR, "HTTP 恢复参数无效或引擎未启动");
         }
         {
             std::scoped_lock lock(he::g_map_mtx);
             const auto it = he::g_tasks.find(natural_key);
             if (it != he::g_tasks.end() && it->second->pause_req.load() && !it->second->thread_done.load()) {
-                return dw_submit_result_t::failure(DW_REASON_FAIL, "HTTP 任务正在暂停");
+                return dw_result<>::failure(DW_REASON_FAIL, "HTTP 任务正在暂停");
             }
         }
         std::scoped_lock lock(manager->get_mutex());
         const auto *task = manager->get_engine_task(natural_key);
         if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->is_delete || task->save_path.empty()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务或保存路径不存在");
+            return dw_result<>::failure(DW_REASON_ERROR, "HTTP 任务或保存路径不存在");
         }
         TaskParams p{};
         p.client_id = client_id;
@@ -305,24 +305,24 @@ namespace dw {
         return start_download(&p, false);
     }
 
-    dw_submit_result_t HttpEngine::pause_task(const TaskParams *params) {
-        if (!params) return dw_submit_result_t::failure(DW_REASON_INVALID_INPUT, "入参为空");
+    dw_result<> HttpEngine::pause_task(const TaskParams *params) {
+        if (!params) return dw_result<>::failure(DW_REASON_INVALID_INPUT, "入参为空");
         const auto &id = params->task_key();
         if (id.empty()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "入参为空");
+            return dw_result<>::failure(DW_REASON_ERROR, "入参为空");
         }
         log_d(id.c_str(), "HTTP pause_task 进入");
 
         if (!ensure_running()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "ensure_running failed");
+            return dw_result<>::failure(DW_REASON_ERROR, "ensure_running failed");
         }
 
         auto *manager = he::g_task_manager;
-        if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
+        if (!manager) return dw_result<>::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
         std::scoped_lock lock(manager->get_mutex());
         auto *task = manager->get_engine_task(id);
         if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->is_delete) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务不存在");
+            return dw_result<>::failure(DW_REASON_ERROR, "HTTP 任务不存在");
         }
 
         try {
@@ -333,32 +333,32 @@ namespace dw {
                     log_i(id.c_str(), "HTTP pause_task 成功（非销毁，待 sweep 回收 ctx）");
                 }
             }
-            return dw_submit_result_t::success();
+            return dw_result<>::success();
         } catch (const std::exception &e) {
             log_e("", "HTTP pause_task exception: {}", e.what());
-            return dw_submit_result_t::failure(DW_REASON_ERROR, e.what());
+            return dw_result<>::failure(DW_REASON_ERROR, e.what());
         }
     }
 
-    dw_submit_result_t HttpEngine::delete_task(const TaskParams *params) {
-        if (!params) return dw_submit_result_t::failure(DW_REASON_INVALID_INPUT, "入参为空");
+    dw_result<> HttpEngine::delete_task(const TaskParams *params) {
+        if (!params) return dw_result<>::failure(DW_REASON_INVALID_INPUT, "入参为空");
         const auto &id = params->task_key();
         if (id.empty()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "入参为空");
+            return dw_result<>::failure(DW_REASON_ERROR, "入参为空");
         }
         log_d(id.c_str(), "HTTP delete_task");
 
         if (!ensure_running()) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "ensure_running failed");
+            return dw_result<>::failure(DW_REASON_ERROR, "ensure_running failed");
         }
 
         // 置取消和删除标志，待线程退出后由 sweep 回收上下文。
         auto *manager = he::g_task_manager;
-        if (!manager) return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
+        if (!manager) return dw_result<>::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
         std::scoped_lock lock(manager->get_mutex());
         auto *task = manager->get_engine_task(id);
         if (!task || task->task_protocol != DW_PROTOCOL_HTTP || task->is_delete) {
-            return dw_submit_result_t::failure(DW_REASON_ERROR, "HTTP 任务不存在");
+            return dw_result<>::failure(DW_REASON_ERROR, "HTTP 任务不存在");
         }
 
         try {
@@ -375,13 +375,13 @@ namespace dw {
             task->dirty = true;
             if (hit) {
                 log_i(id.c_str(), "HTTP delete_task 已标记，等待回收上下文");
-                return dw_submit_result_t::success();
+                return dw_result<>::success();
             }
             log_i(id.c_str(), "HTTP delete_task 任务不在引擎");
-            return dw_submit_result_t::success();
+            return dw_result<>::success();
         } catch (const std::exception &e) {
             log_e("", "HTTP delete_task exception: {}", e.what());
-            return dw_submit_result_t::failure(DW_REASON_ERROR, e.what());
+            return dw_result<>::failure(DW_REASON_ERROR, e.what());
         }
     }
 

@@ -96,42 +96,42 @@ DW_API char *create(void) {
         log_i("", "wrapper 下载器构建开始...");
         std::call_once(dw::g_init_flag, dw::do_init_singleton);
         std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
-        if (dw::g_downloader->destroying) return dw::result_to_json(dw::dw_submit_result_t::failure());
+        if (dw::g_downloader->destroying) return dw::result_to_json(dw::dw_result<>::failure());
         if (!dw::g_downloader->task_manager) {
             dw::g_downloader->task_manager = std::make_unique<dw::TaskManager>();
         }
         log_i("", "wrapper 下载器构建完成");
-        return dw::result_to_json(dw::dw_submit_result_t::success());
+        return dw::result_to_json(dw::dw_result<>::success());
     } catch (const std::exception &e) {
         log_e("", "wrapper 创建下载器失败: {}", e.what());
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     } catch (...) {
         log_e("", "wrapper 创建下载器失败: 未知异常");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
 }
 
 DW_API char *init(const char *config_json) {
     log_i("", "wrapper 下载器初始化开始 config={}", config_json ? config_json : "(null)");
     if (!dw::g_downloader || !config_json || !config_json[0]) {
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     std::lock_guard<std::mutex> lock(dw::g_downloader->mutex);
     dw::Config config;
     if (dw::parse_config(config_json, config) != 0) {
         log_e("", "wrapper 配置无效");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
 
     if (dw::g_downloader->initialized.load()) {
         log_i("", "wrapper 下载器已初始化完成");
-        return dw::result_to_json(dw::dw_submit_result_t::success());
+        return dw::result_to_json(dw::dw_result<>::success());
     }
 
     auto *tm = dw::g_downloader->task_manager.get();
     if (!tm) {
         log_e("", "wrapper 管理器无效");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     if (auto cfg_result = tm->config(config); cfg_result.code != DW_REASON_NONE) {
         log_e("", "wrapper 管理器配置失败");
@@ -146,7 +146,7 @@ DW_API char *init(const char *config_json) {
     }
 
     dw::g_downloader->initialized.store(true);
-    return dw::result_to_json(dw::dw_submit_result_t::success());
+    return dw::result_to_json(dw::dw_result<>::success());
 }
 
 DW_API void destroy(void) {
@@ -180,18 +180,18 @@ DW_API char *set_config(const char *config_json) {
     std::lock_guard<std::mutex> lock(dw::global_downloader()->mutex);
     if (!dw::global_downloader()->initialized.load()) {
         log_e("", "wrapper 下载器未初始化");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
 
     dw::Config cfg;
     if (dw::parse_config(config_json, cfg) != 0) {
         log_e("", "wrapper 配置失败 参数无效");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     auto *tm = dw::global_downloader()->task_manager.get();
     auto result = tm->config(cfg);
     if (result.code != DW_REASON_NONE) {
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     dw::g_log_level.store(cfg.log_level);
     log_i("", "wrapper 配置完成");
@@ -204,24 +204,24 @@ DW_API char *set_config(const char *config_json) {
 
 DW_API char *set_progress_callback(const dw_progress_cb cb) {
     auto *downloader = dw::global_downloader();
-    if (!downloader) return dw::result_to_json(dw::dw_submit_result_t::failure());
+    if (!downloader) return dw::result_to_json(dw::dw_result<>::failure());
     std::lock_guard<std::mutex> lock(downloader->mutex);
     if (!downloader->task_manager || downloader->destroying) {
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     downloader->progress_cb.store(cb);
-    return dw::result_to_json(dw::dw_submit_result_t::success());
+    return dw::result_to_json(dw::dw_result<>::success());
 }
 
 DW_API char *set_log_callback(const dw_log_cb cb) {
     auto *downloader = dw::global_downloader();
-    if (!downloader) return dw::result_to_json(dw::dw_submit_result_t::failure());
+    if (!downloader) return dw::result_to_json(dw::dw_result<>::failure());
     std::lock_guard<std::mutex> lock(downloader->mutex);
     if (!downloader->task_manager || downloader->destroying) {
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     downloader->log_cb.store(cb);
-    return dw::result_to_json(dw::dw_submit_result_t::success());
+    return dw::result_to_json(dw::dw_result<>::success());
 }
 
 /* ------------------------------------------------------------------ */
@@ -232,7 +232,7 @@ DW_API char *add_task(const char *params_json) {
     log_i("", "wrapper 添加任务 params={}", params_json ? params_json : "null");
     if (!dw::global_downloader()->initialized.load()) {
         log_e("", "wrapper 下载器未初始化");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     // 通用参数校验与解析
     dw::TaskParams params;
@@ -256,7 +256,7 @@ DW_API char *pause_task(const char *params_json) {
     log_i("", "wrapper 暂停任务 params={}", params_json ? params_json : "null");
     if (!dw::global_downloader()->initialized.load()) {
         log_e("", "wrapper 下载器未初始化");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     dw::TaskParams params;
     if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
@@ -275,7 +275,7 @@ DW_API char *resume_task(const char *params_json) {
     log_i("", "wrapper 恢复任务 params={}", params_json ? params_json : "null");
     if (!dw::global_downloader()->initialized.load()) {
         log_e("", "wrapper 下载器未初始化");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
     dw::TaskParams params;
     if (char *err = dw::validate_and_parse_task_params(params_json, params)) {
@@ -294,7 +294,7 @@ DW_API char *delete_task(const char *params_json) {
     log_i("", "wrapper 删除任务 params={}", params_json ? params_json : "null");
     if (!dw::global_downloader()->initialized.load()) {
         log_e("", "wrapper 下载器未初始化");
-        return dw::result_to_json(dw::dw_submit_result_t::failure());
+        return dw::result_to_json(dw::dw_result<>::failure());
     }
 
     dw::TaskParams params;
@@ -322,9 +322,7 @@ DW_API char *parse_magnet(const char *magnet_link) {
         if (result.code != DW_REASON_NONE) {
             return dw::utils::dup_cstr(dw::make_error_response(result.message));
         }
-        boost::json::object data;
-        data["info_hash"] = result.info_hash;
-        return dw::utils::dup_cstr(dw::make_success_response(data));
+        return dw::utils::dup_cstr(dw::make_success_response("info_hash", result.data));
     } catch (const std::exception &) {
         return dw::utils::dup_cstr(dw::make_error_response("磁力链接解析失败"));
     }
@@ -335,19 +333,20 @@ DW_API char *parse_torrent_file(const char *torrent_file_path) {
         return dw::utils::dup_cstr(dw::make_error_response("torrent_file 为空"));
     }
     try {
-        const auto result = dw::TaskManager::parse_torrent_file(torrent_file_path);
+        std::string info_hash;
+        const auto result = dw::TaskManager::parse_torrent_file(torrent_file_path, &info_hash);
         if (result.code != DW_REASON_NONE) {
             return dw::utils::dup_cstr(dw::make_error_response(result.message));
         }
         boost::json::object data;
-        data["info_hash"] = result.info_hash;
-        // 文件列表
-        if (!result.files.empty()) {
-            boost::json::array files_arr;
-            for (const auto &fi: result.files) {
-                files_arr.push_back(dw::to_json(fi));
+        data["info_hash"] = std::move(info_hash);
+        if (!result.data.empty()) {
+            boost::json::array files;
+            files.reserve(result.data.size());
+            for (const auto &file : result.data) {
+                files.push_back(dw::to_json(file));
             }
-            data["files"] = std::move(files_arr);
+            data["files"] = std::move(files);
         }
         return dw::utils::dup_cstr(dw::make_success_response(data));
     } catch (const std::exception &) {
