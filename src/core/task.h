@@ -95,6 +95,17 @@ namespace dw {
         return obj;
     }
 
+    inline boost::json::object to_summary_json(const Task &task) {
+        return {
+            {"task_id", task.task_id}, {"client_id", task.client_id},
+            {"task_protocol", static_cast<int>(task.task_protocol)},
+            {"name", task.name}, {"save_path", task.save_path}, {"full_path", task.full_path},
+            {"status", task.status}, {"total_size", task.total_size}, {"total_done", task.total_done},
+            {"download_rate", task.download_rate}, {"upload_rate", task.upload_rate},
+            {"created_at", task.created_at}, {"modified_at", task.modified_at}, {"is_delete", task.is_delete}
+        };
+    }
+
     inline void tag_invoke(boost::json::value_from_tag, boost::json::value &value, const Task &task) {
         value = to_json(task);
     }

@@ -348,6 +348,9 @@ DW_API char *parse_torrent_file(const char *torrent_file_path);
  */
 DW_API char *list_tasks(const char *params_json);
 
+/// 查询任务详情，参数为 {"task_id":"..."}，响应需用 release_memory 释放。
+DW_API char *get_task(const char *params_json);
+
 /* ================================================================== */
 /*                        任务文件查询                                */
 /* ================================================================== */

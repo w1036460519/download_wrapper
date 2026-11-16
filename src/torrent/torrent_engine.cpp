@@ -67,7 +67,6 @@ namespace dw {
         std::thread g_status_thread;
         // 线程运行标志：destroy() 置 false，各循环在下一次检查时退出。
         std::atomic<bool> g_running{false};
-        // 默认 tracker 列表：init 从 cfg->trackers 拷贝，添加/恢复任务时统一注入。
         // 任务管理器
         class TaskManager *g_task_manager = nullptr;
 
@@ -87,6 +86,22 @@ namespace dw {
                 return info_hash_hex(h.info_hashes());
             } catch (...) {
                 return {};
+            }
+        }
+
+        void apply_trackers(const lt::torrent_handle &handle, const std::vector<std::string> &configured) {
+            auto trackers = handle.trackers();
+            const auto removed = std::erase_if(trackers, [&configured](const lt::announce_entry &tracker) {
+                return tracker.source == lt::announce_entry::source_client &&
+                       std::ranges::find(configured, tracker.url) == configured.end();
+            });
+            if (removed != 0) handle.replace_trackers(trackers);
+
+            for (const auto &url: configured) {
+                if (std::ranges::find(trackers, url, &lt::announce_entry::url) != trackers.end()) continue;
+                lt::announce_entry tracker(url);
+                tracker.source = lt::announce_entry::source_client;
+                handle.add_tracker(tracker);
             }
         }
 
@@ -133,6 +148,7 @@ namespace dw {
                 atp.flags &= ~lt::torrent_flags::auto_managed;
                 try {
                     if (auto handle = g_session->add_torrent(std::move(atp)); handle.is_valid()) {
+                        apply_trackers(handle, g_task_manager->config().trackers);
                         return handle;
                     }
                     log_e(trace_id.c_str(), "构建处理器失败 无法构建任务");
@@ -560,7 +576,20 @@ namespace dw {
                 const std::string info_hash = info_hash_hex(rd->handle);
                 if (rd->handle.is_valid() && rd->handle.status().has_metadata) {
                     try {
-                        if (const std::vector<char> buf = lt::write_resume_data_buf(rd->params); !buf.empty()) {
+                        // 自定义 Tracker 由应用配置恢复，避免续传数据保留失效的设置。
+                        const auto trackers = rd->handle.trackers();
+                        auto params = rd->params;
+                        for (std::size_t i = params.trackers.size(); i > 0; --i) {
+                            const auto tracker = std::ranges::find(trackers, params.trackers[i - 1],
+                                                                   &lt::announce_entry::url);
+                            if (tracker == trackers.end() || tracker->source == lt::announce_entry::source_client) {
+                                params.trackers.erase(params.trackers.begin() + (i - 1));
+                                if (i <= params.tracker_tiers.size()) {
+                                    params.tracker_tiers.erase(params.tracker_tiers.begin() + (i - 1));
+                                }
+                            }
+                        }
+                        if (const std::vector<char> buf = lt::write_resume_data_buf(params); !buf.empty()) {
                             if (Task *task = TorrentEngine::get_task(info_hash); task && !task->is_delete) {
                                 task->resume_data = {buf.begin(), buf.end()};
                                 task->resume_dirty = true;
@@ -783,6 +812,18 @@ namespace dw {
         }
     }
 
+    void TorrentEngine::update_trackers(const std::vector<std::string> &trackers) {
+        std::scoped_lock lock(tasks_mutex());
+        if (!g_session) return;
+        for (const auto &handle: g_session->get_torrents()) {
+            try {
+                apply_trackers(handle, trackers);
+            } catch (const std::exception &e) {
+                log_e(info_hash_hex(handle).c_str(), "bt 更新 Tracker 失败: {}", e.what());
+            }
+        }
+    }
+
     void TorrentEngine::destroy() {
         if (!initialized_) {
             return;
@@ -926,14 +967,6 @@ namespace dw {
                 registered_task->dirty = true;
                 return dw_result<>::failure();
             }
-            // 设置tracker
-            if (!g_task_manager->config().trackers.empty()) {
-                for (const auto &url: g_task_manager->config().trackers) {
-                    lt::announce_entry tracker(url);
-                    tracker.source = lt::announce_entry::source_client;
-                    handle.add_tracker(tracker);
-                }
-            }
 
             // 设置优先级
             if (!params->file_indexes.empty()
@@ -984,14 +1017,6 @@ namespace dw {
                 return dw_result<>::failure();
             }
 
-            // 设置tracker
-            if (!g_task_manager->config().trackers.empty()) {
-                for (const auto &url: g_task_manager->config().trackers) {
-                    lt::announce_entry tracker(url);
-                    tracker.source = lt::announce_entry::source_client;
-                    handle.add_tracker(tracker);
-                }
-            }
             // 设置优先级
             if (!params->file_indexes.empty()
                 && (params->file_priority == 0 || params->file_priority == 4 || params->file_priority == 7)) {

@@ -58,6 +58,7 @@ namespace dw {
         const auto previous_download_rate = config_.download_rate_limit;
         const auto previous_upload_rate = config_.upload_rate_limit;
         const bool previous_net_allowed = net_allowed_;
+        const bool trackers_changed = config_.trackers != cfg.trackers;
         config_ = cfg;
         if (config_.max_concurrent_downloads < 0) config_.max_concurrent_downloads = 3;
         net_allowed_ = config_.network_type != 0 &&
@@ -70,6 +71,7 @@ namespace dw {
                              changed(previous_download_rate, config_.download_rate_limit),
                              changed(previous_upload_rate, config_.upload_rate_limit),
                              changed(previous_net_allowed, net_allowed_));
+            if (trackers_changed) torrent_->update_trackers(config_.trackers);
         }
         log_i("", "manager 应用配置[{}]", to_json_string(config_));
         return dw_result<>::success();
@@ -217,13 +219,20 @@ namespace dw {
     /*                          快照查询                                  */
     /* ================================================================== */
 
+    bool TaskManager::get_task(const std::string &task_id, Task &out) {
+        std::scoped_lock lock(mtx_);
+        if (const auto it = tasks_.find(task_id); it != tasks_.end()) {
+            out = it->second;
+            return true;
+        }
+        if (!task_store_.find_by_task_id(task_id, out)) return false;
+        out.files = task_file_store_.get(task_id);
+        return true;
+    }
+
     std::vector<Task> TaskManager::list() {
         std::scoped_lock lock(mtx_);
-        auto tasks = task_store_.find_all();
-        for (auto &task: tasks) {
-            task.files = task_file_store_.get(task.task_id);
-        }
-        return tasks;
+        return task_store_.find_all();
     }
 
     /* ================================================================== */
@@ -241,12 +250,18 @@ namespace dw {
 
     void TaskManager::maintenance_loop() {
         while (running_.load()) {
-            std::vector<Task> dirty_records;
+            std::vector<std::string> dirty_records;
             {
                 std::scoped_lock lock(mtx_);
                 for (auto it = tasks_.begin(); it != tasks_.end();) {
                     const auto current = it++;
                     auto &task = current->second;
+                    if (!task.is_delete && std::ranges::any_of(task.files, &TaskFile::dirty)) {
+                        task.dirty = true;
+                    }
+                    if (task.dirty) {
+                        task.modified_at = std::max(now_unix_ms(), task.modified_at + 1);
+                    }
                     if (task.is_delete) {
                         if (task.dirty) {
                             if (!task_store_.save(task) || !task_file_store_.delete_task(task.task_id)) {
@@ -254,7 +269,7 @@ namespace dw {
                                 continue;
                             }
                             task.dirty = false;
-                            dirty_records.push_back(std::move(task));
+                            dirty_records.push_back(boost::json::serialize(to_summary_json(task)));
                         }
                         tasks_.erase(current);
                         continue;
@@ -274,7 +289,7 @@ namespace dw {
                         } else {
                             log_e(task.task_id.c_str(), "manager 任务[{}]保存失败", task.name);
                         }
-                        dirty_records.push_back(task);
+                        dirty_records.push_back(boost::json::serialize(to_summary_json(task)));
                     }
 
                     if (task.resume_dirty) {
@@ -289,8 +304,8 @@ namespace dw {
                 }
             }
 
-            for (const auto &task: dirty_records) {
-                emit_progress(to_string(task).c_str());
+            for (const auto &record: dirty_records) {
+                emit_progress(record.c_str());
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(maintenance_interval_ms_));

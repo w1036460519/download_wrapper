@@ -29,6 +29,8 @@
 #include <vector>
 
 namespace dw {
+    class TorrentEngine;
+
     class IDownloadEngine;
 
     /**
@@ -75,6 +77,7 @@ namespace dw {
 
         // ---- 快照查询 ----
         /// 查询所有未删除的任务及其文件（供 App 启动恢复列表）。
+        bool get_task(const std::string &task_id, Task &out);
         std::vector<Task> list();
 
         /// 获取当前配置（供运行期更新）。
@@ -143,6 +146,6 @@ namespace dw {
         static constexpr int32_t maintenance_interval_ms_ = 1000; // 持久化线程节拍（内部固定）
 
         std::unique_ptr<IDownloadEngine> http_;
-        std::unique_ptr<IDownloadEngine> torrent_;
+        std::unique_ptr<TorrentEngine> torrent_;
     };
 } // namespace dw

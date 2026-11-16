@@ -358,6 +358,40 @@ DW_API char *parse_torrent_file(const char *torrent_file_path) {
 /*  任务快照与队列                                              */
 /* ------------------------------------------------------------------ */
 
+DW_API char *get_task(const char *params_json) {
+    auto *d = dw::global_downloader();
+    if (!d || !params_json) {
+        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
+    }
+
+    std::string task_id;
+    try {
+        task_id = dw::json_get_string(boost::json::parse(params_json).as_object(), "task_id");
+    } catch (const std::exception &) {
+        return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
+    }
+    if (task_id.empty()) {
+        return dw::utils::dup_cstr(dw::make_error_response("任务标识不能为空"));
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(d->mutex);
+        if (!d->initialized.load() || !d->task_manager) {
+            return dw::utils::dup_cstr(dw::make_error_response("下载器未初始化"));
+        }
+        dw::Task task;
+        if (!d->task_manager->get_task(task_id, task)) {
+            return dw::utils::dup_cstr(dw::make_error_response("任务不存在"));
+        }
+        auto data = dw::to_json(task);
+        data["files"] = boost::json::value_from(task.files);
+        return dw::utils::dup_cstr(dw::make_success_response(data));
+    } catch (const std::exception &e) {
+        log_e(task_id.c_str(), "wrapper 查询任务失败: {}", e.what());
+        return dw::utils::dup_cstr(dw::make_error_response("查询任务失败"));
+    }
+}
+
 DW_API char *list_tasks(const char *params_json) {
     auto *d = dw::global_downloader();
     if (!d || !params_json) {

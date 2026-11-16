@@ -48,6 +48,9 @@ public:
                 std::optional<int64_t> upload_rate = std::nullopt,
                 std::optional<bool> network_allowed = std::nullopt) override;
 
+    /// 将自定义 Tracker 同步到已经加载的任务。
+    void update_trackers(const std::vector<std::string> &trackers);
+
     /// 注册并持久化 BT 任务，创建任务句柄。
     /// @param params 下载来源、保存路径和文件选择等参数。
     dw_result<> add_task(const TaskParams *params) override;
