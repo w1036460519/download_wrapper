@@ -1037,6 +1037,13 @@ namespace dw {
             handle.set_flags(lt::torrent_flags::auto_managed,
                              lt::torrent_flags::auto_managed | lt::torrent_flags::upload_mode);
             handle.resume();
+            const auto status = handle.status();
+            log_i(info_hash.c_str(),
+                  "bt 恢复请求已提交 session_paused={} paused={} auto_managed={} upload_mode={} state={} metadata={} peers={}",
+                  g_session->is_paused(), bool(status.flags & lt::torrent_flags::paused),
+                  bool(status.flags & lt::torrent_flags::auto_managed),
+                  bool(status.flags & lt::torrent_flags::upload_mode), static_cast<int>(status.state),
+                  status.has_metadata, status.num_peers);
             g_session->post_torrent_updates();
             task->message.clear();
             task->dirty = true;

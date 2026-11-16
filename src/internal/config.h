@@ -73,7 +73,7 @@ namespace dw {
         obj["default_parts"] = c.default_parts;
         obj["min_size_for_split"] = c.min_size_for_split;
         obj["listen_port"] = c.listen_port;
-        obj["max_concurrent"] = c.max_concurrent_downloads;
+        obj["max_concurrent_downloads"] = c.max_concurrent_downloads;
         obj["dl_rate_limit"] = c.download_rate_limit;
         obj["ul_rate_limit"] = c.upload_rate_limit;
         obj["seed_ratio"] = c.seed_ratio_limit;
@@ -107,7 +107,7 @@ namespace dw {
         json_util::extract(obj, "default_parts", c.default_parts);
         json_util::extract(obj, "min_size_for_split", c.min_size_for_split);
         json_util::extract(obj, "listen_port", c.listen_port);
-        json_util::extract(obj, "max_concurrent", c.max_concurrent_downloads);
+        json_util::extract(obj, "max_concurrent_downloads", c.max_concurrent_downloads);
         json_util::extract(obj, "dl_rate_limit", c.download_rate_limit);
         json_util::extract(obj, "ul_rate_limit", c.upload_rate_limit);
         if (const auto *v = obj.if_contains("seed_ratio"); v && v->is_number()) {

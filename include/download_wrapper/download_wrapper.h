@@ -174,7 +174,7 @@ DW_API char *create(void);
  * {
  *   "client_id": "uuid",           // 必填
  *   "work_dir": "/path/to/dir",    // 必填
- *   "max_concurrent": 5,
+ *   "max_concurrent_downloads": 5,
  *   "listen_port": 6881,
  *   ...
  * }
