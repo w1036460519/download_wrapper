@@ -7,9 +7,7 @@
 
 #include "internal/task_identity.h"
 
-#include <charconv>
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -29,7 +27,6 @@ namespace dw {
         std::string torrent_file;
         std::vector<int32_t> file_indexes;
         int32_t file_priority = 4; // 添加 BT 任务时，file_indexes 共用的下载优先级。
-        std::map<int32_t, int32_t> file_priorities; // 文件索引 -> 下载优先级。
         std::vector<std::string> url_seeds;
         std::vector<uint8_t> resume_data; // 断点续传数据
         std::optional<int32_t> queue_priority; // 添加任务时的队列优先级。
@@ -59,14 +56,6 @@ namespace dw {
             boost::json::array fi;
             for (auto x: p.file_indexes) fi.push_back(x);
             obj["file_indexes"] = std::move(fi);
-        }
-
-        if (!p.file_priorities.empty()) {
-            boost::json::object priorities;
-            for (const auto &[index, priority]: p.file_priorities) {
-                priorities.emplace(std::to_string(index), priority);
-            }
-            obj["file_priorities"] = std::move(priorities);
         }
 
         if (!p.url_seeds.empty()) {
@@ -110,32 +99,6 @@ namespace dw {
                     throw std::invalid_argument("file_indexes must contain non-negative int32 indexes");
                 }
                 p.file_indexes.push_back(static_cast<int32_t>(index.as_int64()));
-            }
-        }
-        if (const auto *priorities = obj.if_contains("file_priorities"); priorities && priorities->is_object()) {
-            p.file_priorities.clear();
-            for (const auto &entry: priorities->as_object()) {
-                const auto key = entry.key();
-                int32_t index = 0;
-                const auto *end = key.data() + key.size();
-                const auto [ptr, ec] = std::from_chars(key.data(), end, index);
-                const auto &priority = entry.value();
-                if (ec == std::errc{} && ptr == end && index >= 0 && priority.is_int64()) {
-                    const auto level = priority.as_int64();
-                    if (level >= 0 && level <= 7) {
-                        p.file_priorities.insert_or_assign(index, static_cast<int32_t>(level));
-                    }
-                }
-            }
-        } else if (const auto *indexes = obj.if_contains("priority_file_indexes"); indexes && indexes->is_array()) {
-            // 兼容旧请求中的索引数组和统一优先级。
-            p.file_priorities.clear();
-            const int32_t priority = p.queue_priority.value_or(4);
-            const int32_t file_priority = priority < 4 ? 1 : (priority > 4 ? 7 : 4);
-            for (const auto &index: indexes->as_array()) {
-                if (index.is_int64() && index.as_int64() >= 0 && std::in_range<int32_t>(index.as_int64())) {
-                    p.file_priorities.try_emplace(static_cast<int32_t>(index.as_int64()), file_priority);
-                }
             }
         }
         json_util::extract(obj, "url_seeds", p.url_seeds);

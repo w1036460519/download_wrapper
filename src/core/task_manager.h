@@ -71,6 +71,7 @@ namespace dw {
         dw_result<> pause(const TaskParams &params) const;
 
         dw_result<> resume(const TaskParams &params) const;
+        dw_result<> set_file_priority(const TaskParams &params) const;
 
         /// 向对应引擎提交删除请求。
         dw_result<> remove(const TaskParams &params) const;

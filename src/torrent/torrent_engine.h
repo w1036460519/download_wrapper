@@ -59,6 +59,7 @@ public:
     /// @param params 任务哈希、强制调度标记和文件优先级映射。
     /// @return 入队结果。
     dw_result<> resume_task(const TaskParams *params) override;
+    dw_result<> set_file_priority(const TaskParams &params);
 
     /// 请求暂停任务并刷新状态。
     /// @param params BT 任务哈希。

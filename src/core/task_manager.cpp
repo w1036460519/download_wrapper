@@ -192,6 +192,16 @@ namespace dw {
         return dw_result<>::failure();
     }
 
+    dw_result<> TaskManager::set_file_priority(const TaskParams &params) const {
+        std::scoped_lock lock(mtx_);
+        if (params.protocol != DW_PROTOCOL_TORRENT || params.client_id != config_.client_id) {
+            log_e(params.task_key().c_str(), "manager 下载优先级 暂不支持");
+            return dw_result<>::failure();
+        }
+        if (!engine_of(DW_PROTOCOL_TORRENT)) return dw_result<>::failure();
+        return torrent_->set_file_priority(params);
+    }
+
     dw_result<> TaskManager::remove(const TaskParams &params) const {
         log_i(params.task_key().c_str(), "manager 删除任务[{}]", to_json_string(params));
         if (params.client_id.empty() || params.client_id == config_.client_id) {

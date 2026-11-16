@@ -282,13 +282,19 @@ DW_API char *pause_task(const char *params_json);
 /**
  * 恢复（继续）单个任务。
  *
- * JSON schema 同 pause_task。BT 可选填 file_priorities，例如 {"0":4,"2":7}。
+ * JSON schema 同 pause_task。BT 可选填 file_indexes 和 file_priority。
  * 键为文件索引，值为 0 到 7 的下载优先级。
  *
  * @param params_json  JSON 参数字符串，不可为 NULL。
  * @return             成功返回 JSON 响应（调用者 release_memory 释放），失败返回 NULL。
  */
 DW_API char *resume_task(const char *params_json);
+
+/** 修改已加载 BT 任务的文件优先级。使用 protocol、client_id、info_hash、
+ * file_indexes 和 file_priority，不改变任务的暂停或调度设置。
+ * 返回字符串用 release_memory 释放。
+ */
+DW_API char *set_file_priority(const char *params_json);
 
 /**
  * 删除单个任务。

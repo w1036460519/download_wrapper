@@ -290,6 +290,14 @@ DW_API char *resume_task(const char *params_json) {
     return dw::result_to_json(std::move(result));
 }
 
+DW_API char *set_file_priority(const char *params_json) {
+    auto *d = dw::global_downloader();
+    std::lock_guard<std::mutex> lock(d->mutex);
+    dw::TaskParams params;
+    if (char *err = dw::validate_and_parse_task_params(params_json, params)) return err;
+    return dw::result_to_json(d->task_manager->set_file_priority(params));
+}
+
 DW_API char *delete_task(const char *params_json) {
     log_i("", "wrapper 删除任务 params={}", params_json ? params_json : "null");
     if (!dw::global_downloader()->initialized.load()) {

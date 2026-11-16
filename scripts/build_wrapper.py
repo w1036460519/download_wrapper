@@ -74,6 +74,7 @@ PLATFORMS = {
         "triplet": "arm64-ios",
         "static": True,
         "output": "download-ios-arm64.a",
+        "deploy_target": "17.0",
         "overlay_triplets": True,
     },
     "ios-simulator-universal": {
@@ -81,6 +82,7 @@ PLATFORMS = {
         "universal": True,
         "simulator": True,
         "output": "download-ios-simulator-universal.a",
+        "deploy_target": "17.0",
         "overlay_triplets": True,
     },
     "android-arm64": {
@@ -372,7 +374,7 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
                 "-DCMAKE_OSX_ARCHITECTURES=arm64",
             ])
 
-    # macOS 部署目标
+    # Apple 平台显式写入部署目标，覆盖旧构建目录中的缓存。
     if cfg.get("deploy_target"):
         cmd.append(f"-DCMAKE_OSX_DEPLOYMENT_TARGET={cfg['deploy_target']}")
 
@@ -508,10 +510,12 @@ def merge_ios_static_libs(workspace: Path, cfg: dict, vcpkg_dir: Path,
         return output
     else:
         # iOS arm64 单架构
-        self_lib = find_output(workspace / "build", "download-ios-arm64.a")
+        self_lib = find_output(workspace / "build-ios-arm64", "download-ios-arm64.a")
         if not self_lib:
             raise FileNotFoundError("未找到 wrapper 自身静态库 download-ios-arm64.a")
-        deps = find_vcpkg_installed(workspace, "arm64-ios")
+        deps = find_vcpkg_installed(workspace / "build-ios-arm64", "arm64-ios")
+        if not deps:
+            raise FileNotFoundError("未找到 iOS 真机构建目录中的 vcpkg 静态库")
 
         output = dist / cfg["output"]
         run(["libtool", "-static", "-o", str(output), str(self_lib)] +
@@ -647,7 +651,7 @@ def main():
         output = build_ios_simulator_universal(workspace, cfg, vcpkg_dir, libtorrent_dir)
     elif cfg.get("static") and cfg["os"] == "ios":
         # iOS arm64 单架构静态库
-        build_dir = workspace / "build"
+        build_dir = workspace / "build-ios-arm64"
         cmake_configure(build_dir, workspace, cfg, vcpkg_dir, libtorrent_dir)
         cmake_build(build_dir)
         # 单架构分支同样并入 libtorrent，否则产物缺 BT 符号

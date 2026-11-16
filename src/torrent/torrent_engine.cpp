@@ -105,7 +105,8 @@ namespace dw {
             }
         }
 
-        lt::torrent_handle find_handle(const std::string &info_hash, const bool upload_only = false) {
+        lt::torrent_handle find_handle(const std::string &info_hash, const bool upload_only = false,
+                                       const bool load_if_missing = true) {
             if (info_hash.empty()) {
                 return {};
             }
@@ -131,6 +132,8 @@ namespace dw {
                     return th;
                 }
             }
+
+            if (!load_if_missing) return {};
 
             Task task;
             if (!g_task_manager->get_task_store().find_by_task_id(info_hash, task)) {
@@ -624,7 +627,12 @@ namespace dw {
                 log_e(info_hash.c_str(), "任务文件删除失败: {}", tdf->error.what());
             } else if (const auto *fp = lt::alert_cast<lt::file_prio_alert>(a)) {
                 const auto info_hash = info_hash_hex(fp->handle);
-                log_i(info_hash.c_str(), "任务优先级配置完成");
+                if (fp->error) {
+                    log_e(info_hash.c_str(), "任务优先级配置失败: {}", fp->error.message());
+                } else if (fp->handle.is_valid()) {
+                    handle_files(fp->handle);
+                    log_i(info_hash.c_str(), "任务优先级配置完成");
+                }
             }
         }
 
@@ -999,6 +1007,45 @@ namespace dw {
         return dw_result<>::success();
     }
 
+    dw_result<> TorrentEngine::set_file_priority(const TaskParams &params) {
+        const auto &key = params.task_key();
+        if (key.empty() || params.file_indexes.empty() || params.file_priority < 0 || params.file_priority > 7) {
+            log_e("", "设置优先级 任务标识、文件索引或优先级无效");
+            return dw_result<>::failure();
+        }
+
+        std::scoped_lock lock(tasks_mutex());
+        try {
+            const auto handle = find_handle(key, false, false);
+            if (!handle.is_valid()) {
+                log_e("", "设置优先级 任务尚未加载");
+                return dw_result<>::failure();
+            }
+
+            const auto torrent = handle.torrent_file();
+            if (!torrent) {
+                log_e("", "设置优先级 元数据尚未就绪");
+                return dw_result<>::failure();
+            }
+            const auto &files = torrent->layout();
+            auto priorities = handle.get_file_priorities();
+            priorities.resize(files.num_files(), lt::default_priority);
+            const auto requested = lt::download_priority_t{static_cast<uint8_t>(params.file_priority)};
+            for (const auto index: params.file_indexes) {
+                if (index < 0 || index >= files.num_files() || files.pad_file_at(lt::file_index_t{index})) {
+                    log_e("", "设置优先级 文件索引无效");
+                    return dw_result<>::failure();
+                }
+                priorities[index] = requested;
+            }
+            handle.prioritize_files(priorities);
+            return dw_result<>::success();
+        } catch (const std::exception &e) {
+            log_e(key.c_str(), "bt 设置文件优先级失败: {}", e.what());
+            return dw_result<>::failure();
+        }
+    }
+
     dw_result<> TorrentEngine::resume_task(const TaskParams *params) {
         const auto &info_hash = params->task_key();
         if (!g_session || !g_session->is_valid()) {
@@ -1163,21 +1210,22 @@ namespace dw {
         return result;
     }
 
-    dw_result<std::vector<TaskFile>> TorrentEngine::parse_torrent_file(const std::string &torrent_file_path, std::string *info_hash) {
+    dw_result<std::vector<TaskFile> > TorrentEngine::parse_torrent_file(const std::string &torrent_file_path,
+                                                                        std::string *info_hash) {
         if (torrent_file_path.empty()) {
             log_e("bt", ".torrent 文件[{}]无效", torrent_file_path);
-            return dw_result<std::vector<TaskFile>>::failure();
+            return dw_result<std::vector<TaskFile> >::failure();
         }
         lt::error_code ec;
         const lt::add_torrent_params loaded = lt::load_torrent_file(torrent_file_path, ec, lt::load_torrent_limits{});
         if (ec) {
             log_e("bt", "加载 .torrent 文件失败[{}]", ec.what());
-            return dw_result<std::vector<TaskFile>>::failure();
+            return dw_result<std::vector<TaskFile> >::failure();
         }
         const std::shared_ptr<const lt::torrent_info> ti = loaded.ti;
         if (!ti) {
             log_e("bt", "解析 .torrent 文件失败[{}]", torrent_file_path);
-            return dw_result<std::vector<TaskFile>>::failure();
+            return dw_result<std::vector<TaskFile> >::failure();
         }
         const lt::info_hash_t ih = ti->info_hashes();
         std::string s;
@@ -1187,9 +1235,9 @@ namespace dw {
             s = lt::aux::to_hex(ih.v1);
         } else {
             log_e("", "解析 .torrent 文件失败[{}]", torrent_file_path);
-            return dw_result<std::vector<TaskFile>>::failure();
+            return dw_result<std::vector<TaskFile> >::failure();
         }
-        auto result = dw_result<std::vector<TaskFile>>::success();
+        auto result = dw_result<std::vector<TaskFile> >::success();
         try {
             const auto &files = ti->layout();
             result.data.reserve(files.num_files());
@@ -1208,7 +1256,7 @@ namespace dw {
             }
         } catch (const std::exception &e) {
             log_e("bt", "解析 .torrent 文件任务列表失败[{}]", e.what());
-            return dw_result<std::vector<TaskFile>>::failure();
+            return dw_result<std::vector<TaskFile> >::failure();
         }
         if (info_hash) *info_hash = std::move(s);
         return result;
