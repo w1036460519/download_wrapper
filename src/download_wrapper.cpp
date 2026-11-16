@@ -42,6 +42,7 @@ namespace dw {
             // 堆分配字符串，所有权交给回调消费方（Dart 侧 release_memory 释放）。
             const char *heap_json = strdup(json);
             if (!heap_json) return;
+            log_d("", "wrapper 投递进度回调 bytes={}", std::strlen(json));
             cb(heap_json);
         }
     }

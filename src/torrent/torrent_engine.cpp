@@ -169,6 +169,7 @@ namespace dw {
                         reinterpret_cast<const char *>(task_resume.resume_data.data()),
                         static_cast<std::ptrdiff_t>(task_resume.resume_data.size()));
                     lt::add_torrent_params atp = lt::read_resume_data(buf);
+                    atp.save_path = task.save_path;
                     if (auto handle = add_torrent(atp, info_hash); handle.is_valid()) {
                         return handle;
                     }
@@ -439,6 +440,7 @@ namespace dw {
 
             // 任务状态改变
             if (const auto *su = lt::alert_cast<lt::state_update_alert>(a)) {
+                log_d("", "bt 收到状态更新 tasks={}", su->status.size());
                 for (const lt::torrent_status &s: su->status) {
                     if (!s.handle.is_valid()) continue;
                     const std::string info_hash = info_hash_hex(s.handle);
@@ -448,6 +450,7 @@ namespace dw {
                                   s.errc.value(), s.errc.what());
                             handle_task_error(info_hash, s.errc);
                         } else {
+                            const auto previous_status = task->status;
                             task->total_size = s.total_wanted;
                             task->total_done = s.total_wanted_done;
                             task->download_rate = static_cast<double>(s.download_payload_rate);
@@ -475,6 +478,10 @@ namespace dw {
                                     default:
                                         break;
                                 }
+                            }
+                            if (previous_status != task->status) {
+                                log_i(info_hash.c_str(), "bt 任务状态 {} -> {} bytes={}/{}",
+                                      previous_status, task->status, task->total_done, task->total_size);
                             }
                             task->dirty = true;
                         }
@@ -611,6 +618,7 @@ namespace dw {
             // 存储迁移完成
             else if (const auto *sm = lt::alert_cast<lt::storage_moved_alert>(a)) {
                 const std::string info_hash = info_hash_hex(sm->handle);
+                handle_files(sm->handle);
                 log_i(info_hash.c_str(), "文件迁移完成");
             }
             // 任务已从 session 移除
@@ -928,13 +936,13 @@ namespace dw {
         task.is_delete = false;
         task.is_read = false;
         task.modified_at = now_unix_ms();
+        const std::filesystem::path base = g_task_manager->config().save_path;
+        task.save_path = base.string();
         if (!existing_task) {
             task.status = DW_TASK_STATUS_RESOLVING;
             task.created_at = task.modified_at;
 
-            // 重名处理
-            const std::filesystem::path base = g_task_manager->config().save_path;
-            task.save_path = base.string();
+            // 新任务才检查重名。
 
             const auto filename = std::filesystem::path(task.name).filename();
             if (std::error_code ec;
@@ -974,6 +982,13 @@ namespace dw {
                 registered_task->modified_at = now_unix_ms();
                 registered_task->dirty = true;
                 return dw_result<>::failure();
+            }
+
+            const auto storage = handle.status(lt::torrent_handle::query_save_path);
+            if (std::filesystem::path(storage.save_path).lexically_normal() !=
+                std::filesystem::path(registered_task->save_path).lexically_normal()) {
+                // 已加载的任务也切换到新目录，并重新检查目标目录中的文件。
+                handle.move_storage(registered_task->save_path, lt::move_flags_t::reset_save_path);
             }
 
             // 设置优先级
