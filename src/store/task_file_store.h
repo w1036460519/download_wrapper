@@ -17,9 +17,8 @@ namespace dw {
         TaskFileStore &operator=(const TaskFileStore &) = delete;
 
         std::vector<TaskFile> get(const std::string &task_id) const;
-        // 按完整路径查询下载进度最高的一条未删除文件记录。
-        bool find_by_path(const std::string &full_path, TaskFile &file) const;
-        // 按任务标识软删除全部关联文件。没有待删除文件也视为成功。
+        std::vector<TaskFile> find_candidates(const std::string &name, int limit, int64_t offset) const;
+        // 按任务标识硬删除全部关联文件。没有待删除文件也视为成功。
         bool delete_task(const std::string &task_id) const;
 
     private:

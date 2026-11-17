@@ -422,6 +422,31 @@ DW_API char *list_tasks(const char *params_json) {
 /*  本地文件浏览与管理                                                */
 /* ------------------------------------------------------------------ */
 
+DW_API char *get_files(const char *params_json) {
+    auto *d = dw::global_downloader();
+    if (!d || !params_json) return dw::utils::dup_cstr(dw::make_error_response("参数非法"));
+
+    std::string dir_path;
+    try {
+        dir_path = dw::json_get_string(boost::json::parse(params_json).as_object(), "dir_path");
+    } catch (const std::exception &) {
+        return dw::utils::dup_cstr(dw::make_error_response("目录参数解析失败"));
+    }
+    if (dir_path.empty()) return dw::utils::dup_cstr(dw::make_error_response("目录不能为空"));
+
+    std::lock_guard<std::mutex> lock(d->mutex);
+    if (!d->initialized.load() || !d->task_manager) {
+        return dw::utils::dup_cstr(dw::make_error_response("下载器未初始化"));
+    }
+    try {
+        const auto files = d->task_manager->get_files(dir_path);
+        return dw::utils::dup_cstr(dw::make_success_response(boost::json::value_from(files).as_array()));
+    } catch (const std::exception &e) {
+        log_e("", "wrapper 读取目录失败: {}", e.what());
+        return dw::utils::dup_cstr(dw::make_error_response("读取目录失败"));
+    }
+}
+
 DW_API char *scan_local_file(const char *params_json) {
     auto *d = dw::global_downloader();
     if (!d || !d->initialized.load() || !params_json) {

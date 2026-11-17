@@ -109,6 +109,9 @@ namespace dw {
 
         /// 内存未命中时加载任务及文件。使用返回指针期间须持有 get_mutex()。
         Task *get_engine_task(const std::string &key);
+        void assign_download_location(Task &task) const;
+        std::string resolve_save_path(const std::string &root_id, const std::string &subdirectory) const;
+        static void resolve_task_file_paths(Task &task);
 
 
         TaskResumeStore &get_task_resume_store() { return task_resume_store_; }
@@ -119,6 +122,7 @@ namespace dw {
 
         // B 线程（重载）：周期持久化 dirty 记录 + 推送 JSON + 引擎 sweep。
         void maintenance_loop();
+        void resolve_download_location(Task &task) const;
 
         // ---- 内部工具 ----
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）

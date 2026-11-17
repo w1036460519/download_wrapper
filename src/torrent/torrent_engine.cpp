@@ -136,7 +136,7 @@ namespace dw {
             if (!load_if_missing) return {};
 
             Task task;
-            if (!g_task_manager->get_task_store().find_by_task_id(info_hash, task)) {
+            if (!g_task_manager->get_task(info_hash, task) || task.save_path.empty()) {
                 return {};
             }
 
@@ -391,7 +391,6 @@ namespace dw {
 
             if (const auto ti = h.torrent_file(); ti) {
                 const auto &files = ti->layout();
-                const auto save_path = h.status(lt::torrent_handle::query_save_path).save_path;
                 const auto priorities = h.get_file_priorities();
                 std::vector<std::int64_t> progress;
                 h.file_progress(progress);
@@ -407,9 +406,6 @@ namespace dw {
                     auto &file = *entry;
                     file.task_id = info_hash;
                     file.path = files.file_path(index);
-                    if (!save_path.empty()) {
-                        file.full_path = (std::filesystem::path(save_path) / file.path).string();
-                    }
                     file.name = std::filesystem::path(file.path).filename().string();
                     file.extension = utils::file_extension(file.path);
                     file.total_size = files.file_size(index);
@@ -425,6 +421,7 @@ namespace dw {
                         file.prioritize = static_cast<std::uint8_t>(priorities[i]);
                     file.dirty = true;
                 }
+                TaskManager::resolve_task_file_paths(*task);
                 task->dirty = true;
             }
         }
@@ -453,8 +450,6 @@ namespace dw {
                             const auto previous_status = task->status;
                             task->total_size = s.total_wanted;
                             task->total_done = s.total_wanted_done;
-                            task->download_rate = static_cast<double>(s.download_payload_rate);
-                            task->upload_rate = static_cast<double>(s.upload_payload_rate);
                             if (s.is_finished) {
                                 task->status = DW_TASK_STATUS_COMPLETED;
                             } else if (s.flags & lt::torrent_flags::paused) {
@@ -479,6 +474,9 @@ namespace dw {
                                         break;
                                 }
                             }
+                            const bool completed = task->status == DW_TASK_STATUS_COMPLETED;
+                            task->download_rate = completed ? 0.0 : static_cast<double>(s.download_payload_rate);
+                            task->upload_rate = completed ? 0.0 : static_cast<double>(s.upload_payload_rate);
                             if (previous_status != task->status) {
                                 log_i(info_hash.c_str(), "bt 任务状态 {} -> {} bytes={}/{}",
                                       previous_status, task->status, task->total_done, task->total_size);
@@ -494,6 +492,8 @@ namespace dw {
                 log_e(info_hash.c_str(), "下载完成");
                 if (Task *task = TorrentEngine::get_task(info_hash); task && !task->is_delete) {
                     task->status = DW_TASK_STATUS_COMPLETED;
+                    task->download_rate = 0.0;
+                    task->upload_rate = 0.0;
                     task->dirty = true;
                 }
             }
@@ -779,6 +779,10 @@ namespace dw {
                 || task->status == DW_TASK_STATUS_COMPLETED) {
                 continue;
             }
+            if (task->save_path.empty()) {
+                log_e(task_id.c_str(), "bt 初始化 保存位置不可访问");
+                continue;
+            }
             try {
                 if (const auto handle = find_handle(task_id); !handle.is_valid()) {
                     task->status = DW_TASK_STATUS_PAUSED;
@@ -924,6 +928,36 @@ namespace dw {
         Task new_task;
         Task &task = existing_task ? *existing_task : new_task;
 
+        const std::string root_id = task.storage_root_id.empty()
+            ? g_task_manager->config().default_download_root : task.storage_root_id;
+        std::string relative_save_path = task.relative_save_path;
+        if (!existing_task) {
+            const std::filesystem::path base = g_task_manager->resolve_save_path(root_id, "");
+            const auto filename = std::filesystem::path(atp.ti ? atp.ti->name() : atp.name).filename();
+            if (std::error_code ec;
+                !base.empty() && !filename.empty() && filename != "." && filename != ".." &&
+                std::filesystem::exists(base / filename, ec)) {
+                const auto stem = filename.stem().string();
+                for (int32_t i = 1; i < 10000; ++i) {
+                    const auto subdirectory = stem + "(" + std::to_string(i) + ")";
+                    const bool occupied = std::filesystem::exists(base / subdirectory, ec);
+                    if (ec) break;
+                    if (!occupied) {
+                        relative_save_path = subdirectory;
+                        break;
+                    }
+                }
+            }
+        }
+        auto save_path = g_task_manager->resolve_save_path(root_id, relative_save_path);
+        if (save_path.empty()) {
+            return dw_result<>::failure(DW_REASON_ERROR, "保存位置不可访问");
+        }
+
+        task.storage_root_id = root_id;
+        task.relative_save_path = std::move(relative_save_path);
+        task.save_path = std::move(save_path);
+
         task.name = atp.ti ? atp.ti->name() : atp.name;
         task.client_id = params->client_id;
         task.is_remote = false;
@@ -936,30 +970,20 @@ namespace dw {
         task.is_delete = false;
         task.is_read = false;
         task.modified_at = now_unix_ms();
-        const std::filesystem::path base = g_task_manager->config().save_path;
-        task.save_path = base.string();
         if (!existing_task) {
             task.status = DW_TASK_STATUS_RESOLVING;
             task.created_at = task.modified_at;
-
-            // 新任务才检查重名。
-
-            const auto filename = std::filesystem::path(task.name).filename();
-            if (std::error_code ec;
-                !filename.empty()
-                && filename != "."
-                && filename != ".."
-                && std::filesystem::exists(base / filename, ec)) {
-                const auto stem = filename.stem().string();
-                for (int32_t i = 1; i < 10000; ++i) {
-                    const auto candidate = base / (stem + "(" + std::to_string(i) + ")");
-                    const bool occupied = std::filesystem::exists(candidate, ec);
-                    if (ec) break;
-                    if (!occupied) {
-                        task.save_path = candidate.string();
-                        break;
-                    }
-                }
+        } else {
+            task.status = DW_TASK_STATUS_RESOLVING;
+            task.total_done = 0;
+            task.download_rate = 0;
+            task.upload_rate = 0;
+            task.message.clear();
+            for (auto &file: task.files) {
+                file.total_done = 0;
+                file.progress = 0;
+                file.segments.clear();
+                file.dirty = true;
             }
         }
         task.dirty = true;
@@ -989,6 +1013,9 @@ namespace dw {
                 std::filesystem::path(registered_task->save_path).lexically_normal()) {
                 // 已加载的任务也切换到新目录，并重新检查目标目录中的文件。
                 handle.move_storage(registered_task->save_path, lt::move_flags_t::reset_save_path);
+            } else if (existing_task) {
+                // 重新校验磁盘文件，让引擎用实际数据重建进度。
+                handle.force_recheck();
             }
 
             // 设置优先级
@@ -1072,6 +1099,9 @@ namespace dw {
 
         Task *task = get_task(info_hash);
         if (!task || task->is_delete) return dw_result<>::failure();
+        if (task->save_path.empty()) {
+            return dw_result<>::failure(DW_REASON_ERROR, "保存位置不可访问，请重新授权");
+        }
         try {
             const auto handle = find_handle(info_hash);
             if (!handle.is_valid()) {
@@ -1155,8 +1185,24 @@ namespace dw {
 
         try {
             if (Task *task = get_task(info_hash); task && !task->is_delete) {
-                if (const auto handle = find_handle(info_hash, true); handle.is_valid()) {
+                if (delete_files) {
+                    std::error_code ec;
+                    if (task->save_path.empty() || !std::filesystem::is_directory(task->save_path, ec)) {
+                        return dw_result<>::failure(DW_REASON_ERROR, "保存位置不可访问，无法删除文件");
+                    }
+                }
+                const auto handle = find_handle(info_hash, true, delete_files != 0);
+                if (handle.is_valid()) {
+                    if (delete_files) {
+                        const auto current = handle.status(lt::torrent_handle::query_save_path).save_path;
+                        if (std::filesystem::path(current).lexically_normal() !=
+                            std::filesystem::path(task->save_path).lexically_normal()) {
+                            return dw_result<>::failure(DW_REASON_ERROR, "任务保存位置尚未同步，无法删除文件");
+                        }
+                    }
                     g_session->remove_torrent(handle, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
+                } else if (delete_files) {
+                    return dw_result<>::failure(DW_REASON_ERROR, "无法加载任务以删除文件");
                 }
                 task->is_delete = true;
                 task->dirty = true;

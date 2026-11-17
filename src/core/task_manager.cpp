@@ -29,7 +29,6 @@
 #include <fstream>
 #include <ranges>
 #include <stdexcept>
-#include <unordered_set>
 #include <utility>
 
 namespace dw {
@@ -60,6 +59,15 @@ namespace dw {
         const bool previous_net_allowed = net_allowed_;
         const bool trackers_changed = config_.trackers != cfg.trackers;
         config_ = cfg;
+        for (auto &task: tasks_ | std::views::values) {
+            if (task.save_path.empty() && !task.storage_root_id.empty() &&
+                config_.storage_roots.contains(task.storage_root_id)) {
+                if (Task stored; task_store_.find_by_task_id(task.task_id, stored)) {
+                    task.full_path = std::move(stored.full_path);
+                }
+                resolve_download_location(task);
+            }
+        }
         if (config_.max_concurrent_downloads < 0) config_.max_concurrent_downloads = 3;
         net_allowed_ = config_.network_type != 0 &&
                        (config_.network_type != 2 || config_.allow_mobile_data);
@@ -212,6 +220,73 @@ namespace dw {
         return dw_result<>::failure();
     }
 
+    void TaskManager::assign_download_location(Task &task) const {
+        std::scoped_lock lock(mtx_);
+        task.storage_root_id.clear();
+        task.relative_save_path.clear();
+        if (const auto root = config_.storage_roots.find(config_.default_download_root);
+            root != config_.storage_roots.end()) {
+            const auto relative = std::filesystem::path(task.save_path).lexically_normal()
+                    .lexically_relative(std::filesystem::path(root->second).lexically_normal());
+            if (!relative.empty() && !relative.is_absolute() && *relative.begin() != "..") {
+                task.storage_root_id = root->first;
+                if (relative != ".") task.relative_save_path = relative.generic_string();
+            }
+        }
+    }
+
+    void TaskManager::resolve_task_file_paths(Task &task) {
+        namespace fs = std::filesystem;
+        fs::path common_root;
+        bool has_file = false;
+        bool single_root = true;
+        for (auto &file: task.files) {
+            file.full_path.clear();
+            const auto relative = fs::path(file.path).lexically_normal();
+            if (file.is_delete || task.save_path.empty() || relative.empty() || relative == "." ||
+                relative.has_root_path() || *relative.begin() == "..")
+                continue;
+            file.full_path = (fs::path(task.save_path) / relative).string();
+            if (!has_file) {
+                common_root = *relative.begin();
+                has_file = true;
+            } else if (*relative.begin() != common_root) {
+                single_root = false;
+            }
+        }
+        if (task.save_path.empty()) task.full_path.clear();
+        else if (has_file) {
+            task.full_path = single_root ? (fs::path(task.save_path) / common_root).string() : task.save_path;
+        }
+    }
+
+    std::string TaskManager::resolve_save_path(const std::string &root_id, const std::string &subdirectory) const {
+        namespace fs = std::filesystem;
+        const auto root = config_.storage_roots.find(root_id);
+        const auto relative = fs::path(subdirectory).lexically_normal();
+        if (root_id.empty() || root == config_.storage_roots.end() || !fs::path(root->second).is_absolute() ||
+            relative.has_root_path() || (!relative.empty() && *relative.begin() == "..")) {
+            return {};
+        }
+        return relative.empty() ? root->second : (fs::path(root->second) / relative).string();
+    }
+
+    void TaskManager::resolve_download_location(Task &task) const {
+        namespace fs = std::filesystem;
+        const fs::path previous = task.save_path;
+        task.save_path = resolve_save_path(task.storage_root_id, task.relative_save_path);
+        if (previous != task.save_path) {
+            const auto relative_full_path = task.full_path.empty() || previous.empty()
+                                                ? fs::path(task.full_path)
+                                                : fs::path(task.full_path).lexically_relative(previous);
+            task.full_path = task.save_path.empty() || relative_full_path.empty() || relative_full_path.has_root_path()
+                             || *relative_full_path.begin() == ".."
+                                 ? ""
+                                 : (fs::path(task.save_path) / relative_full_path).string();
+        }
+        resolve_task_file_paths(task);
+    }
+
     Task *TaskManager::get_engine_task(const std::string &key) {
         std::scoped_lock lock(mtx_);
         if (const auto it = tasks_.find(key); it != tasks_.end())
@@ -222,6 +297,7 @@ namespace dw {
             return nullptr;
         }
         task.files = task_file_store_.get(key);
+        resolve_download_location(task);
         return &tasks_.try_emplace(key, std::move(task)).first->second;
     }
 
@@ -237,12 +313,15 @@ namespace dw {
         }
         if (!task_store_.find_by_task_id(task_id, out)) return false;
         out.files = task_file_store_.get(task_id);
+        resolve_download_location(out);
         return true;
     }
 
     std::vector<Task> TaskManager::list() {
         std::scoped_lock lock(mtx_);
-        return task_store_.find_all();
+        auto tasks = task_store_.find_all();
+        for (auto &task: tasks) resolve_download_location(task);
+        return tasks;
     }
 
     /* ================================================================== */
@@ -274,8 +353,15 @@ namespace dw {
                     }
                     if (task.is_delete) {
                         if (task.dirty) {
-                            if (!task_store_.save(task) || !task_file_store_.delete_task(task.task_id)) {
-                                log_e(task.task_id.c_str(), "manager 任务[{}]软删除保存失败", task.name);
+                            auto *db = database_.connection();
+                            if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+                                log_e(task.task_id.c_str(), "manager 任务[{}]开启删除事务失败", task.name);
+                                continue;
+                            }
+                            if (!task_store_.save(task) || !task_file_store_.delete_task(task.task_id) ||
+                                sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+                                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                                log_e(task.task_id.c_str(), "manager 任务[{}]删除保存失败", task.name);
                                 continue;
                             }
                             task.dirty = false;
@@ -286,6 +372,8 @@ namespace dw {
                     }
                     for (auto &file: task.files) {
                         if (!file.dirty) continue;
+                        file.storage_root_id = task.storage_root_id;
+                        file.relative_save_path = task.relative_save_path;
                         if (task_file_store_.save(file)) {
                             file.dirty = false;
                         } else {
@@ -323,38 +411,52 @@ namespace dw {
     }
 
     std::vector<TaskFile> TaskManager::get_files(const std::string &dir_path) const {
+        namespace fs = std::filesystem;
+        std::scoped_lock lock(mtx_);
         std::vector<TaskFile> result;
         try {
-            if (!std::filesystem::exists(dir_path) || !std::filesystem::is_directory(dir_path)) {
-                return result;
-            }
-            for (const auto &entry: std::filesystem::directory_iterator(dir_path)) {
-                const auto name = entry.path().filename().string();
-                // 跳过隐藏文件/目录
-                if (!name.empty() && name[0] == '.') continue;
+            if (!fs::is_directory(dir_path)) return result;
+            const auto directory = fs::absolute(dir_path).lexically_normal();
+            constexpr int page_size = 32;
 
-                TaskFile fi;
-                fi.path = name;
-                fi.full_path = entry.path().string();
-                fi.name = name;
+            for (const auto &entry: fs::directory_iterator(directory)) {
+                const auto name = entry.path().filename().string();
+                TaskFile file;
+                file.path = name;
+                file.full_path = entry.path().string();
+                file.name = name;
                 if (entry.is_directory()) {
-                    fi.is_dir = true;
+                    file.is_dir = true;
                 } else if (entry.is_regular_file()) {
-                    fi.total_size = static_cast<int64_t>(entry.file_size());
-                    fi.extension = utils::file_extension(fi.name);
-                    {
-                        std::scoped_lock lock(mtx_);
-                        if (TaskFile stored_file; task_file_store_.find_by_path(fi.full_path, stored_file)) {
-                            fi.total_done = std::max<int64_t>(0, stored_file.total_done);
-                            fi.total_size = std::max(fi.total_size, fi.total_done);
-                            fi.progress = stored_file.progress;
-                            fi.segments = std::move(stored_file.segments);
+                    file.total_size = static_cast<int64_t>(entry.file_size());
+                    file.extension = utils::file_extension(name);
+                    for (int64_t offset = 0; file.task_id.empty(); offset += page_size) {
+                        auto candidates = task_file_store_.find_candidates(name, page_size, offset);
+                        for (auto &candidate: candidates) {
+                            const auto save_path = resolve_save_path(candidate.storage_root_id,
+                                                                     candidate.relative_save_path);
+                            const auto relative = fs::path(candidate.path).lexically_normal();
+                            if (save_path.empty() || relative.empty() || relative == "." ||
+                                relative.has_root_path() || *relative.begin() == ".." ||
+                                (fs::path(save_path) / relative).lexically_normal() != entry.path())
+                                continue;
+
+                            file.task_id = std::move(candidate.task_id);
+                            file.file_index = candidate.file_index;
+                            file.prioritize = candidate.prioritize;
+                            file.is_read = candidate.is_read;
+                            file.total_done = std::max<int64_t>(0, candidate.total_done);
+                            file.total_size = std::max(file.total_size, file.total_done);
+                            file.progress = candidate.progress;
+                            file.segments = std::move(candidate.segments);
+                            break;
                         }
+                        if (candidates.size() < page_size) break;
                     }
                 } else {
                     continue;
                 }
-                result.push_back(std::move(fi));
+                result.push_back(std::move(file));
             }
         } catch (const std::exception &e) {
             log_e("", "manager 扫描目录[{}]失败: {}", dir_path, e.what());
@@ -371,7 +473,8 @@ namespace dw {
         return TorrentEngine::parse_magnet(magnet_link);
     }
 
-    dw_result<std::vector<TaskFile>> TaskManager::parse_torrent_file(const std::string &torrent_file_path, std::string *info_hash) {
+    dw_result<std::vector<TaskFile> > TaskManager::parse_torrent_file(const std::string &torrent_file_path,
+                                                                      std::string *info_hash) {
         return TorrentEngine::parse_torrent_file(torrent_file_path, info_hash);
     }
 

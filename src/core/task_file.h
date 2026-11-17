@@ -34,6 +34,8 @@ namespace dw {
         std::string name;
         // 任务内的相对路径。
         std::string path;
+        std::string storage_root_id;
+        std::string relative_save_path;
         // 文件完整路径，由 save_path/ path 按平台路径分隔符拼接。
         std::string full_path;
         // 文件总大小，单位：字节（B）

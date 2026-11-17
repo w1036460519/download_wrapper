@@ -4,6 +4,7 @@
  */
 
 #pragma once
+#include <map>
 
 #include "download_wrapper/download_wrapper.h"
 #include "internal/json_util.h"
@@ -48,6 +49,8 @@ namespace dw {
         std::string client_id;
         std::string save_path = "."; // 默认保存目录：当前目录
         std::vector<std::string> trackers;
+        std::string default_download_root;
+        std::map<std::string, std::string> storage_roots;
 
         // 网络控制
         bool allow_mobile_data = false; // 应用设置：是否允许使用移动数据
@@ -81,6 +84,8 @@ namespace dw {
         obj["work_dir"] = c.work_dir;
         obj["client_id"] = c.client_id;
         obj["save_path"] = c.save_path;
+        obj["default_download_root"] = c.default_download_root;
+        obj["storage_roots"] = boost::json::value_from(c.storage_roots);
         boost::json::array trackers_arr;
         for (const auto &t: c.trackers) trackers_arr.emplace_back(t);
         obj["trackers"] = std::move(trackers_arr);
@@ -119,6 +124,14 @@ namespace dw {
         json_util::extract(obj, "work_dir", c.work_dir);
         json_util::extract(obj, "client_id", c.client_id);
         json_util::extract(obj, "save_path", c.save_path);
+        json_util::extract(obj, "default_download_root", c.default_download_root);
+        if (const auto *roots = obj.if_contains("storage_roots"); roots && roots->is_object()) {
+            for (const auto &entry: roots->as_object()) {
+                if (entry.value().is_string()) {
+                    c.storage_roots.emplace(std::string(entry.key()), std::string(entry.value().as_string()));
+                }
+            }
+        }
         json_util::extract(obj, "trackers", c.trackers);
         if (auto *v = obj.if_contains("allow_mobile_data"); v && v->is_bool()) {
             c.allow_mobile_data = v->as_bool();

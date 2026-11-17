@@ -7,7 +7,7 @@
 
 用法：
   python3 scripts/build_libwebrtc.py --platform macos
-  python3 scripts/build_libwebrtc.py --platform linux-x64 --webrtc-branch m144_release
+  python3 scripts/build_libwebrtc.py --platform linux-x64
 """
 
 import argparse
@@ -18,13 +18,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from versions import LIBWEBRTC_SOURCE_BRANCH, LIBWEBRTC_UPSTREAM_TAG
+
 # Windows 默认 cp1252 无法输出中文，强制 UTF-8
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # ── 常量 ──
-LIBWEBRTC_TAG = "libwebrtc.m144.7559.09"
 
 # ── 平台配置 ──
 # 每个平台的 GN 参数由 Python dict 构造，彻底消除 bash 引号转义问题。
@@ -197,7 +198,7 @@ def integrate_libwebrtc(webrtc_src: Path):
     """克隆 webrtc-sdk/libwebrtc 到源码树并打补丁。"""
     libwebrtc_dir = webrtc_src / "libwebrtc"
     if not libwebrtc_dir.exists():
-        run(["git", "clone", "--depth", "1", "--branch", LIBWEBRTC_TAG,
+        run(["git", "clone", "--depth", "1", "--branch", LIBWEBRTC_UPSTREAM_TAG,
              "https://github.com/webrtc-sdk/libwebrtc.git",
              str(libwebrtc_dir)])
 
@@ -403,7 +404,7 @@ def main():
     parser = argparse.ArgumentParser(description="编译 libwebrtc（DataChannel 裁剪版）")
     parser.add_argument("--platform", required=True, choices=PLATFORMS.keys(),
                         help="目标平台")
-    parser.add_argument("--webrtc-branch", default="m144_release",
+    parser.add_argument("--webrtc-branch", default=LIBWEBRTC_SOURCE_BRANCH,
                         help="webrtc-sdk/webrtc 分支")
     parser.add_argument("--temp-dir",
                         default=os.environ.get("DW_TEMP", os.environ.get("RUNNER_TEMP", "/tmp")),
@@ -417,7 +418,7 @@ def main():
     print(f"  平台:       {args.platform}")
     print(f"  目标 OS:    {cfg['target_os']}")
     print(f"  分支:       {args.webrtc_branch}")
-    print(f"  libwebrtc:  {LIBWEBRTC_TAG}")
+    print(f"  libwebrtc:  {LIBWEBRTC_UPSTREAM_TAG}")
     print(f"  临时目录:   {temp_dir}")
 
     # 1. depot_tools

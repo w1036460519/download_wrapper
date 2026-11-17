@@ -132,7 +132,8 @@ namespace dw {
         auto *manager = he::g_task_manager;
         if (!manager) return dw_result<>::failure(DW_REASON_ERROR, "HTTP 引擎未启动");
         std::scoped_lock task_lock(manager->get_mutex());
-        const std::string save_path = manager->config().save_path;
+        const Task *saved_task = replace_record ? nullptr : manager->get_engine_task(url);
+        const std::string save_path = saved_task ? saved_task->save_path : manager->config().save_path;
         if (!validate_add_input(url, save_path.c_str(), &err)) {
             log_e(url, "validate_add_input failed: output={} err={}", save_path, err ? err : "");
             return dw_result<>::failure(DW_REASON_ERROR, err ? err : "输入校验失败");
@@ -199,6 +200,10 @@ namespace dw {
             // 续传回落同一落盘文件：使用 resume 持久化的物理路径。
             // 旧格式无 path 时 full_path 为空，走全量重下路径。
             std::string full_path = rd.full_file_path;
+            if (saved_task && !full_path.empty()) {
+                const auto filename = std::filesystem::path(full_path).filename();
+                full_path = (std::filesystem::path(save_path) / filename).string();
+            }
             // 局部验证打开既有文件（不创建，即开即关；写入由各分片句柄承担）：
             // 文件被外部删除/不可写时打开失败，丢弃续传进度回退全量重下，
             // 避免静默重建空稀疏文件在已下区间留洞。
@@ -246,9 +251,15 @@ namespace dw {
             task.task_id = url;
             task.url = url;
             task.save_path = save_path;
+            manager->assign_download_location(task);
             task.status = DW_TASK_STATUS_DOWNLOADING;
             task.created_at = task.modified_at = utils::now_unix_ms();
-
+            if (!manager->get_task_store().save(task)) {
+                std::scoped_lock lock(he::g_map_mtx);
+                he::g_tasks.erase(url);
+                return dw_result<>::failure(DW_REASON_ERROR, "HTTP 任务保存失败");
+            }
+            if (Task *live = manager->get_engine_task(url)) *live = std::move(task);
         }
         start_task(tCtx);
 

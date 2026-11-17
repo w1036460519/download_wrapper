@@ -17,6 +17,10 @@ LIBTORRENT_VERSION = "2.1.2"
 # Release tag: libwebrtc-{version}
 # 示例: libwebrtc-m144.7559.09
 LIBWEBRTC_VERSION = "m144.7559.09"
+LIBWEBRTC_UPSTREAM_TAG = f"libwebrtc.{LIBWEBRTC_VERSION}"
+LIBWEBRTC_SOURCE_BRANCH = f"{LIBWEBRTC_VERSION.split('.')[0]}_release"
+STOCK_WEBRTC_SOURCE_REF = f"branch-heads/{LIBWEBRTC_VERSION.split('.')[1]}"
+
 
 # download_wrapper 自身版本
 # Release tag: wrapper-v{version}

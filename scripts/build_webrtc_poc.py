@@ -13,7 +13,7 @@ gclient_cmd / setup_depot_tools），仅实现 PoC 专属的取源、GN、打包
 
 用法：
   python3 scripts/build_webrtc_poc.py --temp-dir "$RUNNER_TEMP"
-  python3 scripts/build_webrtc_poc.py --ref branch-heads/7559 --skip-package
+  python3 scripts/build_webrtc_poc.py --skip-package
 """
 
 import argparse
@@ -25,6 +25,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+from versions import STOCK_WEBRTC_SOURCE_REF
 
 # 复用生产脚本中已验证的通用工具，避免重复实现（复用优先）。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -40,8 +42,6 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# 官方源与版本 pin：release 分支 branch-heads/7559 对应 m144。
-DEFAULT_REF = "branch-heads/7559"
 OFFICIAL_SRC_URL = "https://webrtc.googlesource.com/src"
 
 # data-only 最小 ninja 目标：仅依赖工厂入口，媒体模块不会被编译/链接。
@@ -232,7 +232,7 @@ def package_dataonly(webrtc_src: Path, temp_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="stock WebRTC data-only PoC 构建")
-    parser.add_argument("--ref", default=DEFAULT_REF, help="官方源 ref")
+    parser.add_argument("--ref", default=STOCK_WEBRTC_SOURCE_REF, help="官方源 ref")
     parser.add_argument("--temp-dir",
                         default=os.environ.get("DW_TEMP",
                                                os.environ.get("RUNNER_TEMP", "/tmp")))

@@ -369,6 +369,9 @@ DW_API char *get_task(const char *params_json);
  */
 DW_API char *scan_local_file(const char *params_json);
 
+/// 列出 dir_path 下的文件和目录，data 为数组。响应由 release_memory 释放。
+DW_API char *get_files(const char *params_json);
+
 /* ================================================================== */
 /*                          资源释放                                  */
 /* ================================================================== */
