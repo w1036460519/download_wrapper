@@ -395,6 +395,7 @@ namespace dw {
                 std::vector<std::int64_t> progress;
                 h.file_progress(progress);
                 task->files.reserve(files.num_files());
+                lt::piece_index_t last_prioritized{-1};
                 for (int i = 0; i < files.num_files(); ++i) {
                     const lt::file_index_t index{i};
                     if (files.pad_file_at(index)) continue;
@@ -419,6 +420,14 @@ namespace dw {
                                         : 1.0;
                     if (i < static_cast<int>(priorities.size()))
                         file.prioritize = static_cast<std::uint8_t>(priorities[i]);
+                    if (file.prioritize > 0 && file.total_done < file.total_size) {
+                        // 文件起始字节可能落在与前一个文件共享的 piece 中。
+                        const auto first_piece = files.map_file(index, 0, 1).piece;
+                        if (first_piece != last_prioritized && !h.have_piece(first_piece)) {
+                            h.set_piece_deadline(first_piece, 0);
+                            last_prioritized = first_piece;
+                        }
+                    }
                     file.dirty = true;
                 }
                 TaskManager::resolve_task_file_paths(*task);
