@@ -395,7 +395,6 @@ namespace dw {
                 std::vector<std::int64_t> progress;
                 h.file_progress(progress);
                 task->files.reserve(files.num_files());
-                lt::piece_index_t last_prioritized{-1};
                 for (int i = 0; i < files.num_files(); ++i) {
                     const lt::file_index_t index{i};
                     if (files.pad_file_at(index)) continue;
@@ -420,14 +419,6 @@ namespace dw {
                                         : 1.0;
                     if (i < static_cast<int>(priorities.size()))
                         file.prioritize = static_cast<std::uint8_t>(priorities[i]);
-                    if (file.prioritize > 0 && file.total_done < file.total_size) {
-                        // 文件起始字节可能落在与前一个文件共享的 piece 中。
-                        const auto first_piece = files.map_file(index, 0, 1).piece;
-                        if (first_piece != last_prioritized && !h.have_piece(first_piece)) {
-                            h.set_piece_deadline(first_piece, 0);
-                            last_prioritized = first_piece;
-                        }
-                    }
                     file.dirty = true;
                 }
                 TaskManager::resolve_task_file_paths(*task);
@@ -483,9 +474,9 @@ namespace dw {
                                         break;
                                 }
                             }
-                            const bool completed = task->status == DW_TASK_STATUS_COMPLETED;
-                            task->download_rate = completed ? 0.0 : static_cast<double>(s.download_payload_rate);
-                            task->upload_rate = completed ? 0.0 : static_cast<double>(s.upload_payload_rate);
+                            const bool downloading = task->status == DW_TASK_STATUS_DOWNLOADING;
+                            task->download_rate = downloading ? static_cast<double>(s.download_payload_rate) : -1.0;
+                            task->upload_rate = downloading ? static_cast<double>(s.upload_payload_rate) : -1.0;
                             if (previous_status != task->status) {
                                 log_i(info_hash.c_str(), "bt 任务状态 {} -> {} bytes={}/{}",
                                       previous_status, task->status, task->total_done, task->total_size);
@@ -501,8 +492,8 @@ namespace dw {
                 log_e(info_hash.c_str(), "下载完成");
                 if (Task *task = TorrentEngine::get_task(info_hash); task && !task->is_delete) {
                     task->status = DW_TASK_STATUS_COMPLETED;
-                    task->download_rate = 0.0;
-                    task->upload_rate = 0.0;
+                    task->download_rate = -1.0;
+                    task->upload_rate = -1.0;
                     task->dirty = true;
                 }
             }
@@ -727,6 +718,30 @@ namespace dw {
     /* ===================================================================== */
     /*                        TorrentEngine 成员实现                          */
     /* ===================================================================== */
+
+    void TorrentEngine::prioritize_playback(const Task &task, const TaskFile &file,
+                                            int64_t offset, int64_t end) {
+        if (task.status != DW_TASK_STATUS_DOWNLOADING || file.prioritize == 0) return;
+        const auto handle = find_handle(task.task_id, false, false);
+        if (!handle.is_valid()) return;
+        const auto info = handle.torrent_file();
+        if (!info) return;
+        const auto &layout = info->layout();
+        if (file.file_index < 0 || file.file_index >= layout.num_files()) return;
+        const lt::file_index_t index{file.file_index};
+        if (offset < 0 || offset >= layout.file_size(index) || end < offset) return;
+
+        // 限定预读窗口，避免播放器的开放 Range 把整个文件都设成优先。
+        constexpr int64_t lookahead = 1024 * 1024;
+        const auto last_offset = offset + std::min({lookahead - 1, end - offset,
+                                                    layout.file_size(index) - 1 - offset});
+        const int first = static_cast<int>(layout.map_file(index, offset, 1).piece);
+        const int last = static_cast<int>(layout.map_file(index, last_offset, 1).piece);
+        for (int i = first; i <= last; ++i) {
+            const lt::piece_index_t piece{i};
+            if (!handle.have_piece(piece)) handle.set_piece_deadline(piece, (i - first) * 100);
+        }
+    }
 
     std::recursive_mutex &TorrentEngine::tasks_mutex() {
         return g_task_manager->get_mutex();
@@ -985,8 +1000,8 @@ namespace dw {
         } else {
             task.status = DW_TASK_STATUS_RESOLVING;
             task.total_done = 0;
-            task.download_rate = 0;
-            task.upload_rate = 0;
+            task.download_rate = -1.0;
+            task.upload_rate = -1.0;
             task.message.clear();
             for (auto &file: task.files) {
                 file.total_done = 0;
@@ -1174,6 +1189,9 @@ namespace dw {
             }
             handle.unset_flags(lt::torrent_flags::auto_managed);
             handle.pause();
+            task->download_rate = -1.0;
+            task->upload_rate = -1.0;
+            task->dirty = true;
             g_session->post_torrent_updates();
             return dw_result<>::success();
         } catch (const std::exception &e) {

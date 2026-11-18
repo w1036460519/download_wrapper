@@ -3,6 +3,7 @@
  * @brief 统一多协议下载封装库的 C ABI 入口实现。
  */
 
+#include "download_wrapper/playback_proxy.h"
 #include "download_wrapper/download_wrapper.h"
 
 #include "internal/downloader_internal.h"
@@ -167,6 +168,8 @@ DW_API void destroy(void) {
         downloader.log_cb.store(nullptr);
         manager = std::move(downloader.task_manager);
     }
+    // 先结束代理线程，再销毁它查询的任务和引擎。
+    dw_proxy_stop();
     manager.reset();
     {
         std::lock_guard<std::mutex> lock(downloader.mutex);

@@ -35,6 +35,9 @@ public:
     /// 返回已关联任务管理器的递归互斥锁。
     static std::recursive_mutex &tasks_mutex();
 
+    // 调用方持有任务锁。只加急已运行任务中播放器当前等待的小窗口。
+    static void prioritize_playback(const Task &task, const TaskFile &file, int64_t offset, int64_t end);
+
     /// 创建 session 并启动后台线程。
     /// @return 成功返回 0，失败返回 -1。
     int32_t init(const std::vector<std::string> &task_ids = {}) override;

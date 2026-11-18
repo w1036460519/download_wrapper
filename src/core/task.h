@@ -59,8 +59,8 @@ namespace dw {
         bool dirty = false; // 任务有待保存和推送的变化。
         bool resume_dirty = false;
 
-        double download_rate = 0.0; // 实时下载速率（B/s）。
-        double upload_rate = 0.0; // 实时上传速率（B/s）。
+        double download_rate = -1.0; // 实时下载速率（B/s），-1 表示无效。
+        double upload_rate = -1.0; // 实时上传速率（B/s），-1 表示无效。
     };
 
     inline boost::json::object to_json(const Task &r) {
@@ -83,8 +83,8 @@ namespace dw {
         obj["total_done"] = r.total_done;
         // 运行时速率字段：引擎事件已回填（BT=torrent_status、HTTP=分片速率和），
         // 进度回调与列表查询依赖此字段展示实时速率，遗漏会导致上层恒取 -1。
-        obj["download_rate"] = r.download_rate;
-        obj["upload_rate"] = r.upload_rate;
+        obj["download_rate"] = r.status == DW_TASK_STATUS_DOWNLOADING ? r.download_rate : -1.0;
+        obj["upload_rate"] = r.status == DW_TASK_STATUS_DOWNLOADING ? r.upload_rate : -1.0;
         obj["message"] = r.message;
         obj["created_at"] = r.created_at;
         obj["modified_at"] = r.modified_at;
@@ -103,7 +103,7 @@ namespace dw {
             {"task_protocol", static_cast<int>(task.task_protocol)},
             {"name", task.name}, {"save_path", task.save_path}, {"full_path", task.full_path},
             {"status", task.status}, {"total_size", task.total_size}, {"total_done", task.total_done},
-            {"download_rate", task.download_rate}, {"upload_rate", task.upload_rate},
+            {"download_rate", task.status == DW_TASK_STATUS_DOWNLOADING ? task.download_rate : -1.0}, {"upload_rate", task.status == DW_TASK_STATUS_DOWNLOADING ? task.upload_rate : -1.0},
             {"created_at", task.created_at}, {"modified_at", task.modified_at}, {"is_delete", task.is_delete}
         };
     }

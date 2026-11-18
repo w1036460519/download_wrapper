@@ -4,14 +4,15 @@
  *
  * 在 127.0.0.1 随机端口启动 HTTP 服务，接收播放器 Range 请求后：
  *   1. 从 TaskManager 获取文件路径、总大小和已下载区间；
- *   2. 已下载部分直接读文件返回；未下载部分等待后重试；
- *   3. 客户端断开时终止传输与等待。
+ *   2. 已下载部分直接读文件返回；缺片时提高对应 BT 分片的优先级；
+ *   3. 等待超时或传输中断时结束请求。
  *
  * 响应模型：首次发送 206 响应头（含 Content-Range / Content-Length），
  * 后续仅写 body 数据（async_write raw bytes），避免重复发送头部。
  */
 
 #include "download_wrapper/playback_proxy.h"
+#include "torrent/torrent_engine.h"
 
 #include "core/task_manager.h"
 #include "internal/downloader_internal.h"
@@ -44,7 +45,8 @@ using tcp = boost::asio::ip::tcp;
 
 static std::optional<TaskFile> find_playback_file(const std::string &client_id,
                                                   const std::string &task_id,
-                                                  int32_t file_index) {
+                                                  int32_t file_index,
+                                                  int64_t offset = -1, int64_t end = -1) {
     auto *downloader = global_downloader();
     if (!downloader) return std::nullopt;
 
@@ -58,6 +60,13 @@ static std::optional<TaskFile> find_playback_file(const std::string &client_id,
 
     const auto file = std::ranges::find(task->files, file_index, &TaskFile::file_index);
     if (file == task->files.end() || file->is_delete || file->full_path.empty()) return std::nullopt;
+    if (offset >= 0 && task->task_protocol == DW_PROTOCOL_TORRENT && file->total_done < file->total_size) {
+        try {
+            TorrentEngine::prioritize_playback(*task, *file, offset, end);
+        } catch (const std::exception &error) {
+            log_e(task_id.c_str(), "播放分片加急失败: {}", error.what());
+        }
+    }
     return *file;
 }
 
@@ -73,6 +82,7 @@ static std::unique_ptr<net::io_context>    g_ioc;
 static std::unique_ptr<tcp::acceptor>      g_acceptor;
 static std::unique_ptr<std::thread>        g_thread; // 播放代理后台线程：stop 时显式 join
 static std::atomic<bool>         g_running{false};
+static std::mutex                g_lifecycle_mutex;
 
 // ========================================================================
 //  工具函数
@@ -92,7 +102,9 @@ bool parse_range_header(const std::string& value,
     // 解析 start
     auto start_sv = range_spec.substr(0, dash);
     if (start_sv.empty()) return false;
-    if (std::from_chars(start_sv.data(), start_sv.data() + start_sv.size(), out_start).ec != std::errc{})
+    const auto [start_ptr, start_error] =
+        std::from_chars(start_sv.data(), start_sv.data() + start_sv.size(), out_start);
+    if (start_error != std::errc{} || start_ptr != start_sv.data() + start_sv.size() || out_start < 0)
         return false;
 
     // 解析 end（开放区间由 total_size 补齐）
@@ -100,7 +112,9 @@ bool parse_range_header(const std::string& value,
     if (end_sv.empty()) {
         out_end = -1;
     } else {
-        if (std::from_chars(end_sv.data(), end_sv.data() + end_sv.size(), out_end).ec != std::errc{})
+        const auto [end_ptr, end_error] =
+            std::from_chars(end_sv.data(), end_sv.data() + end_sv.size(), out_end);
+        if (end_error != std::errc{} || end_ptr != end_sv.data() + end_sv.size() || out_end < 0)
             return false;
     }
     return true;
@@ -150,6 +164,10 @@ private:
     int64_t total_size_   = -1;
     std::string file_path_;
     bool header_sent_     = false;
+    bool partial_ = false;
+    int64_t prioritized_offset_ = -1;
+    int wait_attempts_ = 0;
+    std::string content_type_ = "application/octet-stream";
 
     net::steady_timer timer_{stream_.get_executor()};
 
@@ -212,47 +230,48 @@ private:
             file_index_ = val;
         }
 
-        // ---- 解析 Range 头 ----
-        auto range_header = req_[http::field::range];
-        if (range_header.empty()) {
-            send_error(http::status::bad_request, "Missing Range header");
+        if (req_.method() != http::verb::get && req_.method() != http::verb::head) {
+            send_error(http::status::method_not_allowed, "Method not allowed");
             return;
         }
-        if (!parse_range_header(std::string(range_header),
-                                range_start_, range_end_)) {
-            send_error(http::status::bad_request, "Invalid Range header");
-            return;
-        }
-
-        // ---- 获取文件路径与总大小 ----
         const auto file = find_playback_file(client_id_, natural_key_, file_index_);
-        if (!file) {
+        if (!file || file->total_size <= 0) {
             send_error(http::status::not_found, "Task or file not found");
             return;
         }
         file_path_ = file->full_path;
         total_size_ = file->total_size;
+        if (file->extension == "mp4" || file->extension == "m4v") content_type_ = "video/mp4";
+        else if (file->extension == "mov") content_type_ = "video/quicktime";
+        else if (file->extension == "webm") content_type_ = "video/webm";
+        else if (file->extension == "mkv") content_type_ = "video/x-matroska";
 
-        // ---- 开放区间补齐 ----
-        if (range_end_ < 0) {
-            if (total_size_ > 0) {
-                range_end_ = total_size_ - 1;
-            } else {
-                // 总大小未知：尝试从文件系统获取
-                std::ifstream f(file_path_, std::ios::ate | std::ios::binary);
-                if (f.is_open() && f.tellg() > 0) {
-                    range_end_ = static_cast<int64_t>(f.tellg()) - 1;
-                } else {
-                    send_error(http::status::internal_server_error,
-                               "Cannot determine file size for open-ended range");
+        const auto range = req_[http::field::range];
+        partial_ = !range.empty();
+        range_end_ = total_size_ - 1;
+        if (partial_) {
+            if (range.starts_with("bytes=-")) {
+                const auto suffix = range.substr(7);
+                int64_t length = 0;
+                const auto [ptr, ec] = std::from_chars(suffix.data(), suffix.data() + suffix.size(), length);
+                if (ec != std::errc{} || ptr != suffix.data() + suffix.size() || length <= 0) {
+                    send_range_error();
                     return;
                 }
+                range_start_ = total_size_ - std::min(length, total_size_);
+            } else if (!parse_range_header(std::string(range), range_start_, range_end_)) {
+                send_range_error();
+                return;
             }
+            if (range_end_ < 0 || range_end_ >= total_size_) range_end_ = total_size_ - 1;
         }
-
-        // ---- 边界检查 ----
-        if (range_start_ > range_end_) {
+        if (range_start_ < 0 || range_start_ > range_end_) {
             send_range_error();
+            return;
+        }
+        log_d(natural_key_.c_str(), "播放 Range file={} bytes={}-{}", file_index_, range_start_, range_end_);
+        if (req_.method() == http::verb::head) {
+            do_write_header();
             return;
         }
 
@@ -279,22 +298,35 @@ private:
             return;
         }
 
-        bool found = false;
-        int64_t seg_end = 0;
-        for (const auto &segment : file->segments) {
-            if (segment.status == SegmentStatus::Downloaded &&
-                current_pos >= segment.start && current_pos <= segment.end) {
-                found = true;
-                seg_end = segment.end;
-                break;
+        bool found = file->total_done >= total_size_;
+        int64_t seg_end = found ? total_size_ - 1 : 0;
+        if (!found) {
+            for (const auto &segment : file->segments) {
+                if (segment.status == SegmentStatus::Downloaded &&
+                    current_pos >= segment.start && current_pos <= segment.end) {
+                    found = true;
+                    seg_end = segment.end;
+                    break;
+                }
             }
         }
 
         // ========== 情况 1：current_pos 未命中任何分段 → 等待 ==========
         if (!found) {
+            if (protocol_ == DW_PROTOCOL_TORRENT && prioritized_offset_ != current_pos) {
+                log_d(natural_key_.c_str(), "播放等待缺片 file={} offset={}", file_index_, current_pos);
+                find_playback_file(client_id_, natural_key_, file_index_, current_pos, range_end_);
+                prioritized_offset_ = current_pos;
+            }
+            if (++wait_attempts_ >= 60) {
+                if (!header_sent_) send_error(http::status::service_unavailable, "Waiting for download");
+                return;
+            }
             wait_for_data(current_pos);
             return;
         }
+
+        wait_attempts_ = 0;
 
         // ========== 情况 2 & 3：current_pos 命中 ==========
         const int64_t send_start = current_pos;
@@ -337,14 +369,15 @@ private:
 
         http::response<http::empty_body> res;
         res.version(11);
-        res.result(http::status::partial_content);
+        res.result(partial_ ? http::status::partial_content : http::status::ok);
         res.set(http::field::accept_ranges, "bytes");
-        res.set(http::field::content_type, "application/octet-stream");
+        res.set(http::field::content_type, content_type_);
+        res.keep_alive(false);
 
         // Content-Range: bytes start-end/total
         const std::string total_str =
             (total_size_ > 0) ? std::to_string(total_size_) : "*";
-        res.set(http::field::content_range,
+        if (partial_) res.set(http::field::content_range,
                 "bytes " + std::to_string(range_start_) + "-" +
                 std::to_string(range_end_) + "/" + total_str);
 
@@ -359,7 +392,7 @@ private:
         http::async_write_header(
             stream_, *header_sr_,
             [self](beast::error_code ec, std::size_t) {
-                if (ec) return; // 客户端断开，不再继续
+                if (ec || self->req_.method() == http::verb::head) return;
                 // header 发送成功，取出暂存的首批 body 数据并发送
                 self->do_write_body(self->pending_next_pos_,
                                     std::move(self->pending_data_));
@@ -496,6 +529,7 @@ namespace net   = boost::asio;
 using tcp = boost::asio::ip::tcp;
 
 int dw_proxy_start(void) {
+    std::scoped_lock lock(dw::playback::g_lifecycle_mutex);
     if (dw::playback::g_running) {
         return dw::playback::g_port;
     }
@@ -504,7 +538,7 @@ int dw_proxy_start(void) {
         dw::playback::g_ioc = std::make_unique<net::io_context>();
         dw::playback::g_acceptor = std::make_unique<tcp::acceptor>(
             *dw::playback::g_ioc,
-            tcp::endpoint(tcp::v4(), 0)); // 随机端口
+            tcp::endpoint(net::ip::address_v4::loopback(), 0)); // 随机端口
 
         dw::playback::g_port =
             dw::playback::g_acceptor->local_endpoint().port();
@@ -525,12 +559,8 @@ int dw_proxy_start(void) {
 }
 
 void dw_proxy_stop(void) {
+    std::scoped_lock lock(dw::playback::g_lifecycle_mutex);
     dw::playback::g_running = false;
-
-    if (dw::playback::g_acceptor) {
-        beast::error_code ec;
-        dw::playback::g_acceptor->close(ec);
-    }
 
     if (dw::playback::g_ioc) {
         dw::playback::g_ioc->stop();
