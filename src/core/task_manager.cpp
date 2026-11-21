@@ -31,6 +31,18 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#if defined(__linux__) && __has_include(<linux/stat.h>)
+#include <fcntl.h>
+#include <linux/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+#endif
+
 namespace dw {
     using utils::now_unix_ms;
 
@@ -416,6 +428,49 @@ namespace dw {
         }
     }
 
+    namespace {
+        void read_file_times(const std::filesystem::path &path, TaskFile &file) {
+#if defined(_WIN32)
+            WIN32_FILE_ATTRIBUTE_DATA attributes{};
+            if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) return;
+            const auto to_unix_ms = [](const FILETIME &time) -> std::optional<int64_t> {
+                const auto ticks = (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+                if (ticks == 0) return std::nullopt;
+                return static_cast<int64_t>(ticks / 10000) - 11644473600000LL;
+            };
+            file.modified_at_ms = to_unix_ms(attributes.ftLastWriteTime);
+            file.created_at_ms = to_unix_ms(attributes.ftCreationTime);
+#else
+            const auto to_unix_ms = [](int64_t seconds, int64_t nanoseconds) {
+                return seconds * 1000 + nanoseconds / 1000000;
+            };
+#if defined(SYS_statx) && defined(STATX_BTIME)
+            struct statx extended_info{};
+            // 旧内核和部分文件系统只提供修改时间，创建时间保持缺省。
+            if (::syscall(SYS_statx, AT_FDCWD, path.c_str(), 0, STATX_MTIME | STATX_BTIME, &extended_info) == 0) {
+                if (extended_info.stx_mask & STATX_BTIME) {
+                    file.created_at_ms = to_unix_ms(extended_info.stx_btime.tv_sec, extended_info.stx_btime.tv_nsec);
+                }
+                if (extended_info.stx_mask & STATX_MTIME) {
+                    file.modified_at_ms = to_unix_ms(extended_info.stx_mtime.tv_sec, extended_info.stx_mtime.tv_nsec);
+                    return;
+                }
+            }
+#endif
+            struct stat info{};
+            if (::stat(path.c_str(), &info) != 0) return;
+#if defined(__APPLE__)
+            file.modified_at_ms = to_unix_ms(info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec);
+            if (info.st_birthtimespec.tv_sec != 0 || info.st_birthtimespec.tv_nsec != 0) {
+                file.created_at_ms = to_unix_ms(info.st_birthtimespec.tv_sec, info.st_birthtimespec.tv_nsec);
+            }
+#else
+            file.modified_at_ms = to_unix_ms(info.st_mtim.tv_sec, info.st_mtim.tv_nsec);
+#endif
+#endif
+        }
+    } // namespace
+
     std::vector<TaskFile> TaskManager::get_files(const std::string &dir_path) const {
         namespace fs = std::filesystem;
         std::scoped_lock lock(mtx_);
@@ -462,6 +517,7 @@ namespace dw {
                 } else {
                     continue;
                 }
+                read_file_times(entry.path(), file);
                 result.push_back(std::move(file));
             }
         } catch (const std::exception &e) {

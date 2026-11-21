@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/json.hpp>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,12 +58,15 @@ namespace dw {
 
         // ---- 非持久化运行时字段 ----
         bool is_dir = false; // 本地目录扫描结果。
+        // 文件系统时间，Unix 毫秒。文件系统未提供时留空。
+        std::optional<int64_t> modified_at_ms;
+        std::optional<int64_t> created_at_ms;
         // 内存中的数据发生变化
         bool dirty = false;
     };
 
     inline boost::json::object to_json(const TaskFile &file) {
-        return {
+        boost::json::object result{
             {"file_index", file.file_index},
             {"name", file.name},
             {"path", file.path},
@@ -78,6 +82,9 @@ namespace dw {
             {"is_read", file.is_read},
             {"is_dir", file.is_dir}
         };
+        if (file.modified_at_ms) result["modified_at_ms"] = *file.modified_at_ms;
+        if (file.created_at_ms) result["created_at_ms"] = *file.created_at_ms;
+        return result;
     }
 
     inline void tag_invoke(boost::json::value_from_tag,
