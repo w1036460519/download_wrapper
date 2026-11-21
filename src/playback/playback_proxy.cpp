@@ -269,7 +269,7 @@ private:
             send_range_error();
             return;
         }
-        log_d(natural_key_.c_str(), "播放 Range file={} bytes={}-{}", file_index_, range_start_, range_end_);
+        log_i(natural_key_.c_str(), "播放 Range file={} bytes={}-{}", file_index_, range_start_, range_end_);
         if (req_.method() == http::verb::head) {
             do_write_header();
             return;
@@ -314,7 +314,6 @@ private:
         // ========== 情况 1：current_pos 未命中任何分段 → 等待 ==========
         if (!found) {
             if (protocol_ == DW_PROTOCOL_TORRENT && prioritized_offset_ != current_pos) {
-                log_d(natural_key_.c_str(), "播放等待缺片 file={} offset={}", file_index_, current_pos);
                 find_playback_file(client_id_, natural_key_, file_index_, current_pos, range_end_);
                 prioritized_offset_ = current_pos;
             }
