@@ -58,6 +58,11 @@ namespace dw {
         const auto previous_upload_rate = config_.upload_rate_limit;
         const bool previous_net_allowed = net_allowed_;
         const bool trackers_changed = config_.trackers != cfg.trackers;
+        const bool proxy_changed = config_.bt_proxy_type != cfg.bt_proxy_type ||
+                                   config_.bt_proxy_host != cfg.bt_proxy_host ||
+                                   config_.bt_proxy_port != cfg.bt_proxy_port ||
+                                   config_.proxy_username != cfg.proxy_username ||
+                                   config_.proxy_password != cfg.proxy_password;
         config_ = cfg;
         for (auto &task: tasks_ | std::views::values) {
             if (task.save_path.empty() && !task.storage_root_id.empty() &&
@@ -79,6 +84,7 @@ namespace dw {
                              changed(previous_download_rate, config_.download_rate_limit),
                              changed(previous_upload_rate, config_.upload_rate_limit),
                              changed(previous_net_allowed, net_allowed_));
+            if (proxy_changed) torrent_->update_proxy(config_);
             if (trackers_changed) torrent_->update_trackers(config_.trackers);
         }
         log_i("", "manager 应用配置[{}]", to_json_string(config_));

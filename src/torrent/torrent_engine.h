@@ -14,6 +14,8 @@
 
 namespace dw {
 
+struct Config;
+
 /// 基于 libtorrent 的 BT 下载引擎。
 class TorrentEngine final : public IDownloadEngine {
 public:
@@ -52,6 +54,8 @@ public:
                 std::optional<bool> network_allowed = std::nullopt) override;
 
     /// 将自定义 Tracker 同步到已经加载的任务。
+    void update_proxy(const Config &cfg);
+
     void update_trackers(const std::vector<std::string> &trackers);
 
     /// 注册并持久化 BT 任务，创建任务句柄。

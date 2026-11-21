@@ -19,6 +19,7 @@
 
 #include <libtorrent/session.hpp>
 #include <libtorrent/settings_pack.hpp>
+#include <libtorrent/socks5_stream.hpp>
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_status.hpp>
@@ -426,6 +427,24 @@ namespace dw {
             }
         }
 
+        bool proxy_authentication_failed(const lt::error_code &error) {
+            return (error.category() == lt::socks_category() &&
+                    error.value() == lt::socks_error::authentication_error) ||
+                   (error.category() == lt::http_category() && error.value() == 407);
+        }
+
+        void report_proxy_authentication(const lt::torrent_handle &handle, const lt::error_code &error) {
+            if (!handle.is_valid()) return;
+            const std::string id = info_hash_hex(handle);
+            Task *task = TorrentEngine::get_task(id);
+            if (!task || task->is_delete) return;
+            const std::string message = "代理认证失败: " + error.message();
+            if (task->message == message) return;
+            task->message = message;
+            task->dirty = true;
+            log_e(id.c_str(), "{}", message);
+        }
+
         // 处理 alert
         void handle_alert(const lt::alert *a) {
             if (!a) return;
@@ -434,6 +453,25 @@ namespace dw {
                 return;
             }
             std::scoped_lock task_lock(g_task_manager->get_mutex());
+
+            if (const auto *proxy = lt::alert_cast<lt::socks5_alert>(a)) {
+                // SOCKS5 会话事件只带代理端点，不能归到某个任务。
+                log_e("", "BT SOCKS5 代理错误: {}", proxy->message());
+                return;
+            }
+            if (const auto *peer = lt::alert_cast<lt::peer_disconnected_alert>(a)) {
+                if (proxy_authentication_failed(peer->error)) report_proxy_authentication(peer->handle, peer->error);
+                return;
+            }
+            if (const auto *peer = lt::alert_cast<lt::peer_error_alert>(a)) {
+                if (proxy_authentication_failed(peer->error)) report_proxy_authentication(peer->handle, peer->error);
+                return;
+            }
+            if (const auto *tracker = lt::alert_cast<lt::tracker_error_alert>(a);
+                tracker && proxy_authentication_failed(tracker->error)) {
+                report_proxy_authentication(tracker->handle, tracker->error);
+                return;
+            }
 
             // 任务状态改变
             if (const auto *su = lt::alert_cast<lt::state_update_alert>(a)) {
@@ -776,6 +814,8 @@ namespace dw {
             pack.set_int(lt::settings_pack::alert_mask,
                          lt::alert_category::error
                          | lt::alert_category::status
+                         | lt::alert_category::connect
+                         | lt::alert_category::peer
                          | lt::alert_category::storage
                          | lt::alert_category::piece_progress);
             pack.set_bool(lt::settings_pack::dont_count_slow_torrents, false);
@@ -793,6 +833,7 @@ namespace dw {
         g_task_manager = task_manager_;
         initialized_ = true;
         const auto &cfg = task_manager_->config();
+        update_proxy(cfg);
         config(cfg.max_concurrent_downloads, cfg.download_rate_limit, cfg.upload_rate_limit,
                cfg.network_type != 0 && (cfg.network_type != 2 || cfg.allow_mobile_data));
 
@@ -854,6 +895,25 @@ namespace dw {
                 g_session->pause();
             }
         }
+    }
+
+    void TorrentEngine::update_proxy(const Config &cfg) {
+        std::scoped_lock lock(tasks_mutex());
+        if (!g_session) return;
+        using Proxy = lt::settings_pack;
+        const bool valid = !cfg.bt_proxy_host.empty() && cfg.bt_proxy_port > 0 && cfg.bt_proxy_port <= 65535;
+        const bool has_credentials = !cfg.proxy_username.empty() || !cfg.proxy_password.empty();
+        int type = Proxy::none;
+        if (valid && cfg.bt_proxy_type == "socks5") type = has_credentials ? Proxy::socks5_pw : Proxy::socks5;
+        if (valid && cfg.bt_proxy_type == "http") type = has_credentials ? Proxy::http_pw : Proxy::http;
+        const bool standard = type != Proxy::none;
+        lt::settings_pack settings;
+        settings.set_int(Proxy::proxy_type, type);
+        settings.set_str(Proxy::proxy_hostname, standard ? cfg.bt_proxy_host : "");
+        settings.set_int(Proxy::proxy_port, standard ? cfg.bt_proxy_port : 0);
+        settings.set_str(Proxy::proxy_username, standard ? cfg.proxy_username : "");
+        settings.set_str(Proxy::proxy_password, standard ? cfg.proxy_password : "");
+        g_session->apply_settings(std::move(settings));
     }
 
     void TorrentEngine::update_trackers(const std::vector<std::string> &trackers) {

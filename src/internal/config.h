@@ -36,6 +36,11 @@ namespace dw {
         int32_t default_parts = 4;
         int64_t min_size_for_split = 1024 * 1024;
 
+        // BT 会话代理。
+        std::string bt_proxy_type;
+        std::string bt_proxy_host;
+        int32_t bt_proxy_port = 0;
+
         // BT 配置
         int32_t listen_port = 6881;
         int32_t max_concurrent_downloads = 5;
@@ -67,8 +72,9 @@ namespace dw {
         obj["low_speed_time"] = c.low_speed_time;
         obj["max_redirect"] = c.max_redirect;
         obj["proxy"] = c.proxy;
-        obj["proxy_username"] = c.proxy_username;
-        obj["proxy_password"] = c.proxy_password;
+        obj["bt_proxy_type"] = c.bt_proxy_type;
+        obj["bt_proxy_host"] = c.bt_proxy_host;
+        obj["bt_proxy_port"] = c.bt_proxy_port;
         obj["user_agent"] = c.user_agent;
         obj["verify_ssl"] = c.verify_ssl;
         obj["ca_bundle"] = c.ca_bundle;
@@ -101,6 +107,9 @@ namespace dw {
         json_util::extract(obj, "low_speed_time", c.low_speed_time);
         json_util::extract(obj, "max_redirect", c.max_redirect);
         json_util::extract(obj, "proxy", c.proxy);
+        json_util::extract(obj, "bt_proxy_type", c.bt_proxy_type);
+        json_util::extract(obj, "bt_proxy_host", c.bt_proxy_host);
+        json_util::extract(obj, "bt_proxy_port", c.bt_proxy_port);
         json_util::extract(obj, "proxy_username", c.proxy_username);
         json_util::extract(obj, "proxy_password", c.proxy_password);
         json_util::extract(obj, "user_agent", c.user_agent);

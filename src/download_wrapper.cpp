@@ -114,7 +114,7 @@ DW_API char *create(void) {
 }
 
 DW_API char *init(const char *config_json) {
-    log_i("", "wrapper 下载器初始化开始 config={}", config_json ? config_json : "(null)");
+    log_i("", "wrapper 下载器初始化开始");
     if (!dw::g_downloader || !config_json || !config_json[0]) {
         return dw::result_to_json(dw::dw_result<>::failure());
     }
@@ -180,7 +180,7 @@ DW_API void destroy(void) {
 }
 
 DW_API char *set_config(const char *config_json) {
-    log_i("", "wrapper 配置开始 config={}", config_json ? config_json : "(null)");
+    log_i("", "wrapper 配置开始");
     std::lock_guard<std::mutex> lock(dw::global_downloader()->mutex);
     if (!dw::global_downloader()->initialized.load()) {
         log_e("", "wrapper 下载器未初始化");
