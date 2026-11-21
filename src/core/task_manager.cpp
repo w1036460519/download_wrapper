@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
@@ -356,6 +357,12 @@ namespace dw {
     }
 
     void TaskManager::maintenance_loop() {
+        const auto append_rate = [](boost::json::array &history, double rate) {
+            constexpr std::size_t sample_capacity = 60;
+            if (!std::isfinite(rate) || rate < 0) return;
+            if (history.size() >= sample_capacity) history.erase(history.begin());
+            history.emplace_back(rate);
+        };
         while (running_.load()) {
             std::vector<std::string> dirty_records;
             {
@@ -400,6 +407,11 @@ namespace dw {
                     }
 
                     if (task.dirty) {
+                        // 下载中的有效速率在 wrapper 采样，详情页是否打开不影响历史。
+                        if (task.status == DW_TASK_STATUS_DOWNLOADING) {
+                            append_rate(task.download_rate_history, task.download_rate);
+                            append_rate(task.upload_rate_history, task.upload_rate);
+                        }
                         if (task_store_.save(task)) {
                             task.dirty = false;
                         } else {

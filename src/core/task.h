@@ -48,6 +48,10 @@ namespace dw {
         bool is_delete = false; // 软删除标记
         bool is_read = false; // 已读标记
 
+        // 最近的有效速率样本，单位为 B/s，由任务表持久化。
+        boost::json::array download_rate_history;
+        boost::json::array upload_rate_history;
+
         // ---- 独立持久化到 task_file 表 ----
         std::vector<TaskFile> files; // 按 file_index 升序保存，同一索引只保留一条记录。
 
@@ -85,6 +89,8 @@ namespace dw {
         // 进度回调与列表查询依赖此字段展示实时速率，遗漏会导致上层恒取 -1。
         obj["download_rate"] = r.status == DW_TASK_STATUS_DOWNLOADING ? r.download_rate : -1.0;
         obj["upload_rate"] = r.status == DW_TASK_STATUS_DOWNLOADING ? r.upload_rate : -1.0;
+        obj["download_rate_history"] = r.download_rate_history;
+        obj["upload_rate_history"] = r.upload_rate_history;
         obj["message"] = r.message;
         obj["created_at"] = r.created_at;
         obj["modified_at"] = r.modified_at;
