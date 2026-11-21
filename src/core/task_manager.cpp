@@ -424,6 +424,8 @@ namespace dw {
                 emit_progress(record.c_str());
             }
 
+            if (torrent_) torrent_->sweep();
+
             std::this_thread::sleep_for(std::chrono::milliseconds(maintenance_interval_ms_));
         }
     }

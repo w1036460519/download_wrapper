@@ -34,7 +34,6 @@ namespace dw {
             g.max_retries = cfg.max_retries >= 0 ? cfg.max_retries : 3;
             g.default_parts = cfg.default_parts > 0 ? cfg.default_parts : 4;
             g.min_size_for_split = cfg.min_size_for_split > 0 ? cfg.min_size_for_split : 1 * 1024 * 1024;
-            g.download_rate_limit = cfg.download_rate_limit > 0 ? cfg.download_rate_limit : 0;
             g.log_level = cfg.log_level >= DW_LOG_DEBUG && cfg.log_level <= DW_LOG_ERROR
                               ? cfg.log_level
                               : DW_LOG_INFO;
