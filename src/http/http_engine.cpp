@@ -250,7 +250,6 @@ namespace dw {
             task.task_id = url;
             task.url = url;
             task.save_path = save_path;
-            manager->assign_download_location(task);
             task.status = DW_TASK_STATUS_DOWNLOADING;
             task.created_at = task.modified_at = utils::now_unix_ms();
             if (!manager->get_task_store().save(task)) {

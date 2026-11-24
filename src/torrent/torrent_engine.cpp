@@ -17,6 +17,8 @@
 #include "utils/string_util.h"
 #include "utils/time_util.h"
 
+#include <boost/beast/core/string.hpp>
+
 #include <libtorrent/session.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/socks5_stream.hpp>
@@ -48,6 +50,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <optional>
 
 namespace lt = libtorrent;
 
@@ -231,28 +234,21 @@ namespace dw {
             const int64_t piece_length = ti->piece_length();
             if (piece_length <= 0) return;
 
-            // 收集 piece 涉及的文件
-            std::vector<TaskFile *> affected;
+            std::optional<lt::torrent_status> status;
             for (const auto &slice: ti->map_block(piece, 0, ti->piece_size(piece))) {
-                if (fs.pad_file_at(slice.file_index)) continue;
-                const auto index = static_cast<int32_t>(slice.file_index);
-                const auto it = std::ranges::find_if(task->files,
-                                                     [index](const TaskFile &file) {
-                                                         return file.file_index == index;
-                                                     });
-                if (it != task->files.end() && it->total_size > 0)
-                    affected.push_back(&*it);
-            }
-            if (affected.empty()) return;
+                const auto index = slice.file_index;
+                if (fs.pad_file_at(index)) continue;
+                const auto file_index = static_cast<int32_t>(index);
+                const auto file = std::ranges::lower_bound(task->files, file_index, {}, &TaskFile::file_index);
+                if (file == task->files.end() || file->file_index != file_index || file->total_size <= 0) continue;
 
-            // 受影响文件共用一次位图查询。
-            const auto status = h.status(lt::torrent_handle::query_pieces);
-            const auto &pieces = status.pieces;
-            for (TaskFile *file: affected) {
-                const lt::file_index_t index{file->file_index};
-                const int64_t offset = fs.file_offset(index);
                 const int64_t size = fs.file_size(index);
                 if (size <= 0) continue;
+                const int64_t offset = fs.file_offset(index);
+
+                // 受影响文件共用一次位图查询。
+                if (!status) status.emplace(h.status(lt::torrent_handle::query_pieces));
+                const auto &pieces = status->pieces;
                 const int64_t end = offset + size - 1;
                 const int first = static_cast<int>(offset / piece_length);
                 const int last = static_cast<int>(end / piece_length);
@@ -376,6 +372,17 @@ namespace dw {
             }
         }
 
+        void raise_piece_priorities(const lt::torrent_handle &handle,
+                                    const int first, const int last, lt::download_priority_t priority,
+                                    std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > &updates) {
+            for (int i = first; i <= last; ++i) {
+                const lt::piece_index_t piece{i};
+                if (!handle.have_piece(piece) && handle.piece_priority(piece) < priority) {
+                    updates.emplace_back(piece, priority);
+                }
+            }
+        }
+
         void handle_files(const lt::torrent_handle &h) {
             const std::string info_hash = info_hash_hex(h);
             if (info_hash.empty()) return;
@@ -389,12 +396,14 @@ namespace dw {
                 log_e(info_hash.c_str(), "任务不存在或已删除，跳过任务解析");
                 return;
             }
-
+            const auto save_path = std::filesystem::path(task->save_path).lexically_normal();
             if (const auto ti = h.torrent_file(); ti) {
                 const auto &files = ti->layout();
                 const auto priorities = h.get_file_priorities();
                 std::vector<std::int64_t> progress;
-                h.file_progress(progress);
+                h.file_progress(progress, lt::torrent_handle::piece_granularity);
+                constexpr int64_t prefetch_bytes = 4 * 1024 * 1024;
+                std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > prefetch;
                 task->files.reserve(files.num_files());
                 for (int i = 0; i < files.num_files(); ++i) {
                     const lt::file_index_t index{i};
@@ -406,8 +415,10 @@ namespace dw {
                     }
                     auto &file = *entry;
                     file.task_id = info_hash;
-                    file.path = files.file_path(index);
-                    file.name = std::filesystem::path(file.path).filename().string();
+                    const auto path = std::filesystem::path(files.file_path(index));
+                    file.path = path.lexically_normal().generic_string();
+                    file.full_path = (save_path / path).lexically_normal().generic_string();
+                    file.name = path.filename().string();
                     file.extension = utils::file_extension(file.path);
                     file.total_size = files.file_size(index);
                     if (i < static_cast<int>(progress.size())) {
@@ -420,9 +431,30 @@ namespace dw {
                                         : 1.0;
                     if (i < static_cast<int>(priorities.size()))
                         file.prioritize = static_cast<std::uint8_t>(priorities[i]);
+                    // 需下载 大于8MB 后缀mp4 未完成 -> 将前后4MB的piece设置为优先下载
+                    if (!file.is_delete && file.prioritize != 0
+                        && boost::beast::iequals(file.extension, "mp4")
+                        && file.total_size >= 2 * prefetch_bytes
+                        && file.total_done < file.total_size) {
+                        const auto piece_at = [&](const int64_t offset) {
+                            return static_cast<int>(files.map_file(index, offset, 1).piece);
+                        };
+                        const int head_end = piece_at(prefetch_bytes - 1);
+                        raise_piece_priorities(h, piece_at(0), head_end, lt::top_priority, prefetch);
+                        raise_piece_priorities(h, std::max(head_end + 1, piece_at(file.total_size - prefetch_bytes)),
+                                               piece_at(file.total_size - 1), lt::top_priority, prefetch);
+                    }
                     file.dirty = true;
                 }
-                TaskManager::resolve_task_file_paths(*task);
+                if (!prefetch.empty()) {
+                    std::ranges::sort(prefetch);
+                    const auto duplicates = std::ranges::unique(prefetch);
+                    prefetch.erase(duplicates.begin(), duplicates.end());
+                    h.prioritize_pieces(prefetch);
+                }
+
+                task->file_type = task->files.size() != 1;
+                task->ext = task->file_type ? std::string{} : task->files.front().extension;
                 task->dirty = true;
             }
         }
@@ -624,20 +656,7 @@ namespace dw {
                 const std::string info_hash = info_hash_hex(rd->handle);
                 if (rd->handle.is_valid() && rd->handle.status().has_metadata) {
                     try {
-                        // 自定义 Tracker 由应用配置恢复，避免续传数据保留失效的设置。
-                        const auto trackers = rd->handle.trackers();
-                        auto params = rd->params;
-                        for (std::size_t i = params.trackers.size(); i > 0; --i) {
-                            const auto tracker = std::ranges::find(trackers, params.trackers[i - 1],
-                                                                   &lt::announce_entry::url);
-                            if (tracker == trackers.end() || tracker->source == lt::announce_entry::source_client) {
-                                params.trackers.erase(params.trackers.begin() + (i - 1));
-                                if (i <= params.tracker_tiers.size()) {
-                                    params.tracker_tiers.erase(params.tracker_tiers.begin() + (i - 1));
-                                }
-                            }
-                        }
-                        if (const std::vector<char> buf = lt::write_resume_data_buf(params); !buf.empty()) {
+                        if (const std::vector<char> buf = lt::write_resume_data_buf(rd->params); !buf.empty()) {
                             if (Task *task = TorrentEngine::get_task(info_hash); task && !task->is_delete) {
                                 task->resume_data = {buf.begin(), buf.end()};
                                 task->resume_dirty = true;
@@ -758,7 +777,7 @@ namespace dw {
     /* ===================================================================== */
 
     void TorrentEngine::prioritize_playback(const Task &task, const TaskFile &file,
-                                            int64_t offset, int64_t end) {
+                                            const int64_t offset, const int64_t end) {
         if (task.status != DW_TASK_STATUS_DOWNLOADING || file.prioritize == 0) return;
         const auto handle = find_handle(task.task_id, false, false);
         if (!handle.is_valid()) return;
@@ -769,16 +788,14 @@ namespace dw {
         const lt::file_index_t index{file.file_index};
         if (offset < 0 || offset >= layout.file_size(index) || end < offset) return;
 
-        // 限定预读窗口，避免播放器的开放 Range 把整个文件都设成优先。
-        constexpr int64_t lookahead = 1024 * 1024;
-        const auto last_offset = offset + std::min({lookahead - 1, end - offset,
-                                                    layout.file_size(index) - 1 - offset});
+        constexpr int max_pieces = 20;
+        const auto last_offset = std::min(end, layout.file_size(index) - 1);
         const int first = static_cast<int>(layout.map_file(index, offset, 1).piece);
         const int last = static_cast<int>(layout.map_file(index, last_offset, 1).piece);
-        for (int i = first; i <= last; ++i) {
-            const lt::piece_index_t piece{i};
-            if (!handle.have_piece(piece)) handle.set_piece_deadline(piece, (i - first) * 100);
-        }
+        std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > updates;
+        raise_piece_priorities(handle, first, first + std::min(last - first, max_pieces - 1),
+                               lt::download_priority_t{5}, updates);
+        if (!updates.empty()) handle.prioritize_pieces(updates);
     }
 
     std::recursive_mutex &TorrentEngine::tasks_mutex() {
@@ -1012,35 +1029,29 @@ namespace dw {
         Task new_task;
         Task &task = existing_task ? *existing_task : new_task;
 
-        const std::string root_id = task.storage_root_id.empty()
-            ? g_task_manager->config().default_download_root : task.storage_root_id;
-        std::string relative_save_path = task.relative_save_path;
+        namespace fs = std::filesystem;
+        // 新任务先确定落盘目录，已有任务继续使用创建时确定的目录。
+        fs::path save_path = existing_task ? existing_task->save_path : g_task_manager->config().save_path;
+        if (!save_path.is_absolute()) {
+            return dw_result<>::failure(DW_REASON_ERROR, "保存位置不可访问");
+        }
         if (!existing_task) {
-            const std::filesystem::path base = g_task_manager->resolve_save_path(root_id, "");
-            const auto filename = std::filesystem::path(atp.ti ? atp.ti->name() : atp.name).filename();
+            const auto filename = fs::path(atp.ti ? atp.ti->name() : atp.name).filename();
             if (std::error_code ec;
-                !base.empty() && !filename.empty() && filename != "." && filename != ".." &&
-                std::filesystem::exists(base / filename, ec)) {
+                !filename.empty() && filename != "." && filename != ".." && fs::exists(save_path / filename, ec)) {
                 const auto stem = filename.stem().string();
                 for (int32_t i = 1; i < 10000; ++i) {
-                    const auto subdirectory = stem + "(" + std::to_string(i) + ")";
-                    const bool occupied = std::filesystem::exists(base / subdirectory, ec);
+                    const auto candidate = save_path / (stem + "(" + std::to_string(i) + ")");
+                    const bool occupied = fs::exists(candidate, ec);
                     if (ec) break;
                     if (!occupied) {
-                        relative_save_path = subdirectory;
+                        save_path = candidate;
                         break;
                     }
                 }
             }
         }
-        auto save_path = g_task_manager->resolve_save_path(root_id, relative_save_path);
-        if (save_path.empty()) {
-            return dw_result<>::failure(DW_REASON_ERROR, "保存位置不可访问");
-        }
-
-        task.storage_root_id = root_id;
-        task.relative_save_path = std::move(relative_save_path);
-        task.save_path = std::move(save_path);
+        task.save_path = save_path.lexically_normal().generic_string();
 
         task.name = atp.ti ? atp.ti->name() : atp.name;
         task.client_id = params->client_id;
@@ -1092,12 +1103,7 @@ namespace dw {
                 return dw_result<>::failure();
             }
 
-            const auto storage = handle.status(lt::torrent_handle::query_save_path);
-            if (std::filesystem::path(storage.save_path).lexically_normal() !=
-                std::filesystem::path(registered_task->save_path).lexically_normal()) {
-                // 已加载的任务也切换到新目录，并重新检查目标目录中的文件。
-                handle.move_storage(registered_task->save_path, lt::move_flags_t::reset_save_path);
-            } else if (existing_task) {
+            if (existing_task) {
                 // 重新校验磁盘文件，让引擎用实际数据重建进度。
                 handle.force_recheck();
             }

@@ -21,10 +21,7 @@ namespace dw {
         std::string client_id; // 客户端标识
         bool is_remote = false; // 远程标识
         std::string name; // 任务名称
-        std::string storage_root_id;
-        std::string relative_save_path;
         std::string save_path; // 保存路径
-        std::string full_path; // 磁盘根实体全路径；占位空串，PARSED 回填
         bool file_type = true; // true=目录 false=文件
         std::string ext; // 文件后缀（不含点，如 "mp4"）；目录为空
 
@@ -74,7 +71,6 @@ namespace dw {
         obj["is_remote"] = r.is_remote;
         obj["name"] = r.name;
         obj["save_path"] = r.save_path;
-        obj["full_path"] = r.full_path;
         obj["file_type"] = r.file_type;
         obj["ext"] = r.ext;
         obj["url"] = r.url;
@@ -107,7 +103,7 @@ namespace dw {
         return {
             {"task_id", task.task_id}, {"client_id", task.client_id},
             {"task_protocol", static_cast<int>(task.task_protocol)},
-            {"name", task.name}, {"save_path", task.save_path}, {"full_path", task.full_path},
+            {"name", task.name}, {"save_path", task.save_path}, {"file_type", task.file_type}, {"ext", task.ext},
             {"status", task.status}, {"total_size", task.total_size}, {"total_done", task.total_done},
             {"download_rate", task.status == DW_TASK_STATUS_DOWNLOADING ? task.download_rate : -1.0}, {"upload_rate", task.status == DW_TASK_STATUS_DOWNLOADING ? task.upload_rate : -1.0},
             {"created_at", task.created_at}, {"modified_at", task.modified_at}, {"is_delete", task.is_delete}

@@ -12,7 +12,7 @@ namespace dw {
         constexpr char task_select[] = R"SQL(
             SELECT file_index, name, path, total_size, total_done,
                    progress, segments, extension, prioritize, is_delete, is_read, task_id,
-                   storage_root_id, relative_save_path
+                   full_path
             FROM task_file
         )SQL";
 
@@ -29,8 +29,7 @@ namespace dw {
             col_is_delete,
             col_is_read,
             col_task_id,
-            col_storage_root_id,
-            col_relative_save_path,
+            col_full_path,
         };
 
         TaskFile read_task_file(sqlite3_stmt *statement) {
@@ -39,8 +38,7 @@ namespace dw {
             file.file_index = sqlite3_column_int(statement, col_file_index);
             file.name = column_text(statement, col_name);
             file.path = column_text(statement, col_path);
-            file.storage_root_id = column_text(statement, col_storage_root_id);
-            file.relative_save_path = column_text(statement, col_relative_save_path);
+            file.full_path = column_text(statement, col_full_path);
             file.total_size = sqlite3_column_int64(statement, col_total_size);
             file.total_done = sqlite3_column_int64(statement, col_total_done);
             file.progress = sqlite3_column_double(statement, col_progress);
@@ -91,8 +89,7 @@ namespace dw {
                    sqlite3_bind_int(statement, param(":file_index"), file.file_index) == SQLITE_OK &&
                    bind_text(statement, ":name", file.name) &&
                    bind_text(statement, ":path", file.path) &&
-                   bind_text(statement, ":storage_root_id", file.storage_root_id) &&
-                   bind_text(statement, ":relative_save_path", file.relative_save_path) &&
+                   bind_text(statement, ":full_path", file.full_path) &&
                    sqlite3_bind_int64(statement, param(":total_size"), file.total_size) == SQLITE_OK &&
                    sqlite3_bind_int64(statement, param(":total_done"), file.total_done) == SQLITE_OK &&
                    sqlite3_bind_double(statement, param(":progress"), file.progress) == SQLITE_OK &&
@@ -115,8 +112,7 @@ namespace dw {
                 file_index INTEGER NOT NULL,
                 name TEXT NOT NULL DEFAULT '',
                 path TEXT NOT NULL DEFAULT '',
-                storage_root_id TEXT NOT NULL DEFAULT '',
-                relative_save_path TEXT NOT NULL DEFAULT '',
+                full_path TEXT NOT NULL DEFAULT '',
                 total_size INTEGER NOT NULL DEFAULT 0,
                 total_done INTEGER NOT NULL DEFAULT 0,
                 progress REAL NOT NULL DEFAULT 0,
@@ -127,6 +123,8 @@ namespace dw {
                 is_read INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(task_id, file_index)
             );
+            CREATE INDEX IF NOT EXISTS task_file_full_path
+                ON task_file(full_path, task_id, file_index) WHERE is_delete=0;
         )SQL", nullptr, nullptr, nullptr) == SQLITE_OK;
     }
 
@@ -140,16 +138,16 @@ namespace dw {
         sqlite3_stmt *statement = nullptr;
         if (sqlite3_prepare_v2(db_,
                                R"SQL(
-                INSERT INTO task_file(task_id,file_index,name,path,storage_root_id,relative_save_path,
+                INSERT INTO task_file(task_id,file_index,name,path,full_path,
                                       total_size,total_done,
                                       progress,segments,extension,prioritize,is_delete,is_read)
-                SELECT :task_id,:file_index,:name,:path,:storage_root_id,:relative_save_path,
+                SELECT :task_id,:file_index,:name,:path,:full_path,
                        :total_size,:total_done,
                        :progress,:segments,:extension,:prioritize,:is_delete,:is_read
                 WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE task_id=:task_id AND is_delete=1)
                 ON CONFLICT(task_id,file_index) DO UPDATE SET
                     name=excluded.name, path=excluded.path,
-                    storage_root_id=excluded.storage_root_id, relative_save_path=excluded.relative_save_path,
+                    full_path=excluded.full_path,
                     total_size=excluded.total_size, total_done=excluded.total_done,
                     progress=excluded.progress, segments=excluded.segments,
                     extension=excluded.extension, prioritize=excluded.prioritize,
@@ -160,7 +158,7 @@ namespace dw {
         const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement_guard(statement, &sqlite3_finalize);
         bool success = true;
         for (const auto &file: files) {
-            if (file.task_id.empty() || file.storage_root_id.empty() || file.file_index < 0) {
+            if (file.task_id.empty() || file.file_index < 0) {
                 success = false;
                 continue;
             }
@@ -189,26 +187,16 @@ namespace dw {
         return result;
     }
 
-    std::vector<TaskFile> TaskFileStore::find_candidates(const std::string &name,
-                                                         const int limit,
-                                                         const int64_t offset) const {
+    bool TaskFileStore::find_by_full_path(const std::string &path, TaskFile &file) const {
         std::scoped_lock lock(mutex_);
-        std::vector<TaskFile> result;
-        const std::string sql = std::string(task_select) +
-                                " WHERE is_delete=0 AND name=:name ORDER BY task_id, file_index LIMIT :limit OFFSET :offset";
+        const auto sql = std::string(task_select) +
+                         " WHERE is_delete=0 AND full_path=:path ORDER BY task_id, file_index LIMIT 1";
         sqlite3_stmt *statement = nullptr;
-        if (!db_ || sqlite3_prepare_v2(db_, sql.c_str(), -1, &statement, nullptr) != SQLITE_OK) return result;
+        if (!db_ || sqlite3_prepare_v2(db_, sql.c_str(), -1, &statement, nullptr) != SQLITE_OK) return false;
         const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> guard(statement, &sqlite3_finalize);
-        if (!bind_text(statement, ":name", name) ||
-            sqlite3_bind_int(statement, sqlite3_bind_parameter_index(statement, ":limit"), limit) != SQLITE_OK ||
-            sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":offset"), offset) != SQLITE_OK) {
-            return result;
-        }
-
-        int status;
-        while ((status = sqlite3_step(statement)) == SQLITE_ROW) result.push_back(read_task_file(statement));
-        if (status != SQLITE_DONE) result.clear();
-        return result;
+        if (!bind_text(statement, ":path", path) || sqlite3_step(statement) != SQLITE_ROW) return false;
+        file = read_task_file(statement);
+        return true;
     }
 
     bool TaskFileStore::delete_task(const std::string &task_id) const {

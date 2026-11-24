@@ -28,8 +28,11 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <memory>
 #include <ranges>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #if defined(_WIN32)
@@ -66,6 +69,9 @@ namespace dw {
             return dw_result<>::failure();
         }
         std::scoped_lock lock(mtx_);
+        if (running_.load() && !cfg.path_replacements.empty()) {
+            return dw_result<>::failure(DW_REASON_ERROR, "更新存储路径需要重新启动下载器");
+        }
         const auto previous_downloads = config_.max_concurrent_downloads;
         const auto previous_download_rate = config_.download_rate_limit;
         const auto previous_upload_rate = config_.upload_rate_limit;
@@ -77,15 +83,6 @@ namespace dw {
                                    config_.proxy_username != cfg.proxy_username ||
                                    config_.proxy_password != cfg.proxy_password;
         config_ = cfg;
-        for (auto &task: tasks_ | std::views::values) {
-            if (task.save_path.empty() && !task.storage_root_id.empty() &&
-                config_.storage_roots.contains(task.storage_root_id)) {
-                if (Task stored; task_store_.find_by_task_id(task.task_id, stored)) {
-                    task.full_path = std::move(stored.full_path);
-                }
-                resolve_download_location(task);
-            }
-        }
         if (config_.max_concurrent_downloads < 0) config_.max_concurrent_downloads = 3;
         net_allowed_ = config_.network_type != 0 &&
                        (config_.network_type != 2 || config_.allow_mobile_data);
@@ -104,9 +101,138 @@ namespace dw {
         return dw_result<>::success();
     }
 
+    namespace {
+        bool under_directory(const std::string_view path, const std::string_view directory) {
+            return path.starts_with(directory) &&
+                   (path.size() == directory.size() || directory.back() == '/' || path[directory.size()] == '/');
+        }
+
+        bool replace_storage_paths(sqlite3 *db, const std::map<std::string, std::string> &requested) {
+            if (requested.empty()) return true;
+            namespace fs = std::filesystem;
+            std::map<std::string, std::string> normalized;
+            const auto normalize = [](const std::string &value) {
+                auto path = fs::path(value).lexically_normal();
+                if (!path.is_absolute()) return std::string{};
+                if (!path.has_filename() && path != path.root_path()) path = path.parent_path();
+                return path.generic_string();
+            };
+            for (const auto &[previous, current]: requested) {
+                const auto source = normalize(previous);
+                const auto target = normalize(current);
+                if (source.empty() || target.empty()) return false;
+                if (source != target) {
+                    if (const auto [entry, inserted] = normalized.emplace(source, target);
+                        !inserted && entry->second != target)
+                        return false;
+                }
+            }
+            if (normalized.empty()) return true;
+            std::vector<std::pair<std::string, std::string> > replacements(normalized.begin(), normalized.end());
+            // 长路径排在前面
+            std::ranges::sort(replacements, [](const auto &left, const auto &right) {
+                return left.first.size() > right.first.size();
+            });
+
+            const auto replacement_for = [&](const std::string_view path) {
+                for (const auto &[source, target]: replacements) {
+                    if (!under_directory(path, source)) continue;
+                    auto suffix = path.substr(source.size());
+                    if (suffix.starts_with('/')) suffix.remove_prefix(1);
+                    return suffix.empty() ? target : (fs::path(target) / suffix).generic_string();
+                }
+                return std::string{};
+            };
+
+            const auto check = [db](const bool success) {
+                if (!success) throw std::runtime_error(sqlite3_errmsg(db));
+            };
+            const auto execute = [db, &check](const char *sql) {
+                check(sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+            };
+            const auto prepare = [db, &check](const char *sql) {
+                sqlite3_stmt *raw = nullptr;
+                const int result = sqlite3_prepare_v2(db, sql, -1, &raw, nullptr);
+                constexpr auto finalize = &sqlite3_finalize;
+                std::unique_ptr<sqlite3_stmt, decltype(finalize)> statement(raw, finalize);
+                check(result == SQLITE_OK);
+                return statement;
+            };
+            const auto replace_batches = [&](const char *query, const char *update) {
+                const auto select = prepare(query);
+                const auto write = prepare(update);
+                constexpr int batch_size = 200;
+                std::vector<std::pair<sqlite3_int64, std::string> > changes;
+                changes.reserve(batch_size);
+                sqlite3_int64 last_row = std::numeric_limits<sqlite3_int64>::min();
+                int rows;
+                do {
+                    changes.clear();
+                    check(sqlite3_bind_int64(select.get(), 1, last_row) == SQLITE_OK);
+                    check(sqlite3_bind_int(select.get(), 2, batch_size) == SQLITE_OK);
+                    rows = 0;
+                    int step;
+                    while ((step = sqlite3_step(select.get())) == SQLITE_ROW) {
+                        ++rows;
+                        last_row = sqlite3_column_int64(select.get(), 0);
+                        const auto *raw = sqlite3_column_text(select.get(), 1);
+                        if (!raw) continue;
+                        const std::string_view path(reinterpret_cast<const char *>(raw));
+                        auto updated = replacement_for(path);
+                        if (!updated.empty() && updated != path) {
+                            changes.emplace_back(last_row, std::move(updated));
+                        }
+                    }
+                    check(step == SQLITE_DONE);
+                    check(sqlite3_reset(select.get()) == SQLITE_OK);
+
+                    for (const auto &[row, path]: changes) {
+                        check(sqlite3_bind_text(write.get(), 1, path.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+                        check(sqlite3_bind_int64(write.get(), 2, row) == SQLITE_OK);
+                        check(sqlite3_step(write.get()) == SQLITE_DONE);
+                        check(sqlite3_reset(write.get()) == SQLITE_OK);
+                    }
+                } while (rows == batch_size);
+            };
+
+            bool transaction_started = false;
+            try {
+                execute("BEGIN IMMEDIATE");
+                transaction_started = true;
+                replace_batches(
+                    "SELECT rowid, save_path FROM tasks WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                    "UPDATE tasks SET save_path = ?1 WHERE rowid = ?2");
+                replace_batches(
+                    "SELECT rowid, full_path FROM task_file WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                    "UPDATE task_file SET full_path = ?1 WHERE rowid = ?2");
+
+                // 播放进度表没有 rowid，且路径属于主键。用原主键快照分页。
+                execute(R"SQL(
+                    CREATE TEMP TABLE storage_playback_keys AS
+                    SELECT directory_path, file_name FROM playback_progress
+                )SQL");
+                replace_batches(
+                    "SELECT rowid, directory_path FROM temp.storage_playback_keys WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                    R"SQL(
+                        UPDATE playback_progress SET directory_path = ?1
+                        WHERE (directory_path, file_name) = (
+                            SELECT directory_path, file_name FROM temp.storage_playback_keys WHERE rowid = ?2
+                        )
+                    )SQL");
+                execute("DROP TABLE temp.storage_playback_keys");
+                execute("COMMIT");
+                return true;
+            } catch (const std::exception &error) {
+                log_e("", "更新存储路径失败: {}", error.what());
+                if (transaction_started) sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                return false;
+            }
+        }
+    } // namespace
+
     dw_result<> TaskManager::init() {
         const std::string dir = !config_.work_dir.empty() ? config_.work_dir : ".";
-        const std::string story_path = dir + "/leopard_tasks.db";
+        const std::string story_path = dir + "/leopard_tasks_absolute.db";
 
         std::unique_lock lock(mtx_);
         if (running_.load()) {
@@ -118,11 +244,16 @@ namespace dw {
             return dw_result<>::failure();
         }
         if (!task_store_.init_schema() || !task_file_store_.init_schema() ||
-            !task_resume_store_.init_schema()) {
+            !task_resume_store_.init_schema() || !playback_progress_store_.init_schema()) {
             log_e("", "manager 数据任务初始化失败");
             database_.close();
             return dw_result<>::failure();
         }
+        if (!replace_storage_paths(database_.connection(), config_.path_replacements)) {
+            database_.close();
+            return dw_result<>::failure(DW_REASON_ERROR, "无法更新存储路径");
+        }
+        config_.path_replacements.clear();
         const std::vector<Task> all_tasks = task_store_.find_all();
         std::vector<std::string> torrent_task_ids;
         for (auto &task: all_tasks) {
@@ -239,73 +370,6 @@ namespace dw {
         return dw_result<>::failure();
     }
 
-    void TaskManager::assign_download_location(Task &task) const {
-        std::scoped_lock lock(mtx_);
-        task.storage_root_id.clear();
-        task.relative_save_path.clear();
-        if (const auto root = config_.storage_roots.find(config_.default_download_root);
-            root != config_.storage_roots.end()) {
-            const auto relative = std::filesystem::path(task.save_path).lexically_normal()
-                    .lexically_relative(std::filesystem::path(root->second).lexically_normal());
-            if (!relative.empty() && !relative.is_absolute() && *relative.begin() != "..") {
-                task.storage_root_id = root->first;
-                if (relative != ".") task.relative_save_path = relative.generic_string();
-            }
-        }
-    }
-
-    void TaskManager::resolve_task_file_paths(Task &task) {
-        namespace fs = std::filesystem;
-        fs::path common_root;
-        bool has_file = false;
-        bool single_root = true;
-        for (auto &file: task.files) {
-            file.full_path.clear();
-            const auto relative = fs::path(file.path).lexically_normal();
-            if (file.is_delete || task.save_path.empty() || relative.empty() || relative == "." ||
-                relative.has_root_path() || *relative.begin() == "..")
-                continue;
-            file.full_path = (fs::path(task.save_path) / relative).string();
-            if (!has_file) {
-                common_root = *relative.begin();
-                has_file = true;
-            } else if (*relative.begin() != common_root) {
-                single_root = false;
-            }
-        }
-        if (task.save_path.empty()) task.full_path.clear();
-        else if (has_file) {
-            task.full_path = single_root ? (fs::path(task.save_path) / common_root).string() : task.save_path;
-        }
-    }
-
-    std::string TaskManager::resolve_save_path(const std::string &root_id, const std::string &subdirectory) const {
-        namespace fs = std::filesystem;
-        const auto root = config_.storage_roots.find(root_id);
-        const auto relative = fs::path(subdirectory).lexically_normal();
-        if (root_id.empty() || root == config_.storage_roots.end() || !fs::path(root->second).is_absolute() ||
-            relative.has_root_path() || (!relative.empty() && *relative.begin() == "..")) {
-            return {};
-        }
-        return relative.empty() ? root->second : (fs::path(root->second) / relative).string();
-    }
-
-    void TaskManager::resolve_download_location(Task &task) const {
-        namespace fs = std::filesystem;
-        const fs::path previous = task.save_path;
-        task.save_path = resolve_save_path(task.storage_root_id, task.relative_save_path);
-        if (previous != task.save_path) {
-            const auto relative_full_path = task.full_path.empty() || previous.empty()
-                                                ? fs::path(task.full_path)
-                                                : fs::path(task.full_path).lexically_relative(previous);
-            task.full_path = task.save_path.empty() || relative_full_path.empty() || relative_full_path.has_root_path()
-                             || *relative_full_path.begin() == ".."
-                                 ? ""
-                                 : (fs::path(task.save_path) / relative_full_path).string();
-        }
-        resolve_task_file_paths(task);
-    }
-
     Task *TaskManager::get_engine_task(const std::string &key) {
         std::scoped_lock lock(mtx_);
         if (const auto it = tasks_.find(key); it != tasks_.end())
@@ -316,7 +380,6 @@ namespace dw {
             return nullptr;
         }
         task.files = task_file_store_.get(key);
-        resolve_download_location(task);
         return &tasks_.try_emplace(key, std::move(task)).first->second;
     }
 
@@ -332,15 +395,12 @@ namespace dw {
         }
         if (!task_store_.find_by_task_id(task_id, out)) return false;
         out.files = task_file_store_.get(task_id);
-        resolve_download_location(out);
         return true;
     }
 
     std::vector<Task> TaskManager::list() {
         std::scoped_lock lock(mtx_);
-        auto tasks = task_store_.find_all();
-        for (auto &task: tasks) resolve_download_location(task);
-        return tasks;
+        return task_store_.find_all();
     }
 
     /* ================================================================== */
@@ -397,8 +457,6 @@ namespace dw {
                     }
                     for (auto &file: task.files) {
                         if (!file.dirty) continue;
-                        file.storage_root_id = task.storage_root_id;
-                        file.relative_save_path = task.relative_save_path;
                         if (task_file_store_.save(file)) {
                             file.dirty = false;
                         } else {
@@ -491,42 +549,28 @@ namespace dw {
         std::vector<TaskFile> result;
         try {
             if (!fs::is_directory(dir_path)) return result;
-            const auto directory = fs::absolute(dir_path).lexically_normal();
-            constexpr int page_size = 32;
 
-            for (const auto &entry: fs::directory_iterator(directory)) {
+            for (const auto directory = fs::absolute(dir_path).lexically_normal();
+                 const auto &entry: fs::directory_iterator(directory)) {
                 const auto name = entry.path().filename().string();
                 TaskFile file;
                 file.path = name;
-                file.full_path = entry.path().string();
+                file.full_path = entry.path().lexically_normal().generic_string();
                 file.name = name;
                 if (entry.is_directory()) {
                     file.is_dir = true;
                 } else if (entry.is_regular_file()) {
                     file.total_size = static_cast<int64_t>(entry.file_size());
                     file.extension = utils::file_extension(name);
-                    for (int64_t offset = 0; file.task_id.empty(); offset += page_size) {
-                        auto candidates = task_file_store_.find_candidates(name, page_size, offset);
-                        for (auto &candidate: candidates) {
-                            const auto save_path = resolve_save_path(candidate.storage_root_id,
-                                                                     candidate.relative_save_path);
-                            const auto relative = fs::path(candidate.path).lexically_normal();
-                            if (save_path.empty() || relative.empty() || relative == "." ||
-                                relative.has_root_path() || *relative.begin() == ".." ||
-                                (fs::path(save_path) / relative).lexically_normal() != entry.path())
-                                continue;
-
-                            file.task_id = std::move(candidate.task_id);
-                            file.file_index = candidate.file_index;
-                            file.prioritize = candidate.prioritize;
-                            file.is_read = candidate.is_read;
-                            file.total_done = std::max<int64_t>(0, candidate.total_done);
-                            file.total_size = std::max(file.total_size, file.total_done);
-                            file.progress = candidate.progress;
-                            file.segments = std::move(candidate.segments);
-                            break;
-                        }
-                        if (candidates.size() < page_size) break;
+                    if (TaskFile candidate; task_file_store_.find_by_full_path(file.full_path, candidate)) {
+                        file.task_id = std::move(candidate.task_id);
+                        file.file_index = candidate.file_index;
+                        file.prioritize = candidate.prioritize;
+                        file.is_read = candidate.is_read;
+                        file.total_done = std::max<int64_t>(0, candidate.total_done);
+                        file.total_size = std::max(file.total_size, file.total_done);
+                        file.progress = candidate.progress;
+                        file.segments = std::move(candidate.segments);
                     }
                 } else {
                     continue;
@@ -539,7 +583,18 @@ namespace dw {
         } catch (...) {
             log_e("", "manager 扫描目录[{}]失败: 未知异常", dir_path);
         }
+        playback_progress_store_.attach(result);
         return result;
+    }
+
+    bool TaskManager::save_playback_progress(const std::string &full_path, int64_t position_ms, int64_t duration_ms) {
+        std::scoped_lock lock(mtx_);
+        return playback_progress_store_.save(full_path, position_ms, duration_ms);
+    }
+
+    void TaskManager::attach_playback_progress(std::vector<TaskFile> &files) const {
+        std::scoped_lock lock(mtx_);
+        playback_progress_store_.attach(files);
     }
 
     // ---- 本地文件浏览与管理 ----

@@ -5,7 +5,7 @@
  * 在 127.0.0.1 随机端口启动 HTTP 服务，接收播放器 Range 请求后：
  *   1. 从 TaskManager 获取文件路径、总大小和已下载区间；
  *   2. 已下载部分直接读文件返回；缺片时提高对应 BT 分片的优先级；
- *   3. 等待超时或传输中断时结束请求。
+ *   3. 客户端断开或代理停止时结束等待。
  *
  * 响应模型：首次发送 206 响应头（含 Content-Range / Content-Length），
  * 后续仅写 body 数据（async_write raw bytes），避免重复发送头部。
@@ -16,23 +16,28 @@
 
 #include "core/task_manager.h"
 #include "internal/downloader_internal.h"
+#include "utils/string_util.h"
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/url.hpp>
+#include <openssl/rand.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace dw {
@@ -46,6 +51,7 @@ using tcp = boost::asio::ip::tcp;
 static std::optional<TaskFile> find_playback_file(const std::string &client_id,
                                                   const std::string &task_id,
                                                   int32_t file_index,
+                                                  const std::string &path = {},
                                                   int64_t offset = -1, int64_t end = -1) {
     auto *downloader = global_downloader();
     if (!downloader) return std::nullopt;
@@ -55,16 +61,25 @@ static std::optional<TaskFile> find_playback_file(const std::string &client_id,
     if (!downloader->initialized.load() || !manager) return std::nullopt;
 
     std::scoped_lock task_lock(manager->get_mutex());
-    const auto *task = manager->get_engine_task(task_id);
-    if (!task || task->is_delete || task->client_id != client_id) return std::nullopt;
+    const auto *task = task_id.empty() ? nullptr : manager->get_engine_task(task_id);
+    if (!task_id.empty() && (!task || task->is_delete || (!client_id.empty() && task->client_id != client_id))) return std::nullopt;
+
+    if (!path.empty() && !task) {
+        TaskFile stored;
+        if (!manager->get_task_file_store().find_by_full_path(path, stored)) return std::nullopt;
+        task = manager->get_engine_task(stored.task_id);
+        file_index = stored.file_index;
+    }
+    if (!task || task->is_delete) return std::nullopt;
 
     const auto file = std::ranges::find(task->files, file_index, &TaskFile::file_index);
-    if (file == task->files.end() || file->is_delete || file->full_path.empty()) return std::nullopt;
+    if (file == task->files.end() || file->is_delete || file->full_path.empty() ||
+        (!path.empty() && file->full_path != path)) return std::nullopt;
     if (offset >= 0 && task->task_protocol == DW_PROTOCOL_TORRENT && file->total_done < file->total_size) {
         try {
             TorrentEngine::prioritize_playback(*task, *file, offset, end);
         } catch (const std::exception &error) {
-            log_e(task_id.c_str(), "播放分片加急失败: {}", error.what());
+            log_e(task->task_id.c_str(), "播放分片提权失败: {}", error.what());
         }
     }
     return *file;
@@ -83,6 +98,8 @@ static std::unique_ptr<tcp::acceptor>      g_acceptor;
 static std::unique_ptr<std::thread>        g_thread; // 播放代理后台线程：stop 时显式 join
 static std::atomic<bool>         g_running{false};
 static std::mutex                g_lifecycle_mutex;
+static std::mutex                g_paths_mutex;
+static std::unordered_map<std::string, std::string> g_paths;
 
 // ========================================================================
 //  工具函数
@@ -153,11 +170,8 @@ private:
     http::request<http::string_body> req_;
 
     // ---- 请求级 state（handle_request 初始化，后续阶段只读） ----
-    // protocol_ + natural_key_ 拆分存储：与 C ABI 一致，URL 参数原样透传。
-    // type 取值 "http" / "bt"；natural_key 须 URL 编码。
     std::string client_id_;
     std::string natural_key_;
-    int     protocol_     = DW_PROTOCOL_HTTP;
     int     file_index_   = 0;
     int64_t range_start_  = 0;
     int64_t range_end_    = 0;   // 含（闭合区间）；-1 在 handle_request 中已补齐
@@ -165,8 +179,8 @@ private:
     std::string file_path_;
     bool header_sent_     = false;
     bool partial_ = false;
-    int64_t prioritized_offset_ = -1;
-    int wait_attempts_ = 0;
+    bool task_file_ = false;
+    bool watching_disconnect_ = false;
     std::string content_type_ = "application/octet-stream";
 
     net::steady_timer timer_{stream_.get_executor()};
@@ -195,56 +209,72 @@ private:
             send_error(http::status::not_found, "Not Found");
             return;
         }
-        auto params = parsed->params();
-        auto client_id_it = params.find("client_id");
-        auto type_it = params.find("type");
-        auto key_it  = params.find("key");
-        auto file_it = params.find("file");
-        if (client_id_it == params.end() || type_it == params.end() || key_it == params.end() || file_it == params.end()) {
-            send_error(http::status::bad_request, "Missing client_id/type/key/file parameter");
-            return;
-        }
-        try {
-            client_id_ = std::string((*client_id_it).value);
-            const std::string type_str((*type_it).value);
-            if (type_str == "http") protocol_ = DW_PROTOCOL_HTTP;
-            else if (type_str == "bt") protocol_ = DW_PROTOCOL_TORRENT;
-            else {
-                send_error(http::status::bad_request, "Invalid type parameter");
-                return;
-            }
-            natural_key_ = std::string((*key_it).value);
-        } catch (...) {
-            send_error(http::status::bad_request, "Invalid client_id/type/key/file parameter");
-            return;
-        }
-        // file 参数用 from_chars 解析，零分配且无异常
-        {
-            const std::string file_str((*file_it).value);
-            int val = 0;
-            auto [ptr, ec] = std::from_chars(file_str.data(), file_str.data() + file_str.size(), val);
-            if (ec != std::errc{} || ptr != file_str.data() + file_str.size()) {
-                send_error(http::status::bad_request, "Invalid type/key/file parameter");
-                return;
-            }
-            file_index_ = val;
-        }
-
         if (req_.method() != http::verb::get && req_.method() != http::verb::head) {
             send_error(http::status::method_not_allowed, "Method not allowed");
             return;
         }
-        const auto file = find_playback_file(client_id_, natural_key_, file_index_);
-        if (!file || file->total_size <= 0) {
-            send_error(http::status::not_found, "Task or file not found");
+
+        const auto params = parsed->params();
+        std::optional<TaskFile> file;
+        if (const auto token = params.find("token"); token != params.end()) {
+            {
+                std::scoped_lock lock(g_paths_mutex);
+                if (const auto entry = g_paths.find(std::string((*token).value)); entry != g_paths.end()) {
+                    file_path_ = entry->second;
+                }
+            }
+            if (!file_path_.empty()) {
+                file = find_playback_file({}, {}, 0, file_path_);
+                if (file) {
+                    natural_key_ = file->task_id;
+                    file_index_ = file->file_index;
+                } else {
+                    std::error_code error;
+                    if (std::filesystem::is_regular_file(file_path_, error)) {
+                        const auto size = std::filesystem::file_size(file_path_, error);
+                        if (!error && size <= static_cast<uintmax_t>(INT64_MAX)) total_size_ = size;
+                    }
+                }
+            }
+        } else {
+            const auto client = params.find("client_id");
+            const auto key = params.find("key");
+            const auto index = params.find("file");
+            const auto type = params.find("type");
+            if (client == params.end() || key == params.end() || index == params.end() ||
+                type == params.end() || ((*type).value != "bt" && (*type).value != "http")) {
+                send_error(http::status::bad_request, "Invalid client_id/type/key/file parameter");
+                return;
+            }
+            const std::string value((*index).value);
+            const auto [ptr, error] = std::from_chars(value.data(), value.data() + value.size(), file_index_);
+            if (error != std::errc{} || ptr != value.data() + value.size()) {
+                send_error(http::status::bad_request, "Invalid file index");
+                return;
+            }
+            client_id_ = (*client).value;
+            natural_key_ = (*key).value;
+            if (client_id_.empty() || natural_key_.empty()) {
+                send_error(http::status::bad_request, "Missing client or task ID");
+                return;
+            }
+            file = find_playback_file(client_id_, natural_key_, file_index_);
+        }
+        if (file) {
+            task_file_ = true;
+            file_path_ = file->full_path;
+            total_size_ = file->total_size;
+        }
+        if (total_size_ <= 0) {
+            send_error(http::status::not_found, "File not found");
             return;
         }
-        file_path_ = file->full_path;
-        total_size_ = file->total_size;
-        if (file->extension == "mp4" || file->extension == "m4v") content_type_ = "video/mp4";
-        else if (file->extension == "mov") content_type_ = "video/quicktime";
-        else if (file->extension == "webm") content_type_ = "video/webm";
-        else if (file->extension == "mkv") content_type_ = "video/x-matroska";
+        const auto extension = utils::file_extension(file_path_);
+        if (boost::beast::iequals(extension, "mp4") || boost::beast::iequals(extension, "m4v")) content_type_ = "video/mp4";
+        else if (boost::beast::iequals(extension, "mov")) content_type_ = "video/quicktime";
+        else if (boost::beast::iequals(extension, "webm")) content_type_ = "video/webm";
+        else if (boost::beast::iequals(extension, "mkv")) content_type_ = "video/x-matroska";
+        else if (boost::beast::iequals(extension, "avi")) content_type_ = "video/x-msvideo";
 
         const auto range = req_[http::field::range];
         partial_ = !range.empty();
@@ -275,7 +305,9 @@ private:
             return;
         }
 
-        // ---- 开始流式传输 ----
+        if (file && file->total_done < total_size_) {
+            find_playback_file(client_id_, natural_key_, file_index_, file_path_, range_start_, range_end_);
+        }
         do_stream(range_start_);
     }
 
@@ -289,75 +321,51 @@ private:
     //
     // ================================================================
     void do_stream(int64_t current_pos) {
-        auto self = shared_from_this();
-
-        const auto file = find_playback_file(client_id_, natural_key_, file_index_);
-        if (!file || file->full_path != file_path_) {
-            if (!header_sent_) send_error(http::status::not_found, "Task or file not found");
-
-            return;
-        }
-
-        bool found = file->total_done >= total_size_;
-        int64_t seg_end = found ? total_size_ - 1 : 0;
-        if (!found) {
-            for (const auto &segment : file->segments) {
-                if (segment.status == SegmentStatus::Downloaded &&
-                    current_pos >= segment.start && current_pos <= segment.end) {
-                    found = true;
-                    seg_end = segment.end;
-                    break;
-                }
-            }
-        }
-
-        // ========== 情况 1：current_pos 未命中任何分段 → 等待 ==========
-        if (!found) {
-            if (protocol_ == DW_PROTOCOL_TORRENT && prioritized_offset_ != current_pos) {
-                find_playback_file(client_id_, natural_key_, file_index_, current_pos, range_end_);
-                prioritized_offset_ = current_pos;
-            }
-            if (++wait_attempts_ >= 60) {
-                if (!header_sent_) send_error(http::status::service_unavailable, "Waiting for download");
+        const auto chunk_end = current_pos + std::min<int64_t>(range_end_ - current_pos, kChunkSize - 1);
+        int64_t seg_end = chunk_end;
+        if (task_file_) {
+            const auto file = find_playback_file(client_id_, natural_key_, file_index_, file_path_);
+            if (!file) {
+                if (!header_sent_) send_error(http::status::not_found, "Task file not found");
+                finish();
                 return;
             }
-            wait_for_data(current_pos);
-            return;
+            if (file->total_done < total_size_) {
+                const auto segment = std::ranges::find_if(file->segments, [current_pos](const auto &item) {
+                    return item.status == SegmentStatus::Downloaded &&
+                           current_pos >= item.start && current_pos <= item.end;
+                });
+                if (segment == file->segments.end()) {
+                    wait_for_data(current_pos);
+                    return;
+                }
+                seg_end = std::min(chunk_end, segment->end);
+            }
         }
 
-        wait_attempts_ = 0;
-
-        // ========== 情况 2 & 3：current_pos 命中 ==========
-        const int64_t send_start = current_pos;
-        int64_t send_end = std::min(seg_end, range_end_);
-        // 限制单次读取大小，避免一次读入过大数据块
-        const int64_t max_read = static_cast<int64_t>(kChunkSize);
-        if (send_end - send_start + 1 > max_read) {
-            send_end = send_start + max_read - 1;
-        }
-        const int64_t read_size = send_end - send_start + 1;
-
-        auto data = read_file_data(file_path_, send_start, read_size);
+        auto data = read_file_data(file_path_, current_pos, seg_end - current_pos + 1);
         if (data.empty()) {
             // 分段信息显示有数据但文件读取失败，可能是分段信息过时
             if (!header_sent_) {
                 send_error(http::status::internal_server_error, "File read failed");
             }
+            finish();
             return;
         }
 
+        const int64_t next_pos = current_pos + static_cast<int64_t>(data.size());
         // ---- 首次发送：构造并发送 206 响应头，回调中再发 body ----
         if (!header_sent_) {
             header_sent_ = true;
             // 暂存首批 body 数据，header 发送成功后回调中取出
-            pending_next_pos_ = send_end + 1;
+            pending_next_pos_ = next_pos;
             pending_data_     = std::move(data);
             do_write_header();
             return;
         }
 
         // ---- 非首次：header 已发送，直接发 body ----
-        do_write_body(send_end + 1, std::move(data));
+        do_write_body(next_pos, std::move(data));
     }
 
     // ================================================================
@@ -391,7 +399,10 @@ private:
         http::async_write_header(
             stream_, *header_sr_,
             [self](beast::error_code ec, std::size_t) {
-                if (ec || self->req_.method() == http::verb::head) return;
+                if (ec || self->req_.method() == http::verb::head) {
+                    self->finish();
+                    return;
+                }
                 // header 发送成功，取出暂存的首批 body 数据并发送
                 self->do_write_body(self->pending_next_pos_,
                                     std::move(self->pending_data_));
@@ -417,19 +428,8 @@ private:
             stream_, buffers_,
             [self, next_pos]
             (beast::error_code ec, std::size_t) {
-                // ---- 客户端取消检测 ----
-                if (ec) {
-                    // connection_reset / eof / operation_aborted / broken_pipe
-                    // 均为客户端断开或取消，静默退出
-                    return;
-                }
-
-                // ---- 传输完成？ ----
-                if (next_pos > self->range_end_) {
-                    // 全部请求区间已发送，关闭写端
-                    beast::error_code shutdown_ec;
-                    self->stream_.socket().shutdown(
-                        tcp::socket::shutdown_send, shutdown_ec);
+                if (ec || next_pos > self->range_end_) {
+                    self->finish();
                     return;
                 }
 
@@ -441,23 +441,25 @@ private:
     // ================================================================
     //  阶段 4：等待新数据到达
     //
-    //  定时器每 500ms 触发一次，重新查询分段信息。
-    //  客户端断开时 socket 关闭，async_wait 回调中检测到后退出。
-    // ================================================================
+    // 定时检查下载区间，同时独立监听连接关闭。每个连接只处理一个请求。
     void wait_for_data(int64_t current_pos) {
         auto self = shared_from_this();
-
-        timer_.expires_after(std::chrono::milliseconds(kWaitIntervalMs));
-        timer_.async_wait(
-            [self, current_pos](beast::error_code ec) {
-                if (ec) return; // 定时器取消（session 析构等）
-
-                // 检查客户端是否还在
-                if (!self->stream_.socket().is_open()) return;
-
-                // 重新查询分段，看是否有新数据到达
-                self->do_stream(current_pos);
+        if (!watching_disconnect_) {
+            watching_disconnect_ = true;
+            stream_.socket().async_wait(tcp::socket::wait_read, [self](beast::error_code error) {
+                if (error != net::error::operation_aborted) self->finish();
             });
+        }
+        timer_.expires_after(std::chrono::milliseconds(kWaitIntervalMs));
+        timer_.async_wait([self, current_pos](beast::error_code error) {
+            if (!error && self->stream_.socket().is_open()) self->do_stream(current_pos);
+        });
+    }
+
+    void finish() {
+        timer_.cancel();
+        beast::error_code error;
+        stream_.socket().close(error);
     }
 
     // ================================================================
@@ -569,6 +571,11 @@ void dw_proxy_stop(void) {
         dw::playback::g_thread->join();
     }
 
+    {
+        std::scoped_lock paths_lock(dw::playback::g_paths_mutex);
+        dw::playback::g_paths.clear();
+    }
+
     // 释放资源
     dw::playback::g_acceptor.reset();
     dw::playback::g_ioc.reset();
@@ -589,6 +596,31 @@ const char* dw_proxy_get_url(const char* client_id, dw_protocol_t protocol, cons
           "&key=" + natural_key +
           "&file=" + std::to_string(file_index);
     return url.c_str();
+}
+
+const char* dw_proxy_get_path_url(const char* full_path) {
+    if (!full_path || !dw::playback::g_running) return "";
+    try {
+        const auto path = std::filesystem::path(full_path).lexically_normal();
+        if (!path.is_absolute()) return "";
+        static thread_local std::string url;
+        std::array<unsigned char, 16> bytes{};
+        if (RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) != 1) return "";
+        constexpr std::string_view hex = "0123456789abcdef";
+        std::string token;
+        token.reserve(bytes.size() * 2);
+        for (const auto byte : bytes) {
+            token += hex[byte >> 4];
+            token += hex[byte & 15];
+        }
+        std::scoped_lock lock(dw::playback::g_paths_mutex);
+        if (!dw::playback::g_running) return "";
+        dw::playback::g_paths.emplace(token, path.generic_string());
+        url = "http://127.0.0.1:" + std::to_string(dw::playback::g_port) + "/file?token=" + token;
+        return url.c_str();
+    } catch (const std::exception&) {
+        return "";
+    }
 }
 
 int dw_proxy_is_running(void) {

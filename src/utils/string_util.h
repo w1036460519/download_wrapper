@@ -5,7 +5,6 @@
 #pragma once
 
 #include <string>
-#include <string_view>
 
 namespace dw::utils {
     /**
@@ -21,15 +20,6 @@ namespace dw::utils {
  * @return 去后缀后的名称（"a.tar.gz" 返回 "a.tar"）；无扩展名返回原串。
  */
     std::string strip_extension(const std::string &name);
-
-    /**
- * 忽略大小写的字符串相等比较（ASCII，逐字符 std::tolower），长度不等直接返回 false。
- * 用于 HTTP 响应头名 / URL 查询参数键等大小写不敏感匹配。
- * @param a 待比较串。
- * @param b 待比较串。
- * @return 忽略大小写后两串相等返回 true。
- */
-    bool iequals(std::string_view a, std::string_view b) noexcept;
 
     /**
      * std::string 拷贝为堆分配 C 字符串（malloc 分配，调用方负责 std::free 释放）。

@@ -29,6 +29,9 @@ DW_API void dw_proxy_stop(void);
 /// \return URL 字符串（线程局部静态存储，下次调用覆盖）。
 DW_API const char* dw_proxy_get_url(const char* client_id, dw_protocol_t protocol, const char* natural_key, int file_index);
 
+/// 注册本地绝对路径并生成代理 URL，注册在代理停止时清理。
+DW_API const char* dw_proxy_get_path_url(const char* full_path);
+
 /// 查询代理是否运行中
 ///
 /// \return 1 运行中，0 未运行

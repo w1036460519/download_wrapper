@@ -14,6 +14,7 @@
 #include "download_wrapper/download_wrapper.h"
 #include "internal/downloader_internal.h"
 #include "store/task_store.h"
+#include "store/playback_progress_store.h"
 #include "store/task_resume_store.h"
 #include "store/task_file_store.h"
 #include "sqlite_database.h"
@@ -88,6 +89,8 @@ namespace dw {
         /// @param dir_path 目录路径
         /// @return 文件和目录列表（TaskFile，目录的 total_size=0）
         std::vector<TaskFile> get_files(const std::string &dir_path) const;
+        bool save_playback_progress(const std::string &full_path, int64_t position_ms, int64_t duration_ms);
+        void attach_playback_progress(std::vector<TaskFile> &files) const;
 
         // ---- BT 解析工具（转发至 TorrentEngine 静态方法） ----
 
@@ -106,12 +109,10 @@ namespace dw {
         std::recursive_mutex &get_mutex() { return mtx_; }
         /// 返回持久化存储层引用（调用方须持 mtx_ 保证线程安全）。
         TaskStore &get_task_store() { return task_store_; }
+        const TaskFileStore &get_task_file_store() const { return task_file_store_; }
 
         /// 内存未命中时加载任务及文件。使用返回指针期间须持有 get_mutex()。
         Task *get_engine_task(const std::string &key);
-        void assign_download_location(Task &task) const;
-        std::string resolve_save_path(const std::string &root_id, const std::string &subdirectory) const;
-        static void resolve_task_file_paths(Task &task);
 
 
         TaskResumeStore &get_task_resume_store() { return task_resume_store_; }
@@ -122,7 +123,6 @@ namespace dw {
 
         // B 线程（重载）：周期持久化 dirty 记录 + 推送 JSON + 引擎 sweep。
         void maintenance_loop();
-        void resolve_download_location(Task &task) const;
 
         // ---- 内部工具 ----
         // 按协议取引擎（统一接口分发点；HTTP/BT 之外无其他协议）
@@ -141,6 +141,7 @@ namespace dw {
         SqliteDatabase database_; // 统一连接生命周期，先于 store 构造、后于 store 析构。
         TaskFileStore task_file_store_{database_.connection()};
         TaskStore task_store_{database_.connection()};
+        PlaybackProgressStore playback_progress_store_{database_.connection()};
         TaskResumeStore task_resume_store_{database_.connection()};
         std::thread worker_; // A 线程：任务调度准入（stop() 显式 join）
         std::thread maintenance_; // B 线程：持久化 + JSON 推送 + sweep

@@ -19,6 +19,8 @@
 #include "utils/unique_name.h"
 
 // 续传 BLOB 复用 libtorrent bencode 编解码（与 BT resume 同族格式，项目已链接）。
+#include <boost/beast/core/string.hpp>
+
 #include <libtorrent/bdecode.hpp>
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/entry.hpp>
@@ -43,7 +45,7 @@ namespace dw {
 
         namespace internal {
             using dw::utils::format_unix_ms;
-            using dw::utils::iequals;
+            using boost::beast::iequals;
             using dw::utils::now_unix_ms;
 
             /// 探测窗口大小（字节）：探测请求发 "Range: 0-(n-1)" 有界区间，
@@ -52,7 +54,6 @@ namespace dw {
 
             /* ---------- 字符串工具 ---------- */
 
-            // 忽略大小写比较统一走 utils::iequals（string_util）
 
             std::string_view trim_view(std::string_view s) noexcept {
                 constexpr std::string_view ws = " \t\r\n\v\f";

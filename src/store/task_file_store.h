@@ -17,7 +17,7 @@ namespace dw {
         TaskFileStore &operator=(const TaskFileStore &) = delete;
 
         std::vector<TaskFile> get(const std::string &task_id) const;
-        std::vector<TaskFile> find_candidates(const std::string &name, int limit, int64_t offset) const;
+        bool find_by_full_path(const std::string &path, TaskFile &file) const;
         // 按任务标识硬删除全部关联文件。没有待删除文件也视为成功。
         bool delete_task(const std::string &task_id) const;
 

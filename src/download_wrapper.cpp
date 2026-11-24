@@ -126,8 +126,11 @@ DW_API char *init(const char *config_json) {
     }
 
     if (dw::g_downloader->initialized.load()) {
+        if (!config.path_replacements.empty()) {
+            return dw::result_to_json(dw::dw_result<>::failure(DW_REASON_ERROR, "更新存储路径需要重新启动下载器"));
+        }
         log_i("", "wrapper 下载器已初始化完成");
-        return dw::result_to_json(dw::dw_result<>::success());
+        return dw::utils::dup_cstr(dw::make_success_response(boost::json::object{{"absolute_paths", true}}));
     }
 
     auto *tm = dw::g_downloader->task_manager.get();
@@ -148,7 +151,7 @@ DW_API char *init(const char *config_json) {
     }
 
     dw::g_downloader->initialized.store(true);
-    return dw::result_to_json(dw::dw_result<>::success());
+    return dw::utils::dup_cstr(dw::make_success_response(boost::json::object{{"absolute_paths", true}}));
 }
 
 DW_API void destroy(void) {
@@ -396,6 +399,7 @@ DW_API char *get_task(const char *params_json) {
             return dw::utils::dup_cstr(dw::make_error_response("任务不存在"));
         }
         auto data = dw::to_json(task);
+        d->task_manager->attach_playback_progress(task.files);
         data["files"] = boost::json::value_from(task.files);
         return dw::utils::dup_cstr(dw::make_success_response(data));
     } catch (const std::exception &e) {
@@ -448,6 +452,26 @@ DW_API char *get_files(const char *params_json) {
         log_e("", "wrapper 读取目录失败: {}", e.what());
         return dw::utils::dup_cstr(dw::make_error_response("读取目录失败"));
     }
+}
+
+DW_API char *save_playback_progress(const char *params_json) {
+    auto *downloader = dw::global_downloader();
+    if (!downloader || !params_json) return dw::result_to_json(dw::dw_result<>::failure());
+
+    try {
+        const auto input = boost::json::parse(params_json).as_object();
+        const auto full_path = dw::json_get_string(input, "full_path");
+        const auto position = input.at("position_ms").as_int64();
+        const auto duration = input.at("duration_ms").as_int64();
+        std::scoped_lock lock(downloader->mutex);
+        if (downloader->initialized.load() && downloader->task_manager &&
+            downloader->task_manager->save_playback_progress(full_path, position, duration)) {
+            return dw::result_to_json(dw::dw_result<>::success());
+        }
+    } catch (const std::exception &error) {
+        log_e("", "保存播放进度失败: {}", error.what());
+    }
+    return dw::result_to_json(dw::dw_result<>::failure());
 }
 
 DW_API char *scan_local_file(const char *params_json) {

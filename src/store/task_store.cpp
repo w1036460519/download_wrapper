@@ -16,9 +16,9 @@ namespace dw {
 
         // 查询列顺序须与 TaskColumn 一致。
         constexpr char task_select[] = R"SQL(
-            SELECT task_id, client_id, is_remote, name, relative_full_path, file_type, ext,
+            SELECT task_id, client_id, is_remote, name, file_type, ext,
                    url, info_hash, magnet_link, torrent_file, protocol, status, total_size, total_done,
-                   message, created_at, modified_at, is_delete, is_read, storage_root_id, relative_save_path, rate_history
+                   message, created_at, modified_at, is_delete, is_read, save_path, rate_history
             FROM tasks
         )SQL";
 
@@ -27,7 +27,6 @@ namespace dw {
             col_client_id,
             col_is_remote,
             col_name,
-            col_relative_full_path,
             col_file_type,
             col_ext,
             col_url,
@@ -43,8 +42,7 @@ namespace dw {
             col_modified_at,
             col_is_delete,
             col_is_read,
-            col_storage_root_id,
-            col_relative_save_path,
+            col_save_path,
             col_rate_history,
         };
 
@@ -54,9 +52,7 @@ namespace dw {
             task.client_id = col_text(statement, col_client_id);
             task.is_remote = sqlite3_column_int(statement, col_is_remote) != 0;
             task.name = col_text(statement, col_name);
-            task.storage_root_id = col_text(statement, col_storage_root_id);
-            task.relative_save_path = col_text(statement, col_relative_save_path);
-            task.full_path = col_text(statement, col_relative_full_path);
+            task.save_path = col_text(statement, col_save_path);
             task.file_type = sqlite3_column_int(statement, col_file_type) != 0;
             task.ext = col_text(statement, col_ext);
             task.url = col_text(statement, col_url);
@@ -93,7 +89,7 @@ namespace dw {
                 task_id TEXT NOT NULL PRIMARY KEY,
                 client_id TEXT NOT NULL,
                 is_remote INTEGER NOT NULL,
-                relative_full_path TEXT NOT NULL,
+                full_path TEXT NOT NULL,
                 file_type INTEGER NOT NULL,
                 ext TEXT NOT NULL,
                 url TEXT NOT NULL,
@@ -109,8 +105,7 @@ namespace dw {
                 is_delete INTEGER NOT NULL,
                 is_read INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL DEFAULT '',
-                storage_root_id TEXT NOT NULL DEFAULT '',
-                relative_save_path TEXT NOT NULL DEFAULT '',
+                save_path TEXT NOT NULL DEFAULT '',
                 rate_history TEXT NOT NULL DEFAULT '[[],[]]'
             );
         )SQL";
@@ -126,27 +121,27 @@ namespace dw {
     }
 
     bool TaskStore::write_task(const Task &task) const {
+        // 既有 tasks 表仍要求 full_path 非空，新增记录使用空串。
         constexpr auto sql = R"SQL(
             INSERT INTO tasks (
                 protocol, task_id, client_id, is_remote,
-                relative_full_path, file_type,
+                full_path, file_type,
                 ext, url, info_hash, magnet_link,
                 torrent_file, status, total_size, total_done,
                 message, created_at, modified_at, is_delete,
-                is_read, name, storage_root_id, relative_save_path, rate_history
+                is_read, name, save_path, rate_history
             ) VALUES (
                 :protocol, :task_id, :client_id, :is_remote,
-                :relative_full_path, :file_type,
+                '', :file_type,
                 :ext, :url, :info_hash, :magnet_link,
                 :torrent_file, :status, :total_size, :total_done,
                 :message, :created_at, :modified_at, :is_delete,
-                :is_read, :name, :storage_root_id, :relative_save_path, :rate_history
+                :is_read, :name, :save_path, :rate_history
             )
             ON CONFLICT(task_id) DO UPDATE SET
                 protocol = excluded.protocol,
                 client_id = excluded.client_id,
                 is_remote = excluded.is_remote,
-                relative_full_path = excluded.relative_full_path,
                 file_type = excluded.file_type,
                 ext = excluded.ext,
                 url = excluded.url,
@@ -162,8 +157,7 @@ namespace dw {
                 is_delete = excluded.is_delete,
                 is_read = excluded.is_read,
                 name = excluded.name,
-                storage_root_id = excluded.storage_root_id,
-                relative_save_path = excluded.relative_save_path,
+                save_path = excluded.save_path,
                 rate_history = excluded.rate_history
         )SQL";
         sqlite3_stmt *statement = nullptr;
@@ -177,19 +171,10 @@ namespace dw {
                           -1,
                           SQLITE_TRANSIENT);
         sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":is_remote"), task.is_remote);
-        sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":storage_root_id"),
-                          task.storage_root_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":relative_save_path"),
-                          task.relative_save_path.c_str(), -1, SQLITE_TRANSIENT);
-        std::string relative_full_path;
-        if (!task.full_path.empty() && !task.save_path.empty()) {
-            const auto relative = std::filesystem::path(task.full_path).lexically_relative(task.save_path);
-            if (!relative.empty() && !relative.has_root_path() && *relative.begin() != "..") {
-                relative_full_path = relative.generic_string();
-            }
-        }
-        sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":relative_full_path"),
-                          relative_full_path.c_str(), -1, SQLITE_TRANSIENT);
+        const auto save_path = task.save_path.empty() ? std::string{} :
+            std::filesystem::path(task.save_path).lexically_normal().generic_string();
+        sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":save_path"),
+                          save_path.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":file_type"), task.file_type);
         sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":ext"), task.ext.c_str(), -1,
                           SQLITE_TRANSIENT);
@@ -225,7 +210,7 @@ namespace dw {
 
     bool TaskStore::save(const Task &task) const {
         std::scoped_lock lock(mutex_);
-        return db_ && !task.task_id.empty() && !task.storage_root_id.empty() && write_task(task);
+        return db_ && !task.task_id.empty() && std::filesystem::path(task.save_path).is_absolute() && write_task(task);
     }
 
     bool TaskStore::find_by_task_id(const std::string &task_id, Task &out) const {

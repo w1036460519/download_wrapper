@@ -35,8 +35,6 @@ namespace dw {
         std::string name;
         // 任务内的相对路径。
         std::string path;
-        std::string storage_root_id;
-        std::string relative_save_path;
         // 文件完整路径，由 save_path/ path 按平台路径分隔符拼接。
         std::string full_path;
         // 文件总大小，单位：字节（B）
@@ -61,6 +59,8 @@ namespace dw {
         // 文件系统时间，Unix 毫秒。文件系统未提供时留空。
         std::optional<int64_t> modified_at_ms;
         std::optional<int64_t> created_at_ms;
+        int64_t playback_position_ms = 0;
+        int64_t playback_duration_ms = 0;
         // 内存中的数据发生变化
         bool dirty = false;
     };
@@ -82,6 +82,10 @@ namespace dw {
             {"is_read", file.is_read},
             {"is_dir", file.is_dir}
         };
+        if (file.playback_duration_ms > 0) {
+            result["playback_position_ms"] = file.playback_position_ms;
+            result["playback_duration_ms"] = file.playback_duration_ms;
+        }
         if (file.modified_at_ms) result["modified_at_ms"] = *file.modified_at_ms;
         if (file.created_at_ms) result["created_at_ms"] = *file.created_at_ms;
         return result;
