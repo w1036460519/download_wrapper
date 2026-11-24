@@ -11,7 +11,7 @@
 # libtorrent-rasterbar 版本
 # Release tag: libtorrent-v{version}
 # 示例: libtorrent-v2.1.2
-LIBTORRENT_VERSION = "2.1.2"
+LIBTORRENT_VERSION = "2.1.3"
 
 # libwebrtc 版本（webrtc-sdk 发布标签）
 # Release tag: libwebrtc-{version}
