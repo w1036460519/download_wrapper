@@ -264,7 +264,7 @@ def download_libtorrent(workspace: Path, platform_name: str) -> Path | None:
 
 
 def ensure_libtorrent(workspace: Path, libtorrent_dir: Path | None,
-                      platform_name: str, vcpkg_dir: Path) -> Path | None:
+                      platform_name: str, vcpkg_dir: Path, *, from_source: bool = False) -> Path | None:
     """确保 libtorrent 存在。
     
     优先级：
@@ -278,10 +278,11 @@ def ensure_libtorrent(workspace: Path, libtorrent_dir: Path | None,
         return libtorrent_dir
     
     # 2. 尝试从 Release 下载
-    print("\n== 尝试从 Release 下载 libtorrent ==")
-    release_dir = download_libtorrent(workspace, platform_name)
-    if release_dir:
-        return release_dir
+    if not from_source:
+        print("\n== 尝试从 Release 下载 libtorrent ==")
+        release_dir = download_libtorrent(workspace, platform_name)
+        if release_dir:
+            return release_dir
     
     # 3. 自动编译
     print("\n== 自动编译 libtorrent ==")
@@ -619,11 +620,23 @@ def main():
                         help="临时目录")
     parser.add_argument("--libtorrent-dir",
                         help="本地 libtorrent 目录（跳过 FetchContent）")
+    parser.add_argument("--libtorrent-from-source", action="store_true",
+                        help="跳过 Release 预编译 libtorrent")
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
     temp_dir = Path(args.temp_dir)
     cfg = PLATFORMS[args.platform]
+    if cfg["os"] == "android":
+        ndk = os.environ.get("ANDROID_NDK_LATEST_HOME") or os.environ.get("ANDROID_NDK_HOME")
+        if not ndk:
+            parser.error("Android 构建需要 ANDROID_NDK_LATEST_HOME 或 ANDROID_NDK_HOME")
+        os.environ["ANDROID_NDK_HOME"] = ndk
+        os.environ["ANDROID_NDK"] = ndk
+        print(f"Android NDK: {ndk}")
+        properties = Path(ndk) / "source.properties"
+        if properties.is_file():
+            print(properties.read_text(encoding="utf-8").strip())
 
     print("== 构建配置 ==")
     print(f"  平台:     {args.platform}")
@@ -641,7 +654,8 @@ def main():
     # 2. libtorrent（自动检测/编译）
     print("\n== Step 2: libtorrent ==")
     libtorrent_dir = Path(args.libtorrent_dir).resolve() if args.libtorrent_dir else None
-    libtorrent_dir = ensure_libtorrent(workspace, libtorrent_dir, args.platform, vcpkg_dir)
+    libtorrent_dir = ensure_libtorrent(
+        workspace, libtorrent_dir, args.platform, vcpkg_dir, from_source=args.libtorrent_from_source)
 
     # 3. 构建
     print("\n== Step 3: CMake 构建 ==")

@@ -127,9 +127,9 @@ jobs:
             vcpkg-${{ matrix.name }}-${{ env.VCPKG_REF }}-
             vcpkg-${{ matrix.name }}-
 
-      # Windows 的 CMakeCache.txt 可能保留旧 vcpkg 库路径。Windows 仅复用上面的 vcpkg 二进制归档。
+      # Windows 和 Android 的 CMakeCache.txt 可能保留旧工具链或库路径。
       - name: Cache CMake build
-        if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
+        if: steps.filter.outputs.run == 'true' && runner.os != 'Windows' && !startsWith(matrix.name, 'android-')
         uses: actions/cache@v5
         with:
           path: |
@@ -159,12 +159,18 @@ jobs:
           echo "== 构建前磁盘 =="
           df -h / || true
 
+          libtorrent_args=()
+          if [[ "${{ matrix.name }}" == android-* ]]; then
+            libtorrent_args+=(--libtorrent-from-source)
+          fi
+
           python3 "${{ github.workspace }}/scripts/build_wrapper.py" \
             --platform "${{ matrix.name }}" \
             --vcpkg-ref "${{ env.VCPKG_REF }}" \
             --workspace "${{ github.workspace }}" \
             --temp-dir "${{ runner.temp }}" \
-            --libtorrent-dir "${{ runner.temp }}/libtorrent-${{ matrix.name }}"
+            --libtorrent-dir "${{ runner.temp }}/libtorrent-${{ matrix.name }}" \
+            "${libtorrent_args[@]}"
 
           echo "== 构建后磁盘 =="
           df -h / || true
