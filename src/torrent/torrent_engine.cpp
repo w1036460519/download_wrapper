@@ -383,6 +383,19 @@ namespace dw {
             }
         }
 
+        void log_piece_priorities(const char *task_id, const char *source, const TaskFile &file,
+                                  const std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > &updates,
+                                  std::size_t first_update) {
+            if (first_update == updates.size()) return;
+            std::string pieces = std::to_string(static_cast<int>(updates[first_update].first));
+            for (auto i = first_update + 1; i < updates.size(); ++i) {
+                pieces += ',';
+                pieces += std::to_string(static_cast<int>(updates[i].first));
+            }
+            log_i(task_id, "{}设置 piece 优先级 file={} file_index={} priority={} pieces=[{}]",
+                  source, file.name, file.file_index, static_cast<std::uint8_t>(updates[first_update].second), pieces);
+        }
+
         void handle_files(const lt::torrent_handle &h) {
             const std::string info_hash = info_hash_hex(h);
             if (info_hash.empty()) return;
@@ -440,9 +453,11 @@ namespace dw {
                             return static_cast<int>(files.map_file(index, offset, 1).piece);
                         };
                         const int head_end = piece_at(prefetch_bytes - 1);
+                        const auto first_update = prefetch.size();
                         raise_piece_priorities(h, piece_at(0), head_end, lt::top_priority, prefetch);
                         raise_piece_priorities(h, std::max(head_end + 1, piece_at(file.total_size - prefetch_bytes)),
                                                piece_at(file.total_size - 1), lt::top_priority, prefetch);
+                        log_piece_priorities(info_hash.c_str(), "文件解析", file, prefetch, first_update);
                     }
                     file.dirty = true;
                 }
@@ -795,7 +810,10 @@ namespace dw {
         std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > updates;
         raise_piece_priorities(handle, first, first + std::min(last - first, max_pieces - 1),
                                lt::download_priority_t{5}, updates);
-        if (!updates.empty()) handle.prioritize_pieces(updates);
+        if (!updates.empty()) {
+            handle.prioritize_pieces(updates);
+            log_piece_priorities(task.task_id.c_str(), "播放", file, updates, 0);
+        }
     }
 
     std::recursive_mutex &TorrentEngine::tasks_mutex() {

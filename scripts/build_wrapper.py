@@ -384,7 +384,7 @@ def cmake_configure(build_dir: Path, workspace: Path, cfg: dict,
 
     # Android NDK chainload
     if cfg.get("os") == "android":
-        ndk = os.environ.get("ANDROID_NDK_HOME", os.environ.get("ANDROID_NDK_LATEST_HOME", ""))
+        ndk = os.environ.get("ANDROID_NDK_LATEST_HOME") or os.environ.get("ANDROID_NDK_HOME", "")
         if ndk:
             ndk_toolchain = Path(ndk) / "build" / "cmake" / "android.toolchain.cmake"
             cmd.extend([
@@ -429,7 +429,7 @@ def strip_binary(filepath: Path, platform_os: str, triplet: str = ""):
     elif platform_os == "macos":
         run(["strip", "-x", str(filepath)])
     elif platform_os == "android":
-        ndk = os.environ.get("ANDROID_NDK_HOME", os.environ.get("ANDROID_NDK_LATEST_HOME", ""))
+        ndk = os.environ.get("ANDROID_NDK_LATEST_HOME") or os.environ.get("ANDROID_NDK_HOME", "")
         if ndk:
             strip_bin = next(Path(ndk).rglob("llvm-strip"), None)
             if strip_bin:
