@@ -1,11 +1,11 @@
 # Android arm64-v8a triplet
 # 覆盖 vcpkg 内置 arm64-android，仅修改项目必需的设置：
-# - VCPKG_LIBRARY_LINKAGE: dynamic（FFI 需要 .so）
+# - VCPKG_LIBRARY_LINKAGE: static（将依赖链接进 Wrapper 的 FFI .so）
 # - VCPKG_CMAKE_CONFIGURE_OPTIONS: 传递 ANDROID_ABI 给 cmake-get-vars probe
 # 其余设置与 vcpkg 内置 triplet 保持一致。
 set(VCPKG_TARGET_ARCHITECTURE arm64)
 set(VCPKG_CRT_LINKAGE dynamic)
-set(VCPKG_LIBRARY_LINKAGE dynamic)
+set(VCPKG_LIBRARY_LINKAGE static)
 set(VCPKG_CMAKE_SYSTEM_NAME Android)
 set(VCPKG_CMAKE_SYSTEM_VERSION 28)
 set(VCPKG_MAKE_BUILD_TRIPLET "--host=aarch64-linux-android")
