@@ -149,7 +149,7 @@ namespace dw {
         bool net_allowed_ = true; // 网络允许标志：由 config 根据 network_type + allow_mobile_data 计算
         Config config_; // 权威配置快照（深拷贝，已校验）
         static constexpr int32_t flush_interval_ms_ = 1000; // 调度线程节拍（内部固定）
-        static constexpr int32_t maintenance_interval_ms_ = 1000; // 持久化线程节拍（内部固定）
+        static constexpr int32_t maintenance_interval_ms_ = 500; // 持久化线程节拍（内部固定）
 
         std::unique_ptr<IDownloadEngine> http_;
         std::unique_ptr<TorrentEngine> torrent_;
