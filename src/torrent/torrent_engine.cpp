@@ -562,6 +562,10 @@ namespace dw {
                             const bool downloading = task->status == DW_TASK_STATUS_DOWNLOADING;
                             task->download_rate = downloading ? static_cast<double>(s.download_payload_rate) : -1.0;
                             task->upload_rate = downloading ? static_cast<double>(s.upload_payload_rate) : -1.0;
+                            if (downloading) {
+                                task->max_download_rate = std::max(task->max_download_rate, task->download_rate);
+                                task->max_upload_rate = std::max(task->max_upload_rate, task->upload_rate);
+                            }
                             if (previous_status != task->status) {
                                 log_i(info_hash.c_str(), "bt 任务状态 {} -> {} bytes={}/{}",
                                       previous_status, task->status, task->total_done, task->total_size);
@@ -577,6 +581,7 @@ namespace dw {
                 log_e(info_hash.c_str(), "下载完成");
                 if (Task *task = TorrentEngine::get_task(info_hash); task && !task->is_delete) {
                     task->status = DW_TASK_STATUS_COMPLETED;
+                    task->completed_at = now_unix_ms();
                     task->download_rate = -1.0;
                     task->upload_rate = -1.0;
                     task->dirty = true;
@@ -1089,6 +1094,7 @@ namespace dw {
         } else {
             task.status = DW_TASK_STATUS_RESOLVING;
             task.total_done = 0;
+            task.completed_at = 0;
             task.download_rate = -1.0;
             task.upload_rate = -1.0;
             task.message.clear();

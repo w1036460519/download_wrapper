@@ -444,6 +444,7 @@ namespace dw {
                                 continue;
                             }
                             if (!task_store_.save(task) || !task_file_store_.delete_task(task.task_id) ||
+                                !task_resume_store_.delete_task(task.task_id) ||
                                 sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
                                 sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
                                 log_e(task.task_id.c_str(), "manager 任务[{}]删除保存失败", task.name);

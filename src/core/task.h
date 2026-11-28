@@ -42,6 +42,9 @@ namespace dw {
 
         int64_t created_at = 0; // Unix 毫秒
         int64_t modified_at = 0; // Unix 毫秒
+        int64_t completed_at = 0; // Unix 毫秒，0 表示尚未记录。
+        double max_download_rate = -1.0; // 下载阶段峰值，B/s。
+        double max_upload_rate = -1.0; // 下载阶段峰值，B/s。
         bool is_delete = false; // 软删除标记
         bool is_read = false; // 已读标记
 
@@ -90,6 +93,9 @@ namespace dw {
         obj["message"] = r.message;
         obj["created_at"] = r.created_at;
         obj["modified_at"] = r.modified_at;
+        obj["completed_at"] = r.completed_at;
+        obj["max_download_rate"] = r.max_download_rate;
+        obj["max_upload_rate"] = r.max_upload_rate;
         obj["is_delete"] = r.is_delete;
         obj["is_read"] = r.is_read;
         obj["support_range"] = r.support_range;

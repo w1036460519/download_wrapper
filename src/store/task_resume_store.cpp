@@ -41,6 +41,18 @@ namespace dw {
         return success;
     }
 
+    bool TaskResumeStore::delete_task(const std::string &task_id) const {
+        std::scoped_lock lock(mutex_);
+        if (!db_ || task_id.empty()) return false;
+        sqlite3_stmt *statement = nullptr;
+        constexpr auto sql = "DELETE FROM task_resume WHERE task_id = ?1";
+        if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK) return false;
+        const bool success = sqlite3_bind_text(statement, 1, task_id.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK
+            && sqlite3_step(statement) == SQLITE_DONE;
+        sqlite3_finalize(statement);
+        return success;
+    }
+
     bool TaskResumeStore::find(const std::string &task_id, TaskResume &out) const {
         std::scoped_lock lock(mutex_);
         out = {};

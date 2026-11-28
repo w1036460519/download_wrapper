@@ -18,7 +18,7 @@ namespace dw {
         constexpr char task_select[] = R"SQL(
             SELECT task_id, client_id, is_remote, name, file_type, ext,
                    url, info_hash, magnet_link, torrent_file, protocol, status, total_size, total_done,
-                   message, created_at, modified_at, is_delete, is_read, save_path, rate_history
+                   message, created_at, modified_at, is_delete, is_read, save_path, rate_history, completed_at, max_download_rate, max_upload_rate
             FROM tasks
         )SQL";
 
@@ -44,6 +44,9 @@ namespace dw {
             col_is_read,
             col_save_path,
             col_rate_history,
+            col_completed_at,
+            col_max_download_rate,
+            col_max_upload_rate,
         };
 
         Task read_task(sqlite3_stmt *statement) {
@@ -66,6 +69,9 @@ namespace dw {
             task.message = col_text(statement, col_message);
             task.created_at = sqlite3_column_int64(statement, col_created_at);
             task.modified_at = sqlite3_column_int64(statement, col_modified_at);
+            task.completed_at = sqlite3_column_int64(statement, col_completed_at);
+            task.max_download_rate = sqlite3_column_double(statement, col_max_download_rate);
+            task.max_upload_rate = sqlite3_column_double(statement, col_max_upload_rate);
             task.is_delete = sqlite3_column_int(statement, col_is_delete) != 0;
             task.is_read = sqlite3_column_int(statement, col_is_read) != 0;
             boost::system::error_code error;
@@ -106,18 +112,24 @@ namespace dw {
                 is_read INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL DEFAULT '',
                 save_path TEXT NOT NULL DEFAULT '',
-                rate_history TEXT NOT NULL DEFAULT '[[],[]]'
+                rate_history TEXT NOT NULL DEFAULT '[[],[]]',
+                completed_at INTEGER NOT NULL DEFAULT 0,
+                max_download_rate REAL NOT NULL DEFAULT -1,
+                max_upload_rate REAL NOT NULL DEFAULT -1
             );
         )SQL";
         if (!db_ || sqlite3_exec(db_, sql, nullptr, nullptr, nullptr) != SQLITE_OK) return false;
 
-        // 已安装版本的任务表可能还没有历史列，原有任务保留为空历史。
-        sqlite3_stmt *statement = nullptr;
-        const int prepared = sqlite3_prepare_v2(db_, "SELECT rate_history FROM tasks LIMIT 0", -1, &statement, nullptr);
-        sqlite3_finalize(statement);
-        if (prepared == SQLITE_OK) return true;
-        return sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN rate_history TEXT NOT NULL DEFAULT '[[],[]]'",
-                            nullptr, nullptr, nullptr) == SQLITE_OK;
+        // 逐列补齐旧库，保留已有任务并允许中断后重试。
+        const auto ensure_column = [this](const char *name, const char *alter_sql) {
+            if (sqlite3_table_column_metadata(db_, nullptr, "tasks", name, nullptr, nullptr, nullptr, nullptr, nullptr)
+                == SQLITE_OK) return true;
+            return sqlite3_exec(db_, alter_sql, nullptr, nullptr, nullptr) == SQLITE_OK;
+        };
+        return ensure_column("rate_history", "ALTER TABLE tasks ADD COLUMN rate_history TEXT NOT NULL DEFAULT '[[],[]]'")
+            && ensure_column("completed_at", "ALTER TABLE tasks ADD COLUMN completed_at INTEGER NOT NULL DEFAULT 0")
+            && ensure_column("max_download_rate", "ALTER TABLE tasks ADD COLUMN max_download_rate REAL NOT NULL DEFAULT -1")
+            && ensure_column("max_upload_rate", "ALTER TABLE tasks ADD COLUMN max_upload_rate REAL NOT NULL DEFAULT -1");
     }
 
     bool TaskStore::write_task(const Task &task) const {
@@ -129,14 +141,14 @@ namespace dw {
                 ext, url, info_hash, magnet_link,
                 torrent_file, status, total_size, total_done,
                 message, created_at, modified_at, is_delete,
-                is_read, name, save_path, rate_history
+                is_read, name, save_path, rate_history, completed_at, max_download_rate, max_upload_rate
             ) VALUES (
                 :protocol, :task_id, :client_id, :is_remote,
                 '', :file_type,
                 :ext, :url, :info_hash, :magnet_link,
                 :torrent_file, :status, :total_size, :total_done,
                 :message, :created_at, :modified_at, :is_delete,
-                :is_read, :name, :save_path, :rate_history
+                :is_read, :name, :save_path, :rate_history, :completed_at, :max_download_rate, :max_upload_rate
             )
             ON CONFLICT(task_id) DO UPDATE SET
                 protocol = excluded.protocol,
@@ -158,7 +170,10 @@ namespace dw {
                 is_read = excluded.is_read,
                 name = excluded.name,
                 save_path = excluded.save_path,
-                rate_history = excluded.rate_history
+                rate_history = excluded.rate_history,
+                completed_at = excluded.completed_at,
+                max_download_rate = excluded.max_download_rate,
+                max_upload_rate = excluded.max_upload_rate
         )SQL";
         sqlite3_stmt *statement = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK)
@@ -203,6 +218,9 @@ namespace dw {
             boost::json::array{task.download_rate_history, task.upload_rate_history});
         sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":rate_history"),
                           history.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":completed_at"), task.completed_at);
+        sqlite3_bind_double(statement, sqlite3_bind_parameter_index(statement, ":max_download_rate"), task.max_download_rate);
+        sqlite3_bind_double(statement, sqlite3_bind_parameter_index(statement, ":max_upload_rate"), task.max_upload_rate);
         const bool success = sqlite3_step(statement) == SQLITE_DONE;
         sqlite3_finalize(statement);
         return success;

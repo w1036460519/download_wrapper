@@ -17,6 +17,8 @@ namespace dw {
 
         bool save(const TaskResume &record) const;
 
+        bool delete_task(const std::string &task_id) const;
+
         bool find(const std::string &task_id, TaskResume &out) const;
 
     private:
