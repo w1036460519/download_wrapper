@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 #include <boost/json.hpp>
 
@@ -47,6 +48,21 @@ namespace dw {
         double max_upload_rate = -1.0; // 下载阶段峰值，B/s。
         bool is_delete = false; // 软删除标记
         bool is_read = false; // 已读标记
+
+        std::string file_priorities; // 选中文件索引的 JSON 数组，[] 表示全选，空字符串表示尚未记录。
+
+        void set_file_priorities(const std::vector<int32_t> &indexes) {
+            file_priorities = boost::json::serialize(boost::json::value_from(indexes));
+        }
+
+        [[nodiscard]] std::vector<int32_t> get_file_priorities() const {
+            boost::system::error_code error;
+            const auto json = boost::json::parse(file_priorities, error);
+            if (error) return {};
+            auto indexes = boost::json::try_value_to<std::vector<int32_t>>(json);
+            if (!indexes) return {};
+            return std::move(*indexes);
+        }
 
         // 最近的有效速率样本，单位为 B/s，由任务表持久化。
         boost::json::array download_rate_history;

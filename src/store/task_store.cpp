@@ -18,7 +18,7 @@ namespace dw {
         constexpr char task_select[] = R"SQL(
             SELECT task_id, client_id, is_remote, name, file_type, ext,
                    url, info_hash, magnet_link, torrent_file, protocol, status, total_size, total_done,
-                   message, created_at, modified_at, is_delete, is_read, save_path, rate_history, completed_at, max_download_rate, max_upload_rate
+                   message, created_at, modified_at, is_delete, is_read, save_path, rate_history, completed_at, max_download_rate, max_upload_rate, selected_file_indexes
             FROM tasks
         )SQL";
 
@@ -47,6 +47,7 @@ namespace dw {
             col_completed_at,
             col_max_download_rate,
             col_max_upload_rate,
+            col_selected_file_indexes,
         };
 
         Task read_task(sqlite3_stmt *statement) {
@@ -72,6 +73,7 @@ namespace dw {
             task.completed_at = sqlite3_column_int64(statement, col_completed_at);
             task.max_download_rate = sqlite3_column_double(statement, col_max_download_rate);
             task.max_upload_rate = sqlite3_column_double(statement, col_max_upload_rate);
+            task.file_priorities = col_text(statement, col_selected_file_indexes);
             task.is_delete = sqlite3_column_int(statement, col_is_delete) != 0;
             task.is_read = sqlite3_column_int(statement, col_is_read) != 0;
             boost::system::error_code error;
@@ -115,7 +117,8 @@ namespace dw {
                 rate_history TEXT NOT NULL DEFAULT '[[],[]]',
                 completed_at INTEGER NOT NULL DEFAULT 0,
                 max_download_rate REAL NOT NULL DEFAULT -1,
-                max_upload_rate REAL NOT NULL DEFAULT -1
+                max_upload_rate REAL NOT NULL DEFAULT -1,
+                selected_file_indexes TEXT NOT NULL DEFAULT ''
             );
         )SQL";
         if (!db_ || sqlite3_exec(db_, sql, nullptr, nullptr, nullptr) != SQLITE_OK) return false;
@@ -129,7 +132,8 @@ namespace dw {
         return ensure_column("rate_history", "ALTER TABLE tasks ADD COLUMN rate_history TEXT NOT NULL DEFAULT '[[],[]]'")
             && ensure_column("completed_at", "ALTER TABLE tasks ADD COLUMN completed_at INTEGER NOT NULL DEFAULT 0")
             && ensure_column("max_download_rate", "ALTER TABLE tasks ADD COLUMN max_download_rate REAL NOT NULL DEFAULT -1")
-            && ensure_column("max_upload_rate", "ALTER TABLE tasks ADD COLUMN max_upload_rate REAL NOT NULL DEFAULT -1");
+            && ensure_column("max_upload_rate", "ALTER TABLE tasks ADD COLUMN max_upload_rate REAL NOT NULL DEFAULT -1")
+            && ensure_column("selected_file_indexes", "ALTER TABLE tasks ADD COLUMN selected_file_indexes TEXT NOT NULL DEFAULT ''");
     }
 
     bool TaskStore::write_task(const Task &task) const {
@@ -141,14 +145,14 @@ namespace dw {
                 ext, url, info_hash, magnet_link,
                 torrent_file, status, total_size, total_done,
                 message, created_at, modified_at, is_delete,
-                is_read, name, save_path, rate_history, completed_at, max_download_rate, max_upload_rate
+                is_read, name, save_path, rate_history, completed_at, max_download_rate, max_upload_rate, selected_file_indexes
             ) VALUES (
                 :protocol, :task_id, :client_id, :is_remote,
                 '', :file_type,
                 :ext, :url, :info_hash, :magnet_link,
                 :torrent_file, :status, :total_size, :total_done,
                 :message, :created_at, :modified_at, :is_delete,
-                :is_read, :name, :save_path, :rate_history, :completed_at, :max_download_rate, :max_upload_rate
+                :is_read, :name, :save_path, :rate_history, :completed_at, :max_download_rate, :max_upload_rate, :selected_file_indexes
             )
             ON CONFLICT(task_id) DO UPDATE SET
                 protocol = excluded.protocol,
@@ -173,7 +177,8 @@ namespace dw {
                 rate_history = excluded.rate_history,
                 completed_at = excluded.completed_at,
                 max_download_rate = excluded.max_download_rate,
-                max_upload_rate = excluded.max_upload_rate
+                max_upload_rate = excluded.max_upload_rate,
+                selected_file_indexes = excluded.selected_file_indexes
         )SQL";
         sqlite3_stmt *statement = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) != SQLITE_OK)
@@ -221,6 +226,8 @@ namespace dw {
         sqlite3_bind_int64(statement, sqlite3_bind_parameter_index(statement, ":completed_at"), task.completed_at);
         sqlite3_bind_double(statement, sqlite3_bind_parameter_index(statement, ":max_download_rate"), task.max_download_rate);
         sqlite3_bind_double(statement, sqlite3_bind_parameter_index(statement, ":max_upload_rate"), task.max_upload_rate);
+        sqlite3_bind_text(statement, sqlite3_bind_parameter_index(statement, ":selected_file_indexes"),
+                          task.file_priorities.c_str(), -1, SQLITE_TRANSIENT);
         const bool success = sqlite3_step(statement) == SQLITE_DONE;
         sqlite3_finalize(statement);
         return success;

@@ -12,7 +12,6 @@
  */
 
 #include "download_wrapper/playback_proxy.h"
-#include "torrent/torrent_engine.h"
 
 #include "core/task_manager.h"
 #include "internal/downloader_internal.h"
@@ -51,8 +50,7 @@ using tcp = boost::asio::ip::tcp;
 static std::optional<TaskFile> find_playback_file(const std::string &client_id,
                                                   const std::string &task_id,
                                                   int32_t file_index,
-                                                  const std::string &path = {},
-                                                  int64_t offset = -1, int64_t end = -1) {
+                                                  const std::string &path = {}) {
     auto *downloader = global_downloader();
     if (!downloader) return std::nullopt;
 
@@ -75,13 +73,6 @@ static std::optional<TaskFile> find_playback_file(const std::string &client_id,
     const auto file = std::ranges::find(task->files, file_index, &TaskFile::file_index);
     if (file == task->files.end() || file->is_delete || file->full_path.empty() ||
         (!path.empty() && file->full_path != path)) return std::nullopt;
-    if (offset >= 0 && task->task_protocol == DW_PROTOCOL_TORRENT && file->total_done < file->total_size) {
-        try {
-            TorrentEngine::prioritize_playback(*task, *file, offset, end);
-        } catch (const std::exception &error) {
-            log_e(task->task_id.c_str(), "播放分片提权失败: {}", error.what());
-        }
-    }
     return *file;
 }
 
@@ -305,9 +296,6 @@ private:
             return;
         }
 
-        if (file && file->total_done < total_size_) {
-            find_playback_file(client_id_, natural_key_, file_index_, file_path_, range_start_, range_end_);
-        }
         do_stream(range_start_);
     }
 

@@ -17,8 +17,6 @@
 #include "utils/string_util.h"
 #include "utils/time_util.h"
 
-#include <boost/beast/core/string.hpp>
-
 #include <libtorrent/session.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/socks5_stream.hpp>
@@ -109,6 +107,27 @@ namespace dw {
             }
         }
 
+        std::vector<lt::download_priority_t> engine_priorities(const std::vector<int32_t> &indexes,
+                                                               const lt::file_storage *files) {
+            const auto file_count = files
+                                        ? static_cast<std::size_t>(files->num_files())
+                                        : static_cast<std::size_t>(std::max<int64_t>(
+                                              0, indexes.empty() ? 0 : int64_t{*std::ranges::max_element(indexes)} + 1));
+            std::vector<lt::download_priority_t> priorities(
+                file_count, indexes.empty() ? lt::default_priority : lt::dont_download);
+            for (const auto index: indexes) {
+                if (index >= 0 && static_cast<std::size_t>(index) < file_count) {
+                    priorities[index] = lt::default_priority;
+                }
+            }
+            if (files) {
+                for (int i = 0; i < files->num_files(); ++i) {
+                    if (files->pad_file_at(lt::file_index_t{i})) priorities[i] = lt::dont_download;
+                }
+            }
+            return priorities;
+        }
+
         lt::torrent_handle find_handle(const std::string &info_hash, const bool upload_only = false,
                                        const bool load_if_missing = true) {
             if (info_hash.empty()) {
@@ -146,8 +165,18 @@ namespace dw {
 
             // 只调整引擎必需的标志，保留续传中的其他设置。
             // 按调用方需要启用仅上传模式。
-            const auto add_torrent = [upload_only](lt::add_torrent_params &atp,
-                                                   const std::string &trace_id) -> lt::torrent_handle {
+            const auto add_torrent = [upload_only, &task](lt::add_torrent_params &atp,
+                                                          const std::string &trace_id) -> lt::torrent_handle {
+                if (!task.file_priorities.empty()) {
+                    const auto indexes = task.get_file_priorities();
+                    if (indexes.empty()) {
+                        atp.flags &= ~lt::torrent_flags::default_dont_download;
+                    } else {
+                        atp.flags |= lt::torrent_flags::default_dont_download;
+                    }
+                    atp.file_priorities = engine_priorities(indexes, atp.ti ? &atp.ti->layout() : nullptr);
+                }
+                atp.piece_priorities.clear();
                 atp.flags |= lt::torrent_flags::update_subscribe
                         | lt::torrent_flags::need_save_resume;
                 if (upload_only) atp.flags |= lt::torrent_flags::upload_mode;
@@ -183,19 +212,6 @@ namespace dw {
             }
 
             // 根据任务的原始数据恢复 handler
-            if (!task.magnet_link.empty()) {
-                lt::add_torrent_params atp;
-                lt::error_code ec;
-                lt::parse_magnet_uri(task.magnet_link, atp, ec);
-                atp.save_path = task.save_path;
-                if (ec) {
-                    log_e(info_hash.c_str(), "无法通过链接[{}]恢复 massage={}", task.magnet_link, ec.what());
-                } else {
-                    if (auto handle = add_torrent(atp, info_hash); handle.is_valid()) {
-                        return handle;
-                    }
-                }
-            }
             if (!task.torrent_file.empty()) {
                 lt::error_code ec;
                 lt::add_torrent_params atp =
@@ -210,6 +226,19 @@ namespace dw {
                 }
             }
 
+            if (!task.magnet_link.empty()) {
+                lt::add_torrent_params atp;
+                lt::error_code ec;
+                lt::parse_magnet_uri(task.magnet_link, atp, ec);
+                atp.save_path = task.save_path;
+                if (ec) {
+                    log_e(info_hash.c_str(), "无法通过链接[{}]恢复 massage={}", task.magnet_link, ec.what());
+                } else {
+                    if (auto handle = add_torrent(atp, info_hash); handle.is_valid()) {
+                        return handle;
+                    }
+                }
+            }
             if (task.torrent_file.empty() && task.magnet_link == info_hash) {
                 lt::add_torrent_params atp;
                 atp.info_hashes = info_hash.size() == 40 ? lt::info_hash_t(h1) : lt::info_hash_t(h2);
@@ -372,30 +401,6 @@ namespace dw {
             }
         }
 
-        void raise_piece_priorities(const lt::torrent_handle &handle,
-                                    const int first, const int last, lt::download_priority_t priority,
-                                    std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > &updates) {
-            for (int i = first; i <= last; ++i) {
-                const lt::piece_index_t piece{i};
-                if (!handle.have_piece(piece) && handle.piece_priority(piece) < priority) {
-                    updates.emplace_back(piece, priority);
-                }
-            }
-        }
-
-        void log_piece_priorities(const char *task_id, const char *source, const TaskFile &file,
-                                  const std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > &updates,
-                                  std::size_t first_update) {
-            if (first_update == updates.size()) return;
-            std::string pieces = std::to_string(static_cast<int>(updates[first_update].first));
-            for (auto i = first_update + 1; i < updates.size(); ++i) {
-                pieces += ',';
-                pieces += std::to_string(static_cast<int>(updates[i].first));
-            }
-            log_i(task_id, "{}设置 piece 优先级 file={} file_index={} priority={} pieces=[{}]",
-                  source, file.name, file.file_index, static_cast<std::uint8_t>(updates[first_update].second), pieces);
-        }
-
         void handle_files(const lt::torrent_handle &h) {
             const std::string info_hash = info_hash_hex(h);
             if (info_hash.empty()) return;
@@ -415,8 +420,6 @@ namespace dw {
                 const auto priorities = h.get_file_priorities();
                 std::vector<std::int64_t> progress;
                 h.file_progress(progress, lt::torrent_handle::piece_granularity);
-                constexpr int64_t prefetch_bytes = 4 * 1024 * 1024;
-                std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > prefetch;
                 task->files.reserve(files.num_files());
                 for (int i = 0; i < files.num_files(); ++i) {
                     const lt::file_index_t index{i};
@@ -444,30 +447,8 @@ namespace dw {
                                         : 1.0;
                     if (i < static_cast<int>(priorities.size()))
                         file.prioritize = static_cast<std::uint8_t>(priorities[i]);
-                    // 需下载 大于8MB 后缀mp4 未完成 -> 将前后4MB的piece设置为优先下载
-                    if (!file.is_delete && file.prioritize != 0
-                        && boost::beast::iequals(file.extension, "mp4")
-                        && file.total_size >= 2 * prefetch_bytes
-                        && file.total_done < file.total_size) {
-                        const auto piece_at = [&](const int64_t offset) {
-                            return static_cast<int>(files.map_file(index, offset, 1).piece);
-                        };
-                        const int head_end = piece_at(prefetch_bytes - 1);
-                        const auto first_update = prefetch.size();
-                        raise_piece_priorities(h, piece_at(0), head_end, lt::top_priority, prefetch);
-                        raise_piece_priorities(h, std::max(head_end + 1, piece_at(file.total_size - prefetch_bytes)),
-                                               piece_at(file.total_size - 1), lt::top_priority, prefetch);
-                        log_piece_priorities(info_hash.c_str(), "文件解析", file, prefetch, first_update);
-                    }
                     file.dirty = true;
                 }
-                if (!prefetch.empty()) {
-                    std::ranges::sort(prefetch);
-                    const auto duplicates = std::ranges::unique(prefetch);
-                    prefetch.erase(duplicates.begin(), duplicates.end());
-                    h.prioritize_pieces(prefetch);
-                }
-
                 task->file_type = task->files.size() != 1;
                 task->ext = task->file_type ? std::string{} : task->files.front().extension;
                 task->dirty = true;
@@ -796,31 +777,6 @@ namespace dw {
     /*                        TorrentEngine 成员实现                          */
     /* ===================================================================== */
 
-    void TorrentEngine::prioritize_playback(const Task &task, const TaskFile &file,
-                                            const int64_t offset, const int64_t end) {
-        if (task.status != DW_TASK_STATUS_DOWNLOADING || file.prioritize == 0) return;
-        const auto handle = find_handle(task.task_id, false, false);
-        if (!handle.is_valid()) return;
-        const auto info = handle.torrent_file();
-        if (!info) return;
-        const auto &layout = info->layout();
-        if (file.file_index < 0 || file.file_index >= layout.num_files()) return;
-        const lt::file_index_t index{file.file_index};
-        if (offset < 0 || offset >= layout.file_size(index) || end < offset) return;
-
-        constexpr int max_pieces = 20;
-        const auto last_offset = std::min(end, layout.file_size(index) - 1);
-        const int first = static_cast<int>(layout.map_file(index, offset, 1).piece);
-        const int last = static_cast<int>(layout.map_file(index, last_offset, 1).piece);
-        std::vector<std::pair<lt::piece_index_t, lt::download_priority_t> > updates;
-        raise_piece_priorities(handle, first, first + std::min(last - first, max_pieces - 1),
-                               lt::download_priority_t{5}, updates);
-        if (!updates.empty()) {
-            handle.prioritize_pieces(updates);
-            log_piece_priorities(task.task_id.c_str(), "播放", file, updates, 0);
-        }
-    }
-
     std::recursive_mutex &TorrentEngine::tasks_mutex() {
         return g_task_manager->get_mutex();
     }
@@ -1048,6 +1004,7 @@ namespace dw {
             log_e("", "bt 添加任务 无法解析出info_hash");
             return dw_result<>::failure();
         }
+
         Task *existing_task = get_task(info_hash);
         Task new_task;
         Task &task = existing_task ? *existing_task : new_task;
@@ -1084,6 +1041,7 @@ namespace dw {
         task.info_hash = info_hash;
         task.magnet_link = params->magnet_link;
         task.torrent_file = params->torrent_file;
+        task.set_file_priorities(params->file_indexes);
 
         task.is_delete = false;
         task.is_read = false;
@@ -1127,28 +1085,15 @@ namespace dw {
                 return dw_result<>::failure();
             }
 
+            if (const auto torrent = handle.torrent_file()) {
+                const auto priorities = engine_priorities(registered_task->get_file_priorities(), &torrent->layout());
+                if (handle.get_file_priorities() != priorities) handle.prioritize_files(priorities);
+            }
             if (existing_task) {
                 // 重新校验磁盘文件，让引擎用实际数据重建进度。
                 handle.force_recheck();
             }
 
-            // 设置优先级
-            if (!params->file_indexes.empty()
-                && (params->file_priority == 0 || params->file_priority == 4 || params->file_priority == 7)) {
-                if (const auto torrent = handle.torrent_file()) {
-                    const auto &files = torrent->layout();
-                    auto priorities = handle.get_file_priorities();
-                    priorities.resize(files.num_files(), lt::default_priority);
-                    const auto requested = lt::download_priority_t{static_cast<uint8_t>(params->file_priority)};
-                    for (const auto index: params->file_indexes) {
-                        if (index >= files.num_files() || files.pad_file_at(lt::file_index_t{index})) {
-                            continue;
-                        }
-                        priorities[index] = requested;
-                    }
-                    handle.prioritize_files(priorities);
-                }
-            }
             handle.set_flags(lt::torrent_flags::auto_managed,
                              lt::torrent_flags::auto_managed | lt::torrent_flags::upload_mode);
             g_session->post_torrent_updates();
@@ -1165,12 +1110,14 @@ namespace dw {
 
     dw_result<> TorrentEngine::set_file_priority(const TaskParams &params) {
         const auto &key = params.task_key();
-        if (key.empty() || params.file_indexes.empty() || params.file_priority < 0 || params.file_priority > 7) {
+        if (key.empty()) {
             log_e("", "设置优先级 任务标识、文件索引或优先级无效");
             return dw_result<>::failure();
         }
 
         std::scoped_lock lock(tasks_mutex());
+        Task *task = get_task(key);
+        if (!task || task->is_delete) return dw_result<>::failure();
         try {
             const auto handle = find_handle(key, false, false);
             if (!handle.is_valid()) {
@@ -1184,17 +1131,21 @@ namespace dw {
                 return dw_result<>::failure();
             }
             const auto &files = torrent->layout();
-            auto priorities = handle.get_file_priorities();
-            priorities.resize(files.num_files(), lt::default_priority);
-            const auto requested = lt::download_priority_t{static_cast<uint8_t>(params.file_priority)};
             for (const auto index: params.file_indexes) {
                 if (index < 0 || index >= files.num_files() || files.pad_file_at(lt::file_index_t{index})) {
                     log_e("", "设置优先级 文件索引无效");
                     return dw_result<>::failure();
                 }
-                priorities[index] = requested;
             }
+            const auto priorities = engine_priorities(params.file_indexes, &files);
+            task->set_file_priorities(params.file_indexes);
             handle.prioritize_files(priorities);
+            for (auto &file: task->files) {
+                if (file.file_index < 0 || file.file_index >= files.num_files()) continue;
+                file.prioritize = static_cast<uint8_t>(priorities[file.file_index]);
+                file.dirty = true;
+            }
+            task->dirty = true;
             return dw_result<>::success();
         } catch (const std::exception &e) {
             log_e(key.c_str(), "bt 设置文件优先级失败: {}", e.what());
@@ -1223,23 +1174,6 @@ namespace dw {
                 return dw_result<>::failure();
             }
 
-            // 设置优先级
-            if (!params->file_indexes.empty()
-                && (params->file_priority == 0 || params->file_priority == 4 || params->file_priority == 7)) {
-                if (const auto torrent = handle.torrent_file()) {
-                    const auto &files = torrent->layout();
-                    auto priorities = handle.get_file_priorities();
-                    priorities.resize(files.num_files(), lt::default_priority);
-                    const auto requested = lt::download_priority_t{static_cast<uint8_t>(params->file_priority)};
-                    for (const auto index: params->file_indexes) {
-                        if (index >= files.num_files() || files.pad_file_at(lt::file_index_t{index})) {
-                            continue;
-                        }
-                        priorities[index] = requested;
-                    }
-                    handle.prioritize_files(priorities);
-                }
-            }
             handle.set_flags(lt::torrent_flags::auto_managed,
                              lt::torrent_flags::auto_managed | lt::torrent_flags::upload_mode);
             handle.resume();
